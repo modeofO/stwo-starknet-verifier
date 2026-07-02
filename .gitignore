@@ -1,0 +1,6 @@
+# Scarb / Cairo
+target/
+.snfoundry_cache/
+
+# macOS
+.DS_Store
