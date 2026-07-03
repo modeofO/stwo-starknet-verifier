@@ -228,6 +228,11 @@ as lane 1 — see proof-only-wrapping.md).
   side cannot slice the union witness. The bridge must emit one witness
   per query group (the prover can decommit any query set). The vendored
   `MerkleVerifier::verify` then runs verbatim per group — no fork.
+  No re-proving needed: `ExtendedStarkProof.aux.trace_decommitment`
+  (`MerkleDecommitmentLiftedAux.all_node_values`, a per-layer node→hash
+  map along the opened paths) contains every sibling a subset walk can
+  need, so a witness splitter can synthesize per-group decommitments from
+  the extended proof alone.
 - **Fusion:** a (tree × query-group) tx Merkle-verifies its rows on
   arrival and can immediately absorb them into per-(tree, group) digests
   or feed the fri_answers accumulator — data is consumed in the tx that
