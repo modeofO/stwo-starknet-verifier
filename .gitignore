@@ -8,3 +8,6 @@ target/
 # Profiler artifacts
 snfoundry_trace/
 profile*.pb.gz
+
+# Prover checkout (scripts/setup-prover.sh)
+.prover/
