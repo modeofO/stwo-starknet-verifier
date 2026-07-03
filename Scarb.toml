@@ -1,0 +1,22 @@
+# Root workspace for the Starknet contract build (gas ON, default).
+#
+# The vendored `cairo_verifier` executable crate is deliberately NOT a member:
+# executable targets require `enable-gas = false`, which conflicts with the
+# contract target. It gets its own workspace for Spike 2 measurements.
+# The vendored crates are path dependencies of the contract packages, not
+# workspace members: as members their standalone lib targets would build
+# featureless and trip cairo_air's features_check compile_error. As pure
+# deps they compile inside each contract's compilation unit with the right
+# features.
+[workspace]
+members = [
+    "contracts/stwo_verifier_contract",
+    "contracts/stwo_circuit_verifier_contract",
+]
+
+# Lint config used by the vendored upstream workspace, kept for parity.
+[workspace.tool.cairo-lint]
+collapsible_if_else = false
+double_parens = false
+ifs_same_cond = false
+manual_assert = false
