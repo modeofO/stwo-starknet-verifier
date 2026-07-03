@@ -1,0 +1,116 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index f93a843..29057ec 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,6 +8,7 @@ members = [
+     "crates/vm_runner",
+     "crates/privacy_prove",
+     "crates/privacy_circuit_verify",
++    "crates/privacy_prove_cairo_bridge",
+ ]
+ resolver = "2"
+ 
+diff --git a/crates/privacy_prove/src/lib.rs b/crates/privacy_prove/src/lib.rs
+index 7124050..346d323 100644
+--- a/crates/privacy_prove/src/lib.rs
++++ b/crates/privacy_prove/src/lib.rs
+@@ -260,13 +260,21 @@ pub fn privacy_recursive_prove(
+     })
+ }
+ 
+-fn run_privacy_bootloader(pie: CairoPie) -> Result<(ProverInput, Vec<Felt>), Box<dyn Error>> {
++pub fn run_privacy_bootloader(pie: CairoPie) -> Result<(ProverInput, Vec<Felt>), Box<dyn Error>> {
++    run_privacy_bootloader_task(Task::Pie(pie))
++}
++
++/// Same as [`run_privacy_bootloader`] but accepts any bootloader task type
++/// (e.g. `Task::Cairo1Program` for scarb-built executables).
++pub fn run_privacy_bootloader_task(
++    task: Task,
++) -> Result<(ProverInput, Vec<Felt>), Box<dyn Error>> {
+     let _span = span!(Level::INFO, "get_prover_input").entered();
+ 
+     let output_preimage_file = NamedTempFile::new()?;
+     let output_preimage_path = output_preimage_file.path().to_path_buf();
+     let pie_task_spec = TaskSpec {
+-        task: Rc::new(Task::Pie(pie)),
++        task: Rc::new(task),
+         program_hash_function: HashFunc::Blake,
+     };
+     let bootloader_input = PrivacySimpleBootloaderInput {
+@@ -296,3 +304,75 @@ fn run_privacy_bootloader(pie: CairoPie) -> Result<(ProverInput, Vec<Felt>), Box
+ 
+     Ok((prover_input, output_preimage))
+ }
++
++/// Same as [`privacy_recursive_prove`], but stops before the `CircuitSerialize`/zstd
++/// transport encoding and returns the raw circuit proof together with the bootloader
++/// output preimage. Callers targeting the on-chain Cairo circuit verifier serialize the
++/// proof with `circuit_cairo_serialize::prepare_circuit_proof_for_cairo_verifier` instead.
++pub fn privacy_recursive_prove_raw(
++    pie: CairoPie,
++    precomputes: Arc<RecursiveProverPrecomputes>,
++) -> Result<
++    (
++        circuit_prover::prover::CircuitProof<
++            stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher,
++        >,
++        Vec<Felt>,
++    ),
++    Box<dyn Error>,
++> {
++    let _span = span!(Level::INFO, "privacy_recursive_prove_raw").entered();
++
++    info!("Run privacy bootloader and get the prover input and output preimage");
++    let (prover_input, output_preimage) = run_privacy_bootloader(pie)?;
++
++    info!("Generate the cairo proof");
++    let cairo_proof = prove_cairo_with_precompute(
++        &precomputes.base_column_pool,
++        &precomputes.twiddles,
++        precomputes.cairo_preprocessed_trace.clone(),
++        MaybeOwned::Borrowed(&precomputes.cairo_preprocessed_tree),
++        prover_input,
++        CAIRO_PROVER_PARAMS,
++    )?;
++    let FlatClaim {
++        component_enable_bits,
++        component_log_sizes: _,
++        public_data: _,
++    } = cairo_proof.claim.flatten_claim();
++    info!("Prepare the cairo proof for the cairo-circuit verifier");
++    let (proof, serialized_aux_data) =
++        prepare_cairo_proof_for_circuit_verifier(&cairo_proof, &component_enable_bits);
++
++    info!("Build the cairo-circuit verifier context");
++    let outputs = compute_privacy_bootloader_output(&output_preimage);
++    let mut context = build_fixed_cairo_circuit(
++        &precomputes.cairo_verifier_config,
++        proof,
++        serialized_aux_data,
++        vec![outputs],
++    );
++    if !context.is_circuit_valid() {
++        return Err("Circuit is not valid".into());
++    };
++    let zk_blinding_seed = cairo_proof.extended_stark_proof.proof.commitments.0[1].0;
++    add_zk_blinding(
++        &mut context,
++        zk_blinding_seed,
++        precomputes.circuit_config.config.fri_config.n_queries,
++    );
++    pad_context(&mut context);
++    let context_values = context.values();
++
++    info!("Prove the cairo-circuit verifier");
++    let circuit_proof = prove_circuit_with_precompute(
++        &precomputes.base_column_pool,
++        &precomputes.twiddles,
++        &precomputes.preprocessed_circuit,
++        MaybeOwned::Borrowed(&precomputes.circuit_preprocessed_tree),
++        context_values,
++        precomputes.circuit_config.config,
++    )?;
++
++    Ok((circuit_proof, output_preimage))
++}

@@ -1,0 +1,34 @@
+[package]
+name = "privacy-prove-cairo-bridge"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bridge: Cairo PIE -> privacy bootloader Stwo proof -> cairo-verifier circuit proof -> multiverifier proof -> felt252 cairo-serde for the on-chain Stwo circuit verifier"
+
+[[bin]]
+name = "privacy_prove_cairo_bridge"
+path = "src/main.rs"
+
+[dependencies]
+privacy-prove = { path = "../privacy_prove" }
+circuit-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0451681a86cc4755b848d342f6edbf3a240f2627" }
+circuit-cairo-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0451681a86cc4755b848d342f6edbf3a240f2627" }
+circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0451681a86cc4755b848d342f6edbf3a240f2627" }
+circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0451681a86cc4755b848d342f6edbf3a240f2627" }
+circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0451681a86cc4755b848d342f6edbf3a240f2627" }
+circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0451681a86cc4755b848d342f6edbf3a240f2627" }
+circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0451681a86cc4755b848d342f6edbf3a240f2627" }
+circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "0451681a86cc4755b848d342f6edbf3a240f2627" }
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "5ea05973", features = ["parallel"] }
+stwo-cairo-prover.workspace = true
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "5ea05973" }
+cairo-vm.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+privacy-circuit-verify = { path = "../privacy_circuit_verify" }
+cairo-air.workspace = true
+tempfile.workspace = true
+cairo-program-runner-lib.workspace = true
+indexmap = "2"
+stwo-cairo-common.workspace = true

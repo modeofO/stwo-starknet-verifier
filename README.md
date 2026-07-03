@@ -21,10 +21,22 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   gas/tx budget) plus 65k–223k felts of proof vs a 5k-felt calldata cap.
   The **circuit verifier** (recursion route) costs **3.79M steps ≈ 38% of
   one tx** with a 35.7k-felt proof — single-tx verification is viable there.
-- **Spike 3 (recursion route end-to-end): next.** Drive
-  [stwo-circuits](https://github.com/starkware-libs/stwo-circuits) to wrap
-  an arbitrary program's proof in a circuit proof and check topology match
-  with the on-chain circuit verifier.
+- **Spike 3 (recursion route end-to-end): done — it works.** —
+  [`docs/spike3-results.md`](./docs/spike3-results.md). A scarb-built Cairo 1
+  program was proven via StarkWare's privacy bootloader + recursion circuits
+  ([proving-utils](https://github.com/starkware-libs/proving-utils) +
+  [stwo-circuits](https://github.com/starkware-libs/stwo-circuits)) and the
+  resulting 36k-felt proof was **accepted by the deployable circuit-verifier
+  contract in 3.81M steps (~38% of one tx)**, with the statement binding the
+  program hash and exact program output. One-command repro:
+
+  ```sh
+  scripts/setup-prover.sh          # once
+  scripts/prove-and-verify.sh fixtures/target/dev/poseidon_chain.executable.json \
+      fixtures/poseidon_chain_args_100.json
+  ```
+- **Next:** FactRegistry + proof-staging contracts, devnet declare/deploy,
+  real gas numbers, zk-blinding story.
 
 ## Layout
 
