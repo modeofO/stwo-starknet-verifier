@@ -41,6 +41,24 @@ pub trait IStwoFactRegistry<TContractState> {
         ref self: TContractState, proof_id: felt252, n_slots: u32, n_values: u32,
     ) -> felt252;
 
+    /// Like `verify_and_register`, but takes the head of the packed proof
+    /// directly as calldata and reads only `n_tail_slots` staged slots
+    /// (stored at indices 0..n_tail_slots) for the remainder.
+    ///
+    /// Rationale: storage reads dominate the all-storage variant's gas
+    /// (Starknet's per-invoke cap is 1.21e9 L2 gas and reading ~5k slots
+    /// costs ~3e8), while calldata is nearly free — but the per-transaction
+    /// calldata limit (5,000 felts) is just below a whole packed proof
+    /// (~5,147 slots). Splitting head-via-calldata / tail-via-storage yields
+    /// a two-transaction flow: one small staging tx, one verify tx.
+    fn verify_and_register_from_calldata(
+        ref self: TContractState,
+        proof_id: felt252,
+        head: Span<felt252>,
+        n_tail_slots: u32,
+        n_values: u32,
+    ) -> felt252;
+
     /// True iff `fact` was registered by a successful verification.
     fn is_valid(self: @TContractState, fact: felt252) -> bool;
 }
@@ -158,17 +176,7 @@ mod StwoFactRegistry {
                 packed.append(self.proof_words.entry((caller, proof_id, i)).read());
                 i += 1;
             }
-            let serialized = unpack_proof(packed.span(), n_values);
-
-            let mut span = serialized.span();
-            let proof: CircuitProof = Serde::deserialize(ref span)
-                .expect('proof deserialization failed');
-            assert(span.is_empty(), 'trailing proof data');
-
-            let output = get_verification_output(@proof);
-            verify_circuit(:proof);
-
-            let fact = fact_from_output(@output);
+            let fact = verify_packed(packed.span(), n_values);
             self.facts.entry(fact).write(true);
             self.emit(FactRegistered { fact, prover: caller, proof_id });
             fact
@@ -177,5 +185,43 @@ mod StwoFactRegistry {
         fn is_valid(self: @ContractState, fact: felt252) -> bool {
             self.facts.entry(fact).read()
         }
+
+        fn verify_and_register_from_calldata(
+            ref self: ContractState,
+            proof_id: felt252,
+            head: Span<felt252>,
+            n_tail_slots: u32,
+            n_values: u32,
+        ) -> felt252 {
+            let caller = get_caller_address();
+
+            let mut packed = array![];
+            for slot in head {
+                packed.append(*slot);
+            }
+            let mut i = 0;
+            while i != n_tail_slots {
+                packed.append(self.proof_words.entry((caller, proof_id, i)).read());
+                i += 1;
+            }
+
+            let fact = verify_packed(packed.span(), n_values);
+            self.facts.entry(fact).write(true);
+            self.emit(FactRegistered { fact, prover: caller, proof_id });
+            fact
+        }
+    }
+
+    /// Unpacks, deserializes, verifies, and derives the fact.
+    fn verify_packed(packed: Span<felt252>, n_values: u32) -> felt252 {
+        let serialized = unpack_proof(packed, n_values);
+        let mut span = serialized.span();
+        let proof: CircuitProof = Serde::deserialize(ref span)
+            .expect('proof deserialization failed');
+        assert(span.is_empty(), 'trailing proof data');
+
+        let output = get_verification_output(@proof);
+        verify_circuit(:proof);
+        fact_from_output(@output)
     }
 }

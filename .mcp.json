@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "starknet": {
+      "command": "npx",
+      "args": ["-y", "@mcpdotdirect/starknet-mcp-server"]
+    }
+  }
+}

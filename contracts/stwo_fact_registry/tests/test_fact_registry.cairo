@@ -106,3 +106,20 @@ fn test_cost_bare_verification() {
     let fact = stwo_fact_registry::fact_from_output(@output);
     assert!(fact != 0, "fact");
 }
+
+/// The two-transaction flow: head of the packed proof via calldata,
+/// 152-slot tail staged.
+#[test]
+fn test_verify_from_calldata_real_proof() {
+    let registry = deploy_registry();
+    let packed = load_packed_proof();
+    let head_len: u32 = 4_995;
+    let span = packed.span();
+    let (head, tail) = (span.slice(0, head_len), span.slice(head_len, N_SLOTS - head_len));
+
+    let proof_id = 'pcn100_calldata';
+    registry.stage_proof(proof_id, 0, tail);
+    let fact = registry
+        .verify_and_register_from_calldata(proof_id, head, N_SLOTS - head_len, N_VALUES);
+    assert!(registry.is_valid(fact), "fact must be registered");
+}

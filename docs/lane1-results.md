@@ -62,3 +62,50 @@ probes. Test fixture regenerable with `scripts/prove-and-verify.sh` +
 - Headroom watch: 19% under the cap on this fixture; proofs of bigger
   payloads are the same size (fixed circuit topology), so this should hold,
   but re-measure after any upstream topology change.
+
+---
+
+# Sepolia campaign addendum (2026-07-02, same day)
+
+**Declared and deployed on Starknet Sepolia** — to our knowledge the first
+Stwo verifier ever declared on a public Starknet network:
+
+- Class [`0x049cb29…9629`](https://sepolia.voyager.online/class/0x049cb29261b5ba43e4a9446f9950bd1b6b33d6cee9c607d61021da8441f39629)
+  (declare fee: **151.05 STRK / 5.33e9 L2 gas** — declares are exempt from
+  the invoke gas cap; this also settles Spike 1's CASM-cap question).
+- Instance at `0x05878fb0708fe63863f2d66bc8a79357b867cef8e00079cee83894f47408023c`;
+  all 6 staging transactions of the real proof landed on Sepolia.
+
+**But the verify transaction is blocked — production reality vs snforge:**
+
+| | snforge estimate | devnet/Sepolia actual |
+|---|---|---|
+| verify (all-storage) | 8.9e8 | **1.429e9** |
+| verify (head-in-calldata, 152-slot tail) | — | **1.423e9** |
+| Starknet invoke L2-gas cap (empirical, from sequencer rejection) | — | **1.21e9** |
+
+Key learnings:
+
+1. **The per-invoke cap is 1.21e9 L2 gas** (the sequencer rejects higher
+   bounds outright: "maximum allowed gas amount: 1210000000"). Declares are
+   not subject to it.
+2. **snforge's gas constants understate production by ~1.6×** for this
+   workload. Devnet (starknet-devnet 0.9) matches Sepolia's estimates
+   exactly; use devnet for go/no-go gas decisions.
+3. **Storage reads were never the bottleneck** — moving 4,995 of 5,147
+   packed slots into calldata saved only 0.5%. The verification *compute*
+   is ~1.4e9 by itself.
+4. Other levers measured/checked and exhausted: release-profile build
+   (byte-identical Sierra), qm31 libfuncs in `audited.json` (still absent —
+   0 entries as of today), devnet block state-diff cap (4,000 entries)
+   limits staging chunks to <2,000 slots/tx.
+
+**Conclusion: single-transaction verification is ~18% over today's invoke
+cap.** The path forward is splitting verification across two transactions
+with a small checkpoint (channel state + derived randomness, ~tens of felts)
+persisted between them — i.e. pulling lane 2's resumable-verifier machinery
+forward, at 2-tx granularity. Natural split point: constraint/OODS phase in
+tx1, FRI decommitment phase in tx2; both re-read the staged proof, only the
+Fiat-Shamir state crosses. Alternatively, the moment qm31 libfuncs enter
+`audited.json`, the emulation overhead collapses and single-tx verification
+almost certainly fits.
