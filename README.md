@@ -67,9 +67,15 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   one-function consumer integration
   (`compute_fact(program_hash, outputs, inner_root)` + `is_valid`); its
   test reproduces the live Sepolia fact from application data (~0.8M gas).
+- **Controller envelope: quantified** (from `controller-rs` ABI types) —
+  direct session invokes don't touch the calldata cap (token rides in the
+  signature); the paymaster `execute_from_outside_v3` path costs ~31–34
+  calldata felts (cached auth), so the phase-1 head shrinks to ~4,960
+  slots. See the client section in
+  [`docs/architecture.md`](./docs/architecture.md).
 - **Next:** lane 2 build-out (packing v2 → poseidon channel checkpoint →
-  the two accumulator monsters), plus the Cartridge Controller
-  calldata-envelope measurement.
+  the two accumulator monsters); confirm the Controller envelope with a
+  live Sepolia session transaction.
 
 ## Layout
 

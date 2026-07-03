@@ -103,10 +103,21 @@ progresses. Rationale and design:
   leaks only a scoped, expiring session — never the root identity.
 - Cartridge's paymaster can sponsor fees (users need not hold STRK);
   at ~1.7e9 gas per fact the sponsorship economics are an app decision.
-- Integration caveat to verify: `verify_phase1` uses 4,999/5,000 calldata
-  felts with a plain account envelope; session `execute_from_outside`
-  wrapping is larger, so the calldata head must shrink by a few slots —
-  measure with a real Controller transaction before hardcoding.
+- Integration caveat, now quantified from `controller-rs` ABI types
+  (2026-07-03; live-tx confirmation still pending):
+  - **Direct session invoke** (the app's session key signs the tx from the
+    Controller account): the `SessionToken` rides in the tx *signature*
+    field, not calldata — the 4,991-slot phase-1 head is unaffected.
+  - **Paymaster path** (`execute_from_outside_v3`): the token becomes
+    calldata. Envelope = 4 (outer `__execute__`) + 6 (`OutsideExecutionV3`
+    header: caller, 2-felt nonce, after, before, calls len) + 3 (inner call
+    header) + 1 + (17 + merkle_depth) (signature span with cached
+    authorization: Session 5, cache flag 1, empty auth 1, two Starknet
+    `SignerSignature`s 4+4, proofs 2+d) ≈ **31–34 felts** — the head
+    shrinks to ~4,960 slots and the storage tail grows by ~30 slots. The
+    *first* session use carries the WebAuthn authorization in
+    `session_authorization` (~hundreds of felts) — do the session's first
+    use on a cheap call, not on `verify_phase1`.
 - Mobile is explicitly deferred (egui is weak there; desktop/laptop is the
   target).
 
