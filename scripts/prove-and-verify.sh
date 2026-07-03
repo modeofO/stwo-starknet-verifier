@@ -24,9 +24,17 @@ mkdir -p "$OUT_DIR"
 
 PROOF_JSON="$OUT_DIR/multiverifier_proof.json"
 PREIMAGE_JSON="$OUT_DIR/output_preimage.json"
+CAIRO_PROOF_JSON="$OUT_DIR/cairo_proof.json"
 
-echo "=== proving (bootloader -> stwo -> circuit -> multiverifier) ==="
-"$BRIDGE" "$TASK" "$PROOF_JSON" "$PREIMAGE_JSON" ${ARGS_FILE:+"$ARGS_FILE"}
+# Two stages across the proof-only boundary (docs/proof-only-wrapping.md):
+# `prove` is the client side (program + witness stay here), `wrap` is the
+# untrusted middleman side (sees only the proof + public output preimage).
+echo "=== stage 1: prove (client side: bootloader -> stwo proof) ==="
+"$BRIDGE" prove "$TASK" "$CAIRO_PROOF_JSON" "$PREIMAGE_JSON" ${ARGS_FILE:+"$ARGS_FILE"}
+
+echo
+echo "=== stage 2: wrap (proof-only: circuit -> multiverifier) ==="
+"$BRIDGE" wrap "$CAIRO_PROOF_JSON" "$PREIMAGE_JSON" "$PROOF_JSON"
 
 echo
 echo "=== verifying with the Cairo circuit verifier (the deployable one) ==="
@@ -35,5 +43,6 @@ cd "$REPO_ROOT/vendor/stwo_cairo_verifier"
   --print-resource-usage --arguments-file "$PROOF_JSON"
 
 echo
+echo "cairo proof:      $CAIRO_PROOF_JSON  (the client->wrapper handoff)"
 echo "proof:            $PROOF_JSON"
 echo "output preimage:  $PREIMAGE_JSON"

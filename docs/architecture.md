@@ -112,8 +112,14 @@ progresses. Rationale and design:
 
 **Build order gate:** no app scaffolding until at least one of these lands —
 (a) proof-only wrapping (client hands the middleman a *proof*, not a
-program+witness: embed the app program in the cairo-verifier circuit config
-and match the browser prover's channel/parameters), or (b) the wrap chain
-compiling to wasm32 (memory feasibility probe first). And the golden goose
-remains **lane 2**: the sovereign resumable full-Cairo verifier, for which
-the phase-checkpoint machinery in `stwo_verifier_phases` is the seed.
+program+witness), or (b) the wrap chain compiling to wasm32 (memory
+feasibility probe first). **Status 2026-07-03: (a) landed**
+([`proof-only-wrapping.md`](./proof-only-wrapping.md)) — the bridge's
+`prove`/`wrap` split gives clients a proof-only relayer boundary today, with
+the bootloader running client-side. (b) is dead as wasm32 (7.9–13.6+ GB
+peaks vs the 4 GB ceiling); the browser story is a custom WASM64 build of
+the pinned privacy stack. App scaffolding is therefore unblocked, but the
+golden goose remains **lane 2**: the sovereign resumable full-Cairo
+verifier, for which the phase-checkpoint machinery in
+`stwo_verifier_phases` is the seed — it stays ahead of the client app in
+priority.

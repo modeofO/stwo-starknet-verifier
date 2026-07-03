@@ -1,19 +1,37 @@
-//! End-to-end bridge from an application Cairo PIE to the felt252 proof stream
-//! consumed by the on-chain Stwo circuit verifier
-//! (stwo-cairo `stwo_circuit_verifier`, `main(proof: CircuitProof) -> VerificationOutput`).
+//! Bridge from an application Cairo program to the felt252 proof stream consumed by
+//! the on-chain Stwo circuit verifier (stwo-cairo `stwo_circuit_verifier`,
+//! `main(proof: CircuitProof) -> VerificationOutput`).
 //!
-//! Chain (mirrors stwo-circuits' `circuit_multiverifier::verify_test`
-//! `test_serialize_multiverifier_proof_for_cairo1_verifier`, but over a caller-supplied PIE):
-//!   1. Run the PIE under the privacy simple bootloader; adapt to ProverInput.
-//!   2. Stwo-prove the bootloader run (Blake2sM31 channel, privacy params).
-//!   3. Verify that Cairo proof inside the cairo-verifier circuit (privacy config,
-//!      padded to the multiverifier's target sizes); circuit-prove the assignment.
-//!   4. Build the multiverifier circuit over two copies of that circuit proof;
-//!      circuit-prove it with the lossless Blake2s channel.
-//!   5. Serialize with `prepare_circuit_proof_for_cairo_verifier` to a JSON hex felt array
-//!      (the `scarb execute --arguments-file` format).
+//! Subcommands (the proof-only boundary is the point — see docs/architecture.md):
 //!
-//! Usage: privacy_prove_cairo_bridge <cairo_pie.zip> <proof_out.json> [preimage_out.json]
+//!   prove <task> <cairo_proof_out.json> <preimage_out.json> [program_args.json]
+//!       CLIENT SIDE. Runs the task under the privacy simple bootloader and
+//!       Stwo-proves the run (Blake2sM31 channel, privacy params, extended proof
+//!       with aux data). Emits a serde-JSON `CairoProof<Blake2sMerkleHasher>` and
+//!       the bootloader output preimage (both public; the witness never leaves).
+//!
+//!   wrap <cairo_proof.json> <preimage.json> <proof_out.json>
+//!       WRAPPER SIDE. Takes ONLY the proof + output preimage — no program, no
+//!       witness. Verifies the Cairo proof inside the cairo-verifier circuit
+//!       (privacy config: the bootloader program embedded in the circuit),
+//!       circuit-proves it, wraps in the multiverifier, serializes for the
+//!       on-chain verifier.
+//!
+//!   wrap-app <cairo_proof.json> <proof_out.json>
+//!       WRAPPER SIDE, experimental (spike: proof-only wrapping of direct app
+//!       proofs). Embeds the proven program itself in the cairo-verifier circuit
+//!       config — program, outputs and component set are taken from the proof's
+//!       public data; the pinned preprocessed root and privacy PCS config are
+//!       enforced. Requires the proof to have the full 11-segment public layout
+//!       (bootloader-shaped); raw standalone-executable proofs do not (see
+//!       docs/proof-only-wrapping.md).
+//!
+//!   full <task> <proof_out.json> [preimage_out.json] [program_args.json]
+//!       Legacy one-shot: prove + wrap in memory. Also the default when the
+//!       first argument is not a subcommand (backwards compatible).
+//!
+//! Chain mirrors stwo-circuits' `circuit_multiverifier::verify_test`
+//! `test_serialize_multiverifier_proof_for_cairo1_verifier`.
 
 use std::path::PathBuf;
 
@@ -21,25 +39,28 @@ use cairo_vm::vm::runners::cairo_pie::CairoPie;
 use circuit_cairo_serialize::proof::prepare_circuit_proof_for_cairo_verifier;
 use cairo_air::flat_claims::FlatClaim;
 use cairo_air::verifier::INTERACTION_POW_BITS as CAIRO_INTERACTION_POW_BITS;
+use cairo_air::CairoProof;
 use circuit_cairo_verifier::all_components::all_components as all_cairo_components;
 use indexmap::IndexMap;
 use privacy_circuit_verify::consts::CAIRO_PCS_CONFIG;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+use stwo_cairo_common::prover_types::felt::split_f252;
 use circuit_cairo_verifier::privacy::get_pcs_config;
+use circuit_cairo_verifier::statement::MEMORY_VALUES_LIMBS;
 use circuit_cairo_verifier::verify::{
-    build_cairo_verifier_circuit, build_fixed_cairo_circuit,
-    prepare_cairo_proof_for_circuit_verifier,
+    build_cairo_verifier_circuit, build_fixed_cairo_circuit, get_preprocessed_root,
+    prepare_cairo_proof_for_circuit_verifier, CairoVerifierConfig,
 };
 use privacy_circuit_verify::{compute_privacy_bootloader_output, get_cairo_verifier_config};
-use circuit_common::finalize::{ComponentSizes, pad_to_targets};
+use circuit_common::finalize::{pad_to_targets, ComponentSizes};
 use circuit_common::preprocessed::PreprocessedCircuit;
-use circuit_multiverifier::verify::{MultiverifierInput, SharedConfig, build_multiverifier_circuit};
+use circuit_multiverifier::verify::{build_multiverifier_circuit, MultiverifierInput, SharedConfig};
 use circuit_prover::prover::{
     prepare_circuit_proof_for_circuit_verifier, prove_circuit_assignment,
     prove_circuit_assignment_with_channel,
 };
 use circuit_verifier::statement::{
-    INTERACTION_POW_BITS, all_circuit_components, circuit_component_log_sizes,
+    all_circuit_components, circuit_component_log_sizes, INTERACTION_POW_BITS,
 };
 use circuits::blake::HashValue;
 use circuits::ivalue::NoValue;
@@ -49,19 +70,24 @@ use cairo_program_runner_lib::tasks::create_cairo1_program_task;
 use cairo_program_runner_lib::Task;
 use privacy_prove::consts::CAIRO_PROVER_PARAMS;
 use privacy_prove::run_privacy_bootloader_task;
+use starknet_types_core::felt::Felt;
+use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
-use stwo::core::pcs::PcsConfig;
-use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
+use stwo::core::vcs_lifted::blake2_merkle::{
+    Blake2sM31MerkleChannel, Blake2sMerkleChannel, Blake2sMerkleHasher,
+};
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::mempool::BaseColumnPool;
 use stwo_cairo_prover::prover::prove_cairo;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
+type Error = Box<dyn std::error::Error>;
+
 // Constants mirroring `circuit_multiverifier::verify_test` at this rev; the multiverifier
 // preprocessed root they produce is what the on-chain Cairo verifier pins.
 const PRIVACY_CAIRO_VERIFIER_TRACE_LOG_SIZE: u32 = 21;
 const LOG_BLOWUP_FACTOR: u32 = 3;
-const PCS_CONFIG: PcsConfig =
+const PCS_CONFIG: stwo::core::pcs::PcsConfig =
     get_pcs_config(PRIVACY_CAIRO_VERIFIER_TRACE_LOG_SIZE, LOG_BLOWUP_FACTOR);
 const TARGET_PADDING_SIZES: ComponentSizes = ComponentSizes {
     eq: 1 << 17,
@@ -125,65 +151,69 @@ fn multiverifier_preprocessed_column_log_sizes() -> OrderedHashMap<PreProcessedC
     .collect()
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().init();
-    let mut args = std::env::args().skip(1);
-    let usage = "usage: privacy_prove_cairo_bridge <task.pie.zip|task.executable.json> <proof_out.json> [preimage_out.json] [program_args_file.json]";
-    let task_path = PathBuf::from(args.next().expect(usage));
-    let out_path = PathBuf::from(args.next().expect(usage));
-    let preimage_out = args.next().map(PathBuf::from);
-    let program_args_file = args.next().map(PathBuf::from);
-
-    // 1. Bootloader run. Cairo 1 executables (scarb `.executable.json`) run as
-    // Cairo1Program tasks; `.zip` inputs are treated as Cairo PIEs.
-    eprintln!("[1/5] running privacy bootloader over {}", task_path.display());
+/// Stages 1–2: bootloader run + Stwo proof of it (the client side of the boundary).
+fn prove_stage(
+    task_path: &PathBuf,
+    program_args_file: Option<PathBuf>,
+) -> Result<(CairoProof<Blake2sMerkleHasher>, Vec<Felt>), Error> {
+    eprintln!("[prove 1/2] running privacy bootloader over {}", task_path.display());
     let task = if task_path.extension().is_some_and(|e| e == "json") {
-        create_cairo1_program_task(&task_path, None, program_args_file)
+        create_cairo1_program_task(task_path, None, program_args_file)
             .map_err(|e| format!("create_cairo1_program_task: {e:?}"))?
     } else {
-        Task::Pie(CairoPie::read_zip_file(&task_path)?)
+        Task::Pie(CairoPie::read_zip_file(task_path)?)
     };
     let (prover_input, output_preimage) = run_privacy_bootloader_task(task)?;
 
-    // 2. Cairo proof of the bootloader run.
-    eprintln!("[2/5] stwo-proving the bootloader run");
+    eprintln!("[prove 2/2] stwo-proving the bootloader run");
     let cairo_proof = prove_cairo::<Blake2sM31MerkleChannel>(prover_input, CAIRO_PROVER_PARAMS)?;
+    Ok((cairo_proof, output_preimage))
+}
 
-    // 3. Cairo-verifier circuit proof (production fixed-circuit path: the circuit
-    // config embeds the bootloader program actually proven above).
-    eprintln!("[3/5] circuit-proving the cairo verification");
-    let mut cairo_verifier_config = get_cairo_verifier_config()?;
+/// Checks the invariants the wrapper relies on at the proof-only boundary.
+fn check_proof_shape(cairo_proof: &CairoProof<Blake2sMerkleHasher>) -> Result<(), Error> {
+    let pcs = &cairo_proof.extended_stark_proof.proof.config;
+    if *pcs != CAIRO_PCS_CONFIG {
+        return Err(format!(
+            "proof PCS config {pcs:?} does not match the privacy config {CAIRO_PCS_CONFIG:?} \
+             (the client must prove with the privacy prover parameters)"
+        )
+        .into());
+    }
+    if cairo_proof.preprocessed_trace_variant != PreProcessedTraceVariant::CanonicalSmall {
+        return Err(format!(
+            "proof preprocessed trace variant {:?} != CanonicalSmall",
+            cairo_proof.preprocessed_trace_variant
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Stages 3–5 over an already-built cairo-verifier circuit config: circuit-prove the
+/// cairo verification, wrap in the multiverifier, serialize for the on-chain verifier.
+fn wrap_stage(
+    cairo_proof: &CairoProof<Blake2sMerkleHasher>,
+    cairo_verifier_config: &CairoVerifierConfig,
+    outputs: Vec<[M31; MEMORY_VALUES_LIMBS]>,
+    out_path: &PathBuf,
+) -> Result<(), Error> {
     let FlatClaim { component_enable_bits, .. } = cairo_proof.claim.flatten_claim();
-    // The canonical privacy config fixes the component set of the privacy transaction;
-    // arbitrary payloads enable a different set (e.g. no pedersen). Rebuild the circuit
-    // config for THIS proof's component set. The resulting circuit root differs per
-    // component set, but it enters the multiverifier as a free input.
-    let enabled: IndexMap<_, _> = all_cairo_components::<NoValue>()
-        .into_iter()
-        .zip(component_enable_bits.iter())
-        .filter_map(|((name, component), &bit)| bit.then_some((name, component)))
-        .collect();
-    cairo_verifier_config.enabled_bits = component_enable_bits.clone();
-    cairo_verifier_config.proof_config = ProofConfig::new(
-        &enabled,
-        PreProcessedTraceVariant::CanonicalSmall.n_columns(),
-        &CAIRO_PCS_CONFIG,
-        CAIRO_INTERACTION_POW_BITS,
-    );
+
+    eprintln!("[wrap 1/3] circuit-proving the cairo verification");
     let (prepared_proof, serialized_aux_data) =
-        prepare_cairo_proof_for_circuit_verifier(&cairo_proof, &component_enable_bits);
-    let bootloader_outputs = compute_privacy_bootloader_output(&output_preimage);
+        prepare_cairo_proof_for_circuit_verifier(cairo_proof, &component_enable_bits);
     let mut context = build_fixed_cairo_circuit(
-        &cairo_verifier_config,
+        cairo_verifier_config,
         prepared_proof,
         serialized_aux_data,
-        vec![bootloader_outputs],
+        outputs,
     );
     if !context.is_circuit_valid() {
         return Err("cairo-verifier circuit is not valid over this proof".into());
     }
     pad_to_targets(&mut context, TARGET_PADDING_SIZES);
-    let mut novalue_context = build_cairo_verifier_circuit(&cairo_verifier_config);
+    let mut novalue_context = build_cairo_verifier_circuit(cairo_verifier_config);
     pad_to_targets(&mut novalue_context, TARGET_PADDING_SIZES);
     let preprocessed = PreprocessedCircuit::preprocess_circuit(&mut novalue_context);
     let pool = BaseColumnPool::<SimdBackend>::new();
@@ -192,6 +222,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let inner_preprocessed_root: HashValue<QM31> =
         circuit_proof.stark_proof.proof.commitments.0[0].into();
+    eprintln!(
+        "[wrap 1/3] inner circuit root (consumers whitelist this): {:?}",
+        inner_preprocessed_root.0.each_ref().map(|w| *w.get())
+    );
     let (inner_proof, inner_public_data) =
         prepare_circuit_proof_for_circuit_verifier(circuit_proof);
     let output_values: [QM31; circuit_common::N_RESERVED] = inner_public_data
@@ -200,8 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .try_into()
         .map_err(|_| "unexpected number of inner output values")?;
 
-    // 4. Multiverifier proof over two copies of the inner proof.
-    eprintln!("[4/5] circuit-proving the multiverifier");
+    eprintln!("[wrap 2/3] circuit-proving the multiverifier");
     let shared_config = SharedConfig {
         pcs_config: PCS_CONFIG,
         proof_config: ProofConfig::new(
@@ -223,6 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     multiverifier_context.validate_circuit();
     let preprocessed_multiverifier =
         PreprocessedCircuit::preprocess_circuit(&mut multiverifier_context);
+    let pool = BaseColumnPool::<SimdBackend>::new();
     let multi_circuit_proof = prove_circuit_assignment_with_channel::<Blake2sMerkleChannel>(
         multiverifier_context.values(),
         &preprocessed_multiverifier,
@@ -230,21 +264,203 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PCS_CONFIG,
     )?;
 
-    // 5. Serialize for the on-chain Cairo verifier.
-    eprintln!("[5/5] serializing for the Cairo1 verifier");
+    eprintln!("[wrap 3/3] serializing for the Cairo1 verifier");
     let component_log_sizes = circuit_component_log_sizes(
         &all_circuit_components::<NoValue>(),
         &preprocessed_multiverifier.preprocessed_trace.log_sizes(),
     );
     let felts = prepare_circuit_proof_for_cairo_verifier(multi_circuit_proof, &component_log_sizes);
     let hex: Vec<String> = felts.iter().map(|f| format!("0x{f:x}")).collect();
-    std::fs::write(&out_path, serde_json::to_string(&hex)?)?;
+    std::fs::write(out_path, serde_json::to_string(&hex)?)?;
     eprintln!("wrote {} felts to {}", hex.len(), out_path.display());
+    Ok(())
+}
 
-    if let Some(p) = preimage_out {
-        let pre: Vec<String> = output_preimage.iter().map(|f| format!("0x{f:x}")).collect();
-        std::fs::write(&p, serde_json::to_string(&pre)?)?;
-        eprintln!("wrote {} output preimage felts to {}", pre.len(), p.display());
+/// The privacy (bootloader-embedded) cairo-verifier circuit config, adjusted to this
+/// proof's component set. The canonical privacy config fixes the component set of the
+/// privacy transaction; arbitrary payloads enable a different set (e.g. no pedersen).
+/// The resulting circuit root differs per component set, but it enters the multiverifier
+/// as a free input that the final statement binds.
+fn bootloader_config_for_proof(
+    cairo_proof: &CairoProof<Blake2sMerkleHasher>,
+) -> Result<CairoVerifierConfig, Error> {
+    let mut config = get_cairo_verifier_config()?;
+    let FlatClaim { component_enable_bits, .. } = cairo_proof.claim.flatten_claim();
+    let enabled: IndexMap<_, _> = all_cairo_components::<NoValue>()
+        .into_iter()
+        .zip(component_enable_bits.iter())
+        .filter_map(|((name, component), &bit)| bit.then_some((name, component)))
+        .collect();
+    config.enabled_bits = component_enable_bits;
+    config.proof_config = ProofConfig::new(
+        &enabled,
+        PreProcessedTraceVariant::CanonicalSmall.n_columns(),
+        &CAIRO_PCS_CONFIG,
+        CAIRO_INTERACTION_POW_BITS,
+    );
+    Ok(config)
+}
+
+/// Design-B config: the *proven application program itself* is embedded in the circuit
+/// (instead of the privacy bootloader). Program, outputs and component set come from the
+/// proof's public data; the preprocessed root and PCS config are pinned, NOT taken from
+/// the proof. The circuit root then binds the app program + component set + topology —
+/// consumers whitelist the expected root per application.
+fn app_config_for_proof(
+    cairo_proof: &CairoProof<Blake2sMerkleHasher>,
+) -> Result<(CairoVerifierConfig, Vec<[M31; MEMORY_VALUES_LIMBS]>), Error> {
+    let FlatClaim { component_enable_bits, public_data, .. } = cairo_proof.claim.flatten_claim();
+
+    let n_present_segments = public_data.public_memory.public_segments.present_segments().len();
+    eprintln!(
+        "[wrap-app] proof shape: {} public segments, {} program cells, {} outputs",
+        n_present_segments,
+        public_data.public_memory.program.len(),
+        public_data.public_memory.output.len(),
+    );
+
+    let program: Vec<[M31; MEMORY_VALUES_LIMBS]> = public_data
+        .public_memory
+        .program
+        .iter()
+        .map(|(_id, value)| split_f252(*value))
+        .collect();
+    let outputs: Vec<[M31; MEMORY_VALUES_LIMBS]> = public_data
+        .public_memory
+        .output
+        .iter()
+        .map(|(_id, value)| split_f252(*value))
+        .collect();
+
+    let enabled: IndexMap<_, _> = all_cairo_components::<NoValue>()
+        .into_iter()
+        .zip(component_enable_bits.iter())
+        .filter_map(|((name, component), &bit)| bit.then_some((name, component)))
+        .collect();
+    let proof_config = ProofConfig::new(
+        &enabled,
+        PreProcessedTraceVariant::CanonicalSmall.n_columns(),
+        &CAIRO_PCS_CONFIG,
+        CAIRO_INTERACTION_POW_BITS,
+    );
+    let lifting_log_size = proof_config.fri.log_evaluation_domain_size() as u32;
+
+    let config = CairoVerifierConfig {
+        proof_config,
+        enabled_bits: component_enable_bits,
+        program: program.into(),
+        n_outputs: outputs.len(),
+        preprocessed_root: get_preprocessed_root(lifting_log_size),
+        preprocessed_trace_variant: PreProcessedTraceVariant::CanonicalSmall,
+    };
+    Ok((config, outputs))
+}
+
+fn read_cairo_proof(path: &PathBuf) -> Result<CairoProof<Blake2sMerkleHasher>, Error> {
+    eprintln!("reading Cairo proof from {}", path.display());
+    let bytes = std::fs::read(path)?;
+    let proof: CairoProof<Blake2sMerkleHasher> = serde_json::from_slice(&bytes)?;
+    check_proof_shape(&proof)?;
+    Ok(proof)
+}
+
+fn read_preimage(path: &PathBuf) -> Result<Vec<Felt>, Error> {
+    let hex: Vec<String> = serde_json::from_slice(&std::fs::read(path)?)?;
+    hex.iter().map(|s| Ok(Felt::from_hex(s)?)).collect()
+}
+
+fn write_preimage(path: &PathBuf, preimage: &[Felt]) -> Result<(), Error> {
+    let pre: Vec<String> = preimage.iter().map(|f| format!("0x{f:x}")).collect();
+    std::fs::write(path, serde_json::to_string(&pre)?)?;
+    eprintln!("wrote {} output preimage felts to {}", pre.len(), path.display());
+    Ok(())
+}
+
+/// Cross-checks that the claimed output preimage hashes to the proof's actual output
+/// value, so a wrapper operator gets a clear error instead of a deep circuit failure.
+fn bootloader_outputs_checked(
+    cairo_proof: &CairoProof<Blake2sMerkleHasher>,
+    output_preimage: &[Felt],
+) -> Result<Vec<[M31; MEMORY_VALUES_LIMBS]>, Error> {
+    let computed = compute_privacy_bootloader_output(output_preimage);
+    let FlatClaim { public_data, .. } = cairo_proof.claim.flatten_claim();
+    let from_proof: Vec<[M31; MEMORY_VALUES_LIMBS]> = public_data
+        .public_memory
+        .output
+        .iter()
+        .map(|(_id, value)| split_f252(*value))
+        .collect();
+    if from_proof != vec![computed] {
+        return Err("output preimage does not hash to the proof's output value".into());
+    }
+    Ok(vec![computed])
+}
+
+fn main() -> Result<(), Error> {
+    tracing_subscriber::fmt().init();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let usage = "usage:\n  \
+        privacy_prove_cairo_bridge prove <task.pie.zip|task.executable.json> <cairo_proof_out.json> <preimage_out.json> [program_args.json]\n  \
+        privacy_prove_cairo_bridge wrap <cairo_proof.json> <preimage.json> <proof_out.json>\n  \
+        privacy_prove_cairo_bridge wrap-app <cairo_proof.json> <proof_out.json>\n  \
+        privacy_prove_cairo_bridge [full] <task.pie.zip|task.executable.json> <proof_out.json> [preimage_out.json] [program_args.json]";
+
+    match argv.first().map(String::as_str) {
+        Some("prove") => {
+            let [task, proof_out, preimage_out] = ["task", "proof_out", "preimage_out"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    argv.get(i + 1).map(PathBuf::from).ok_or(format!("missing <{name}>\n{usage}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .try_into()
+                .unwrap();
+            let args_file = argv.get(4).map(PathBuf::from);
+            let (cairo_proof, output_preimage) = prove_stage(&task, args_file)?;
+            let json = serde_json::to_vec(&cairo_proof)?;
+            std::fs::write(&proof_out, &json)?;
+            eprintln!(
+                "wrote Cairo proof ({:.1} MB) to {}",
+                json.len() as f64 / 1e6,
+                proof_out.display()
+            );
+            write_preimage(&preimage_out, &output_preimage)?;
+        }
+        Some("wrap") => {
+            let proof_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;
+            let preimage_in = argv.get(2).map(PathBuf::from).ok_or(usage)?;
+            let out = argv.get(3).map(PathBuf::from).ok_or(usage)?;
+            let cairo_proof = read_cairo_proof(&proof_in)?;
+            let output_preimage = read_preimage(&preimage_in)?;
+            let outputs = bootloader_outputs_checked(&cairo_proof, &output_preimage)?;
+            let config = bootloader_config_for_proof(&cairo_proof)?;
+            wrap_stage(&cairo_proof, &config, outputs, &out)?;
+        }
+        Some("wrap-app") => {
+            let proof_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;
+            let out = argv.get(2).map(PathBuf::from).ok_or(usage)?;
+            let cairo_proof = read_cairo_proof(&proof_in)?;
+            let (config, outputs) = app_config_for_proof(&cairo_proof)?;
+            wrap_stage(&cairo_proof, &config, outputs, &out)?;
+        }
+        Some(first) => {
+            // `full`, or legacy positional form (first arg is the task path).
+            let offset = if first == "full" { 1 } else { 0 };
+            let task = argv.get(offset).map(PathBuf::from).ok_or(usage)?;
+            let out = argv.get(offset + 1).map(PathBuf::from).ok_or(usage)?;
+            let preimage_out = argv.get(offset + 2).map(PathBuf::from);
+            let args_file = argv.get(offset + 3).map(PathBuf::from);
+            let (cairo_proof, output_preimage) = prove_stage(&task, args_file)?;
+            check_proof_shape(&cairo_proof)?;
+            let outputs = bootloader_outputs_checked(&cairo_proof, &output_preimage)?;
+            let config = bootloader_config_for_proof(&cairo_proof)?;
+            wrap_stage(&cairo_proof, &config, outputs, &out)?;
+            if let Some(p) = preimage_out {
+                write_preimage(&p, &output_preimage)?;
+            }
+        }
+        None => return Err(usage.into()),
     }
     Ok(())
 }

@@ -42,9 +42,22 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   end-to-end in snforge: **3 transactions per fact** (2 packed staging txs +
   one verify tx at ~8.9e8 gas, 81% of the per-tx cap), 49,740 Sierra felts,
   audited libfuncs. Consumers integrate via `is_valid(fact)`.
-- **Next:** Sepolia declare/deploy (`scripts/declare-sepolia.sh`), consumer
-  hash-chain helper, WASM feasibility probe (serverless lane 1), then lane 2
-  — the sovereign resumable verifier, the desired end state.
+- **Lane 1 SHIPPED on Sepolia (2026-07-03)** — registry
+  `0x0194f440…c6aa`, fact
+  `0x640299e8…615c` verifies as `true` on-chain: the first on-chain-verified
+  Stwo fact anywhere. Two-phase resumable verification (the 1.21e9
+  per-invoke cap forced a FRI-boundary split), 3 classes, 3 txs per fact.
+  See the Sepolia addenda in [`docs/lane1-results.md`](./docs/lane1-results.md).
+- **Proof-only wrapping: done** —
+  [`docs/proof-only-wrapping.md`](./docs/proof-only-wrapping.md). The bridge
+  is split into `prove` (client side; witness never leaves) and `wrap`
+  (middleman sees only a 2.2 MB proof + 4-felt preimage); output is
+  byte-identical to the shipped fixture. Build-order gate (a) satisfied.
+  WASM verdict: wasm32 is dead (7.9–13.6+ GB peaks); browser = custom WASM64
+  build; native desktop client unaffected.
+- **Next:** lane 2 — the sovereign resumable full-Cairo verifier, the
+  desired end state — plus the consumer hash-chain helper and the Cartridge
+  Controller calldata-envelope measurement.
 
 ## Layout
 
