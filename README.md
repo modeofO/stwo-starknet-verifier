@@ -80,8 +80,16 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   forged-checkpoint rejections proven. Plus the resumable
   `poseidon_hash_span` sponge (the chunking primitive for the claim-mix
   and fri_answers monsters) and packing v2.
-- **Next:** lane 2 sub-phasing (chunked claim mix + fri_answers, then
-  per-section binding and class splitting); confirm the Controller
+- **Both lane-2 monsters solved** — chunked claim mixing
+  (`claim_mix.cairo`: pipeline over two pausable absorbers reproduces the
+  monolithic digest across 7 checkpointed chunks) and chunked
+  `fri_answers` (`fri_chunks.cairo`: query-range chunks over sliced
+  queried values, no fork needed — answers are per-query independent).
+  Both proven equivalent over the real fixture proof; all 9 lane-2 tests
+  green.
+- **Next:** assemble the production N-phase machine (per-section binding
+  digests, incremental claim checks, Merkle/FRI phase wiring, class
+  splitting of phase B), devnet pre-flight; confirm the Controller
   envelope with a live Sepolia session transaction.
 
 ## Layout

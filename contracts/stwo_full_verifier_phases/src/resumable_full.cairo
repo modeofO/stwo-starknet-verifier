@@ -331,7 +331,7 @@ pub fn phase_b(values: Span<felt252>, checkpoint: FullCheckpoint) -> FullVerific
 /// Reconstructs one committed Merkle tree's verifier-side state, mirroring
 /// `CommitmentSchemeVerifierTrait::commit` minus the channel mixing (the
 /// mixing already happened in phase A and is bound by the checkpoint digest).
-fn rebuild_tree(
+pub fn rebuild_tree(
     root: Hash, degree_bound_by_column: Span<u32>, log_blowup_factor: u32,
 ) -> MerkleVerifier<MerkleHasher> {
     let mut max_log_degree_bound = 0_u32;

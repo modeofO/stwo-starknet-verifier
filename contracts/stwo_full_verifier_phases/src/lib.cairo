@@ -2,6 +2,7 @@
 //! (poseidon252 configuration). See docs/lane2-design.md.
 
 pub mod claim_mix;
+pub mod fri_chunks;
 pub mod resumable_full;
 pub mod sponge;
 

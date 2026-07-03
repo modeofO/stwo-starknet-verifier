@@ -183,11 +183,19 @@ as lane 1 — see proof-only-wrapping.md).
      budget; the fixture's 2,597 entries ≈ 5 txs). The output hash is
      precomputed in `begin` and applied at its transcript position in
      `finalize`.
-   - chunked `fri_answers` (12.75M): fork `quotients.cairo` with
-     column-range chunking; state = per-query partial accumulators
-     (~70 QM31 + the running `random_coeff` power ≈ 300 felts) +
-     per-tree queried-values digests established by the Merkle phases.
-     Per-chunk snforge cost probes as for the claim mix.
+   - ~~chunked `fri_answers`~~ **done (2026-07-03), and no fork was
+     needed:** each query's answer is independent and the queried values
+     are consumed query-major with a fixed per-tree stride (one M31 per
+     column), so a transaction computes any contiguous query range by
+     calling the *vendored* `fri_answers` verbatim over the range's
+     positions and per-tree queried-values slices
+     (`src/fri_chunks.cairo`: `queried_values_strides` +
+     `slice_queried_values`). Cross-chunk state is just the accumulated
+     answers; the per-group quotient constants recompute per tx (≈ one
+     extra query's cost). Equivalence over the real proof: 5 chunks of ≤16
+     queries == single-shot (`tests/test_fri_chunks.cairo`). Production
+     binding of a chunk's slice: per-tree queried-values digests from the
+     Merkle phases.
 4. Wire the remaining blocks (OODS tx, Merkle txs, FRI txs), per-section
    binding digests replacing the whole-stream `proof_hash`, devnet
    pre-flight (gas per phase, digit-exact per lane-1 experience), Sepolia
