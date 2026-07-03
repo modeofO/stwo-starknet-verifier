@@ -12,7 +12,7 @@ use crate::fields::m31::M31Zero;
 use crate::fields::qm31::QM31Trait;
 use crate::fri::FriConfig;
 
-mod quotients;
+pub mod quotients;
 pub mod verifier;
 #[cfg(test)]
 mod verifier_test;

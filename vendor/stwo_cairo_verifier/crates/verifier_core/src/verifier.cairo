@@ -126,7 +126,7 @@ fn repeated_circle_double_x(x: QM31, n: u32) -> QM31 {
 
 /// Attempts to extract and compute the composition trace evaluation from the mask.
 /// Returns `None` if the mask does not match the expected structure.
-fn try_extract_composition_eval(
+pub fn try_extract_composition_eval(
     mask: TreeSpan<ColumnSpan<Span<QM31>>>,
     oods_point: CirclePoint<QM31>,
     trace_log_degree_bound: u32,

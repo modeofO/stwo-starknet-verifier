@@ -5,7 +5,7 @@ edition = "2024_07"
 
 [dependencies]
 starknet = "2.18.0"
-stwo_circuit_air = { path = "../../vendor/stwo_cairo_verifier/crates/circuit_air" }
+stwo_verifier_phases = { path = "../stwo_verifier_phases" }
 
 # NOTE: blake2s configuration (no features) — the circuit verifier only
 # supports the blake2s hasher, and blake2s libfuncs are in the audited set.
@@ -14,6 +14,8 @@ stwo_circuit_air = { path = "../../vendor/stwo_cairo_verifier/crates/circuit_air
 sierra = true
 # Deployability probe: enforce the allowlist used for declared classes.
 allowed-libfuncs-list.name = "audited"
+# Make the phase library classes declarable from this package's tests.
+build-external-contracts = ["stwo_verifier_phases::StwoPhase1", "stwo_verifier_phases::StwoPhase2"]
 
 [dev-dependencies]
 snforge_std = "0.61.0"

@@ -3,114 +3,69 @@
 //! Accepts Stwo multiverifier circuit proofs (the recursion route: an
 //! application program is proven under the privacy simple bootloader, that
 //! proof is verified inside the cairo-verifier circuit, and a multiverifier
-//! circuit proof of that verification is what lands here). Because proofs
-//! (~36k felts) exceed the per-transaction calldata limit (5,000 felts), they
-//! are staged into storage across multiple transactions, then verified and
-//! registered in a single transaction.
+//! circuit proof of that verification is what lands here).
+//!
+//! Verification runs in two transactions because the monolithic verifier
+//! (~1.4e9 L2 gas) exceeds Starknet's 1.21e9 per-invoke cap, and the
+//! verification code itself exceeds the 81,920-felt CASM cap when combined
+//! in one class. The phases live in two *library classes*
+//! (`stwo_verifier_phases`), invoked via `library_call`; their class hashes
+//! are fixed at construction and cannot be changed (a swappable verifier is
+//! a rug vector).
+//!
+//! Flow (3 transactions per fact):
+//!   1. `stage_proof` — stage the packed proof's tail (the part beyond the
+//!      5,000-felt calldata limit of the phase-1 transaction).
+//!   2. `verify_phase1` — head via calldata + staged tail: prologue, OODS,
+//!      tree Merkle decommitments, FRI answers; stores a small checkpoint.
+//!   3. `verify_phase2` — the proof's FRI section via calldata: FRI
+//!      decommitment bound to the checkpoint; registers the fact.
 //!
 //! The registered fact is `poseidon(output_hash words)`, where `output_hash`
-//! is the verifier's output `blake2s(multiverifier_preprocessed_root ‖
-//! output_values)`. Consumer contracts recompute the expected output hash
-//! chain (binding the application program hash and its outputs — see
-//! docs/spike3-results.md) and check `is_valid(fact)`.
-
-use stwo_circuit_air::VerificationOutput;
-
-/// The escape marker of the packed-proof encoding (see `unpack_proof`).
-const ESCAPE: u32 = 0xFFFFFFFF;
+//! is `blake2s(multiverifier_preprocessed_root ‖ output_values)`, binding
+//! the application program hash and outputs via a blake2s chain (see
+//! docs/spike3-results.md). Consumers check `is_valid(fact)`.
 
 #[starknet::interface]
 pub trait IStwoFactRegistry<TContractState> {
-    /// Stages `slots` of a *packed* serialized `CircuitProof` at slot
-    /// `offset` under the caller's `proof_id`. Chunks are keyed by caller,
-    /// so uploads cannot be griefed by third parties.
-    ///
-    /// Packing format (storage syscalls dominate gas, and proof streams are
-    /// almost entirely u32-valued): each slot holds 7 little-endian 32-bit
-    /// limbs (`slot = Σ limb_i · 2^(32·i)`). A limb of `0xFFFFFFFF` is an
-    /// escape: the next two limbs are the low/high halves of a u64 value.
-    /// Values ≥ 2^64 do not occur in circuit-proof streams.
+    /// Stages `slots` of the packed proof at slot `offset` under the
+    /// caller's `proof_id`. Chunks are keyed by caller, so uploads cannot
+    /// be griefed by third parties. Packing format: 7 little-endian u32
+    /// limbs per felt252 slot, `0xFFFFFFFF` escapes a u64 (low, high) pair.
     fn stage_proof(
         ref self: TContractState, proof_id: felt252, offset: u32, slots: Span<felt252>,
     );
 
-    /// Unpacks the staged proof (`n_slots` slots holding `n_values` proof
-    /// felts), verifies it with the Stwo circuit verifier, registers and
-    /// returns the fact. Panics if the proof is invalid or malformed.
-    fn verify_and_register(
-        ref self: TContractState, proof_id: felt252, n_slots: u32, n_values: u32,
-    ) -> felt252;
-
-    /// Like `verify_and_register`, but takes the head of the packed proof
-    /// directly as calldata and reads only `n_tail_slots` staged slots
-    /// (stored at indices 0..n_tail_slots) for the remainder.
-    ///
-    /// Rationale: storage reads dominate the all-storage variant's gas
-    /// (Starknet's per-invoke cap is 1.21e9 L2 gas and reading ~5k slots
-    /// costs ~3e8), while calldata is nearly free — but the per-transaction
-    /// calldata limit (5,000 felts) is just below a whole packed proof
-    /// (~5,147 slots). Splitting head-via-calldata / tail-via-storage yields
-    /// a two-transaction flow: one small staging tx, one verify tx.
-    fn verify_and_register_from_calldata(
+    /// Verification phase 1 over head-via-calldata + staged tail (slots
+    /// 0..n_tail_slots). Stores a checkpoint keyed by (caller, proof_id)
+    /// and returns the felt-stream offset of the proof's `fri_proof` field
+    /// (the client passes the stream from that offset, minus the trailing
+    /// channel_salt, to phase 2).
+    fn verify_phase1(
         ref self: TContractState,
         proof_id: felt252,
         head: Span<felt252>,
         n_tail_slots: u32,
         n_values: u32,
+    ) -> u32;
+
+    /// Verification phase 2: FRI decommitment over the packed `fri_proof`
+    /// section (calldata), bound to the phase-1 checkpoint. Registers and
+    /// returns the fact on success.
+    fn verify_phase2(
+        ref self: TContractState, proof_id: felt252, fri_slots: Span<felt252>, n_fri_values: u32,
     ) -> felt252;
 
     /// True iff `fact` was registered by a successful verification.
     fn is_valid(self: @TContractState, fact: felt252) -> bool;
+
+    /// The immutable phase library class hashes.
+    fn verifier_classes(self: @TContractState) -> (starknet::ClassHash, starknet::ClassHash);
 }
 
-/// Decodes the packed limb stream back into the proof's felt252 stream.
-pub fn unpack_proof(packed: Span<felt252>, n_values: u32) -> Array<felt252> {
-    // First pass: split each slot into 7 little-endian u32 limbs. Work on the
-    // slot's two u128 halves — u128 div-rem is far cheaper than u256's.
-    let nz32: NonZero<u128> = 0x100000000_u128.try_into().unwrap();
-    let mut limbs: Array<u32> = array![];
-    for slot in packed {
-        let v: u256 = (*slot).into();
-        // Low half: limbs 0-3.
-        let (q, l0) = DivRem::div_rem(v.low, nz32);
-        let (q, l1) = DivRem::div_rem(q, nz32);
-        let (l3, l2) = DivRem::div_rem(q, nz32);
-        // High half: limbs 4-6 (bits 224+ are always zero).
-        let (q, l4) = DivRem::div_rem(v.high, nz32);
-        let (l6, l5) = DivRem::div_rem(q, nz32);
-        limbs.append(l0.try_into().unwrap());
-        limbs.append(l1.try_into().unwrap());
-        limbs.append(l2.try_into().unwrap());
-        limbs.append(l3.try_into().unwrap());
-        limbs.append(l4.try_into().unwrap());
-        limbs.append(l5.try_into().unwrap());
-        limbs.append(l6.try_into().unwrap());
-    }
-
-    // Second pass: rebuild values, honoring the u64 escape encoding.
-    let limbs = limbs.span();
-    let mut values: Array<felt252> = array![];
-    let mut i: usize = 0;
-    while values.len() != n_values {
-        let limb = *limbs[i];
-        if limb == ESCAPE {
-            let lo: felt252 = (*limbs[i + 1]).into();
-            let hi: felt252 = (*limbs[i + 2]).into();
-            values.append(lo + hi * 0x100000000);
-            i += 3;
-        } else {
-            values.append(limb.into());
-            i += 1;
-        }
-    }
-    values
-}
-
-/// Derives the registry fact from a verification output:
-/// `poseidon(w0, …, w7)` over the 8 little-endian u32 words of
-/// `blake2s(multiverifier_preprocessed_root ‖ output_values)`.
-pub fn fact_from_output(output: @VerificationOutput) -> felt252 {
-    let [w0, w1, w2, w3, w4, w5, w6, w7] = (*output.output_hash.hash).unbox();
+/// Derives the registry fact from the output-hash words: `poseidon(w0…w7)`.
+pub fn fact_from_words(words: [u32; 8]) -> felt252 {
+    let [w0, w1, w2, w3, w4, w5, w6, w7] = words;
     core::poseidon::poseidon_hash_span(
         array![
             w0.into(), w1.into(), w2.into(), w3.into(), w4.into(), w5.into(), w6.into(),
@@ -125,16 +80,25 @@ mod StwoFactRegistry {
     use starknet::storage::{
         Map, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
     };
-    use starknet::{ContractAddress, get_caller_address};
-    use stwo_circuit_air::{CircuitProof, get_verification_output, verify_circuit};
-    use super::{IStwoFactRegistry, fact_from_output, unpack_proof};
+    use starknet::{ClassHash, ContractAddress, get_caller_address};
+    use stwo_verifier_phases::{
+        IStwoPhase1DispatcherTrait, IStwoPhase1LibraryDispatcher, IStwoPhase2DispatcherTrait,
+        IStwoPhase2LibraryDispatcher,
+    };
+    use super::{IStwoFactRegistry, fact_from_words};
 
     #[storage]
     struct Storage {
-        /// Staged proof words: (uploader, proof_id, word index) -> felt.
+        /// Immutable phase library class hashes (set at construction).
+        phase1_class: ClassHash,
+        phase2_class: ClassHash,
+        /// Staged proof slots: (uploader, proof_id, slot index) -> felt.
         proof_words: Map<(ContractAddress, felt252, u32), felt252>,
         /// Registered facts.
         facts: Map<felt252, bool>,
+        /// Serialized phase-1 checkpoints: length + words.
+        checkpoint_len: Map<(ContractAddress, felt252), u32>,
+        checkpoint_words: Map<(ContractAddress, felt252, u32), felt252>,
     }
 
     #[event]
@@ -152,6 +116,12 @@ mod StwoFactRegistry {
         proof_id: felt252,
     }
 
+    #[constructor]
+    fn constructor(ref self: ContractState, phase1_class: ClassHash, phase2_class: ClassHash) {
+        self.phase1_class.write(phase1_class);
+        self.phase2_class.write(phase2_class);
+    }
+
     #[abi(embed_v0)]
     impl StwoFactRegistryImpl of IStwoFactRegistry<ContractState> {
         fn stage_proof(
@@ -165,34 +135,13 @@ mod StwoFactRegistry {
             }
         }
 
-        fn verify_and_register(
-            ref self: ContractState, proof_id: felt252, n_slots: u32, n_values: u32,
-        ) -> felt252 {
-            let caller = get_caller_address();
-
-            let mut packed = array![];
-            let mut i = 0;
-            while i != n_slots {
-                packed.append(self.proof_words.entry((caller, proof_id, i)).read());
-                i += 1;
-            }
-            let fact = verify_packed(packed.span(), n_values);
-            self.facts.entry(fact).write(true);
-            self.emit(FactRegistered { fact, prover: caller, proof_id });
-            fact
-        }
-
-        fn is_valid(self: @ContractState, fact: felt252) -> bool {
-            self.facts.entry(fact).read()
-        }
-
-        fn verify_and_register_from_calldata(
+        fn verify_phase1(
             ref self: ContractState,
             proof_id: felt252,
             head: Span<felt252>,
             n_tail_slots: u32,
             n_values: u32,
-        ) -> felt252 {
+        ) -> u32 {
             let caller = get_caller_address();
 
             let mut packed = array![];
@@ -205,23 +154,54 @@ mod StwoFactRegistry {
                 i += 1;
             }
 
-            let fact = verify_packed(packed.span(), n_values);
+            let phase1 = IStwoPhase1LibraryDispatcher { class_hash: self.phase1_class.read() };
+            let serialized = phase1.run_phase1(packed.span(), n_values);
+
+            // The checkpoint's last field is `fri_value_offset` (see
+            // resumable::Checkpoint); surface it as the return value.
+            let fri_value_offset: u32 = (*serialized[serialized.len() - 1]).try_into().unwrap();
+
+            self.checkpoint_len.entry((caller, proof_id)).write(serialized.len());
+            let mut j = 0;
+            for word in serialized.span() {
+                self.checkpoint_words.entry((caller, proof_id, j)).write(*word);
+                j += 1;
+            }
+
+            fri_value_offset
+        }
+
+        fn verify_phase2(
+            ref self: ContractState, proof_id: felt252, fri_slots: Span<felt252>, n_fri_values: u32,
+        ) -> felt252 {
+            let caller = get_caller_address();
+
+            let len = self.checkpoint_len.entry((caller, proof_id)).read();
+            assert(len != 0, 'no phase1 checkpoint');
+            let mut serialized = array![];
+            let mut i = 0;
+            while i != len {
+                serialized.append(self.checkpoint_words.entry((caller, proof_id, i)).read());
+                i += 1;
+            }
+
+            let phase2 = IStwoPhase2LibraryDispatcher { class_hash: self.phase2_class.read() };
+            let output_hash = phase2.run_phase2(fri_slots, n_fri_values, serialized.span());
+
+            let fact = fact_from_words(output_hash);
             self.facts.entry(fact).write(true);
+            // Consume the checkpoint.
+            self.checkpoint_len.entry((caller, proof_id)).write(0);
             self.emit(FactRegistered { fact, prover: caller, proof_id });
             fact
         }
-    }
 
-    /// Unpacks, deserializes, verifies, and derives the fact.
-    fn verify_packed(packed: Span<felt252>, n_values: u32) -> felt252 {
-        let serialized = unpack_proof(packed, n_values);
-        let mut span = serialized.span();
-        let proof: CircuitProof = Serde::deserialize(ref span)
-            .expect('proof deserialization failed');
-        assert(span.is_empty(), 'trailing proof data');
+        fn is_valid(self: @ContractState, fact: felt252) -> bool {
+            self.facts.entry(fact).read()
+        }
 
-        let output = get_verification_output(@proof);
-        verify_circuit(:proof);
-        fact_from_output(@output)
+        fn verifier_classes(self: @ContractState) -> (ClassHash, ClassHash) {
+            (self.phase1_class.read(), self.phase2_class.read())
+        }
     }
 }

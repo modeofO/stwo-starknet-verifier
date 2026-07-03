@@ -25,7 +25,7 @@ const BYTES_PER_HASH: usize = 32;
 /// to zero. Every draw of 8 words increments `n_draws` by one.
 #[derive(Drop)]
 pub struct Blake2sChannel {
-    digest: Blake2sHash,
+    pub digest: Blake2sHash,
     /// Number of consecutive draws since the last value was mixed into the channel.
     n_draws: usize,
 }

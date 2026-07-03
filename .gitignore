@@ -4,3 +4,7 @@ target/
 
 # macOS
 .DS_Store
+
+# Profiler artifacts
+snfoundry_trace/
+profile*.pb.gz

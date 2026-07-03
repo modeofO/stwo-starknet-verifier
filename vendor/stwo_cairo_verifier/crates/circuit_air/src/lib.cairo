@@ -41,7 +41,7 @@ pub mod relations;
 
 // Security constants.
 pub const INTERACTION_POW_BITS: u32 = 20;
-const SECURITY_BITS: u32 = 96;
+pub const SECURITY_BITS: u32 = 96;
 
 pub const P_U32_CONST: u32 = P_U32;
 
@@ -206,7 +206,7 @@ pub fn verify_circuit(proof: CircuitProof) {
 /// In Cairo we have native `u64` arithmetic, so the accumulator in
 /// `stwo_constraint_framework::accumulate_relation_uses` already sums directly — the check
 /// here is the plain `< P` bound on that accumulated `u64`.
-fn verify_claim(component_log_sizes: [u32; N_COMPONENTS]) {
+pub fn verify_claim(component_log_sizes: [u32; N_COMPONENTS]) {
     let mut relation_uses: RelationUsesDict = Default::default();
     accumulate_circuit_relation_uses(component_log_sizes, ref relation_uses);
 

@@ -39,3 +39,16 @@ Manifests only — no Cairo source has been modified:
   - `cairo_test.workspace = true` → `cairo_test = "2.18.0"`
   - `cairo_execute.workspace = true` → `cairo_execute = "2.18.0"`
   - the `[tool] cairo-lint.workspace = true` entries were removed.
+
+### Visibility patches for the two-phase (resumable) verifier fork
+
+`contracts/stwo_verifier_phases/src/resumable.cairo` mirrors `verify_circuit`
+split at the FRI boundary and needs access to a few internals; the following
+were made `pub` (no logic changes):
+
+- `circuit_air/src/lib.cairo`: `verify_claim`, `SECURITY_BITS`, `mod privacy_consts`
+- `verifier_core/src/pcs.cairo`: `mod quotients`
+- `verifier_core/src/pcs/verifier.cairo`: `mix_sampled_values`
+- `verifier_core/src/verifier.cairo`: `try_extract_composition_eval`
+- `verifier_core/src/channel/blake2s.cairo`: `Blake2sChannel.digest` field
+  (checkpoint save/restore; `n_draws` is always 0 at the checkpoint site)
