@@ -87,7 +87,7 @@ pub mod utils;
 
 // Security constants.
 pub const INTERACTION_POW_BITS: u32 = 24;
-const SECURITY_BITS: u32 = 96;
+pub const SECURITY_BITS: u32 = 96;
 
 pub const ADD_MOD_MEMORY_CELLS: usize = 7;
 pub const BITWISE_MEMORY_CELLS: usize = 5;
@@ -263,7 +263,7 @@ pub fn verify_cairo(proof: CairoProof) {
 /// # Panics
 ///
 /// Panics if the claim is invalid.
-fn verify_claim(claim: @CairoClaim) {
+pub fn verify_claim(claim: @CairoClaim) {
     let PublicData {
         public_memory: PublicMemory {
             program, public_segments, output: _output, safe_call_ids: _safe_call_ids,

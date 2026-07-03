@@ -55,9 +55,17 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   byte-identical to the shipped fixture. Build-order gate (a) satisfied.
   WASM verdict: wasm32 is dead (7.9–13.6+ GB peaks); browser = custom WASM64
   build; native desktop client unaffected.
-- **Next:** lane 2 — the sovereign resumable full-Cairo verifier, the
-  desired end state — plus the consumer hash-chain helper and the Cartridge
-  Controller calldata-envelope measurement.
+- **Lane 2 groundwork: measured and designed** —
+  [`docs/lane2-design.md`](./docs/lane2-design.md). First real
+  poseidon-config proof of our fixture (301,143 felts;
+  `prove-poseidon` bridge subcommand) verified by the full vendored
+  verifier at **34.2M steps**, with a per-phase cost map from
+  `tools/lane2-probe` (claim mix 6.5M, logup 3.7M, fri_answers 12.7M, …).
+  Design: ~15-tx checkpoint state machine, storage-free section feeding
+  (self-authenticating / channel-bound / checkpoint classes).
+- **Next:** lane 2 build-out (packing v2 → poseidon channel checkpoint →
+  the two accumulator monsters), plus the consumer hash-chain helper and
+  the Cartridge Controller calldata-envelope measurement.
 
 ## Layout
 

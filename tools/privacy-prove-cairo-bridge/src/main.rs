@@ -26,6 +26,12 @@
 //!       (bootloader-shaped); raw standalone-executable proofs do not (see
 //!       docs/proof-only-wrapping.md).
 //!
+//!   prove-poseidon <task> <proof_out.json> <params.json> [program_args.json]
+//!       LANE 2. Runs the task under the privacy bootloader, then proves with
+//!       the given prover-params JSON (e.g. fixtures/prover_params_poseidon.json:
+//!       poseidon252 channel) and serializes cairo-serde felts for the FULL
+//!       vendored Cairo verifier (`stwo_cairo_verifier`, poseidon build).
+//!
 //!   full <task> <proof_out.json> [preimage_out.json] [program_args.json]
 //!       Legacy one-shot: prove + wrap in memory. Also the default when the
 //!       first argument is not a subcommand (backwards compatible).
@@ -151,11 +157,11 @@ fn multiverifier_preprocessed_column_log_sizes() -> OrderedHashMap<PreProcessedC
     .collect()
 }
 
-/// Stages 1–2: bootloader run + Stwo proof of it (the client side of the boundary).
-fn prove_stage(
+/// Runs the task under the privacy bootloader (stage 1 shared by all prove modes).
+fn bootloader_stage(
     task_path: &PathBuf,
     program_args_file: Option<PathBuf>,
-) -> Result<(CairoProof<Blake2sMerkleHasher>, Vec<Felt>), Error> {
+) -> Result<(stwo_cairo_adapter::ProverInput, Vec<Felt>), Error> {
     eprintln!("[prove 1/2] running privacy bootloader over {}", task_path.display());
     let task = if task_path.extension().is_some_and(|e| e == "json") {
         create_cairo1_program_task(task_path, None, program_args_file)
@@ -163,7 +169,15 @@ fn prove_stage(
     } else {
         Task::Pie(CairoPie::read_zip_file(task_path)?)
     };
-    let (prover_input, output_preimage) = run_privacy_bootloader_task(task)?;
+    Ok(run_privacy_bootloader_task(task)?)
+}
+
+/// Stages 1–2: bootloader run + Stwo proof of it (the client side of the boundary).
+fn prove_stage(
+    task_path: &PathBuf,
+    program_args_file: Option<PathBuf>,
+) -> Result<(CairoProof<Blake2sMerkleHasher>, Vec<Felt>), Error> {
+    let (prover_input, output_preimage) = bootloader_stage(task_path, program_args_file)?;
 
     eprintln!("[prove 2/2] stwo-proving the bootloader run");
     let cairo_proof = prove_cairo::<Blake2sM31MerkleChannel>(prover_input, CAIRO_PROVER_PARAMS)?;
@@ -403,6 +417,7 @@ fn main() -> Result<(), Error> {
         privacy_prove_cairo_bridge prove <task.pie.zip|task.executable.json> <cairo_proof_out.json> <preimage_out.json> [program_args.json]\n  \
         privacy_prove_cairo_bridge wrap <cairo_proof.json> <preimage.json> <proof_out.json>\n  \
         privacy_prove_cairo_bridge wrap-app <cairo_proof.json> <proof_out.json>\n  \
+        privacy_prove_cairo_bridge prove-poseidon <task> <proof_out.json> <params.json> [program_args.json]\n  \
         privacy_prove_cairo_bridge [full] <task.pie.zip|task.executable.json> <proof_out.json> [preimage_out.json] [program_args.json]";
 
     match argv.first().map(String::as_str) {
@@ -436,6 +451,29 @@ fn main() -> Result<(), Error> {
             let outputs = bootloader_outputs_checked(&cairo_proof, &output_preimage)?;
             let config = bootloader_config_for_proof(&cairo_proof)?;
             wrap_stage(&cairo_proof, &config, outputs, &out)?;
+        }
+        Some("prove-poseidon") => {
+            let task = argv.get(1).map(PathBuf::from).ok_or(usage)?;
+            let proof_out = argv.get(2).map(PathBuf::from).ok_or(usage)?;
+            let params = argv.get(3).map(PathBuf::from).ok_or(usage)?;
+            let args_file = argv.get(4).map(PathBuf::from);
+            let (prover_input, output_preimage) = bootloader_stage(&task, args_file)?;
+            eprintln!(
+                "[prove 2/2] stwo-proving with params {} (cairo-serde output)",
+                params.display()
+            );
+            stwo_cairo_prover::prover::create_and_serialize_proof(
+                prover_input,
+                false,
+                proof_out.clone(),
+                cairo_air::utils::ProofFormat::CairoSerde,
+                Some(params),
+            )?;
+            eprintln!("wrote cairo-serde proof to {}", proof_out.display());
+            eprintln!(
+                "output preimage: {:?}",
+                output_preimage.iter().map(|f| format!("0x{f:x}")).collect::<Vec<_>>()
+            );
         }
         Some("wrap-app") => {
             let proof_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;
