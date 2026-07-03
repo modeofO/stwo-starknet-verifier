@@ -1,0 +1,7 @@
+# Fixture programs to be proven with Stwo. Separate workspace from the repo
+# root: executables require `enable-gas = false`, contracts require gas ON.
+[workspace]
+members = ["poseidon_chain"]
+
+[cairo]
+enable-gas = false

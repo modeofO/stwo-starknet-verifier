@@ -10,12 +10,21 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
 
 ## Status
 
-- **Spike 1 (compile probe): done.** The full Cairo verifier compiles as a
-  `starknet-contract` with gas on and passes the `audited.json` libfunc
-  allowlist — the only deployment blocker is class size (~5.5× over the
-  Sierra bytecode cap). The newer *circuit* verifier fits **all** size caps
-  today but only verifies a hardcoded recursion circuit. See the results doc.
-- **Spike 2 (step-count measurement): next.**
+- **Spike 1 (compile probe): done** — [`docs/spike1-results.md`](./docs/spike1-results.md).
+  The full Cairo verifier compiles as a `starknet-contract` with gas on and
+  passes the `audited.json` libfunc allowlist — the only deployment blocker
+  is class size (~5.5× over the Sierra bytecode cap). The newer *circuit*
+  verifier fits **all** size caps today.
+- **Spike 2 (step-count measurement): done** — [`docs/spike2-results.md`](./docs/spike2-results.md).
+  First public numbers: verifying even the smallest Stwo proof with the full
+  Cairo verifier costs **10.0–15.9M steps** (at or 1.5× over the 1.1e9 L2
+  gas/tx budget) plus 65k–223k felts of proof vs a 5k-felt calldata cap.
+  The **circuit verifier** (recursion route) costs **3.79M steps ≈ 38% of
+  one tx** with a 35.7k-felt proof — single-tx verification is viable there.
+- **Spike 3 (recursion route end-to-end): next.** Drive
+  [stwo-circuits](https://github.com/starkware-libs/stwo-circuits) to wrap
+  an arbitrary program's proof in a circuit proof and check topology match
+  with the on-chain circuit verifier.
 
 ## Layout
 

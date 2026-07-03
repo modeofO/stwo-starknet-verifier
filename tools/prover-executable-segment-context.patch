@@ -1,0 +1,102 @@
+diff --git a/stwo_cairo_prover/crates/adapter/src/adapter.rs b/stwo_cairo_prover/crates/adapter/src/adapter.rs
+index ee3ef28..d5f749c 100644
+--- a/stwo_cairo_prover/crates/adapter/src/adapter.rs
++++ b/stwo_cairo_prover/crates/adapter/src/adapter.rs
+@@ -9,6 +9,13 @@ use crate::relocator::Relocator;
+ use crate::{PublicSegmentContext, StateTransitions};
+ 
+ pub fn adapt(runner: &CairoRunner) -> Result<ProverInput> {
++    adapt_with_context(runner, PublicSegmentContext::bootloader_context())
++}
++
++pub fn adapt_with_context(
++    runner: &CairoRunner,
++    public_segment_context: PublicSegmentContext,
++) -> Result<ProverInput> {
+     let _span = span!(Level::INFO, "adapt").entered();
+ 
+     // Extract the relevant information from the Runner.
+@@ -41,9 +48,6 @@ pub fn adapt(runner: &CairoRunner) -> Result<ProverInput> {
+     // TODO(spapini): Add output builtin to public memory.
+     let (memory, inst_cache) = memory.build();
+ 
+-    // TODO(Ohad): take this from the input.
+-    let public_segment_context = PublicSegmentContext::bootloader_context();
+-
+     Ok(ProverInput {
+         state_transitions,
+         memory,
+diff --git a/stwo_cairo_prover/crates/dev_utils/src/vm_utils.rs b/stwo_cairo_prover/crates/dev_utils/src/vm_utils.rs
+index 22b447e..1580369 100644
+--- a/stwo_cairo_prover/crates/dev_utils/src/vm_utils.rs
++++ b/stwo_cairo_prover/crates/dev_utils/src/vm_utils.rs
+@@ -15,8 +15,8 @@ use cairo_vm::types::relocatable::MaybeRelocatable;
+ use cairo_vm::Felt252;
+ use clap::ValueEnum;
+ use serde_json::from_reader;
+-use stwo_cairo_adapter::adapter::adapt;
+-use stwo_cairo_adapter::ProverInput;
++use stwo_cairo_adapter::adapter::adapt_with_context;
++use stwo_cairo_adapter::{ProverInput, PublicSegmentContext};
+ 
+ #[derive(Clone, Debug, ValueEnum)]
+ pub enum ProgramType {
+@@ -40,7 +40,7 @@ pub fn run_and_adapt(
+         ..Default::default()
+     };
+ 
+-    let (program, mut hints, exec_scopes) = match program_type {
++    let (program, mut hints, exec_scopes, public_segment_context) = match program_type {
+         ProgramType::Executable => {
+             let executable: Executable = from_reader(File::open(program_path)?)?;
+ 
+@@ -54,9 +54,21 @@ pub fn run_and_adapt(
+                 vec![]
+             };
+ 
++            // Standalone executables only carry the builtins they use; the
++            // bootloader context (all builtins present) misreads the
++            // initial/final ap windows for them.
++            let entrypoint_builtins = executable
++                .entrypoints
++                .iter()
++                .find(|e| matches!(e.kind, EntryPointKind::Standalone))
++                .context("Failed to find entrypoint")?
++                .builtins
++                .clone();
++            let public_segment_context = PublicSegmentContext::new(&entrypoint_builtins);
++
+             let (program, hints) = get_program_and_hints_from_executable(&executable, args)?;
+ 
+-            (program, hints, ExecutionScopes::new())
++            (program, hints, ExecutionScopes::new(), public_segment_context)
+         }
+         ProgramType::Json => {
+             let program = Program::from_bytes(&read(program_path)?, Some("main"))?;
+@@ -73,16 +85,20 @@ pub fn run_and_adapt(
+                 program,
+                 Box::new(BuiltinHintProcessor::new_empty()) as Box<dyn HintProcessor>,
+                 exec_scopes,
++                PublicSegmentContext::bootloader_context(),
+             )
+         }
+     };
+ 
+-    adapt(&cairo_run_program_with_initial_scope(
+-        &program,
+-        &cairo_run_config,
+-        hints.as_mut(),
+-        exec_scopes,
+-    )?)
++    adapt_with_context(
++        &cairo_run_program_with_initial_scope(
++            &program,
++            &cairo_run_config,
++            hints.as_mut(),
++            exec_scopes,
++        )?,
++        public_segment_context,
++    )
+ }
+ 
+ fn get_program_and_hints_from_executable(

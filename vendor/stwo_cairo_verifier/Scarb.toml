@@ -1,0 +1,19 @@
+# Workspace for running the vendored verifier *executables* (Spike 2
+# measurements). Separate from the repo-root workspace because executables
+# require `enable-gas = false` while the contract targets require gas ON.
+#
+# Only the executable crates are members; the lib crates compile as their
+# path dependencies with whatever features are passed on the CLI, e.g.:
+#   scarb --profile proving execute -p stwo_cairo_verifier \
+#     --features poseidon252_verifier --print-resource-usage \
+#     --arguments-file <proof.cairo_serde.json>
+[workspace]
+members = ["crates/cairo_verifier", "crates/circuit_verifier"]
+
+[cairo]
+enable-gas = false
+
+# Mirrors upstream: unsafe-panic shrinks the code for proving runs.
+[profile.proving.cairo]
+enable-gas = false
+unsafe-panic = true
