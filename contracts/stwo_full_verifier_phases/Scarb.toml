@@ -1,0 +1,40 @@
+[package]
+name = "stwo_full_verifier_phases"
+version = "0.1.0"
+edition = "2024_07"
+
+# Lane 2: resumable verification of the FULL Cairo verifier (poseidon252
+# configuration — the only contract-legal one). Currently a library crate:
+# the phase seams are validated in snforge against the real fixture proof
+# before being packaged into per-phase library classes (docs/lane2-design.md).
+
+[features]
+# The poseidon build is this crate's whole point; enable it by default so the
+# root workspace build exercises it.
+default = ["poseidon252_verifier", "poseidon_outputs_packing"]
+poseidon252_verifier = [
+    "stwo_cairo_air/poseidon252_verifier",
+    "stwo_verifier_core/poseidon252_verifier",
+]
+poseidon_outputs_packing = ["stwo_cairo_air/poseidon_outputs_packing"]
+
+[dependencies]
+stwo_cairo_air = { path = "../../vendor/stwo_cairo_verifier/crates/cairo_air" }
+stwo_verifier_core = { path = "../../vendor/stwo_cairo_verifier/crates/verifier_core" }
+stwo_constraint_framework = { path = "../../vendor/stwo_cairo_verifier/crates/constraint_framework" }
+stwo_verifier_utils = { path = "../../vendor/stwo_cairo_verifier/crates/verifier_utils" }
+
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
+
+[tool.snforge]
+# The equivalence test runs the full verifier ~2.5x (phase A + phase B +
+# monolithic reference) over a 301k-felt proof: ~100M VM steps.
+max_n_steps = 500000000

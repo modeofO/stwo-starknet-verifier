@@ -15,6 +15,7 @@ members = [
     "contracts/stwo_fact_registry",
     "contracts/stwo_verifier_phases",
     "contracts/stwo_fact_binding",
+    "contracts/stwo_full_verifier_phases",
 ]
 
 # Lint config used by the vendored upstream workspace, kept for parity.

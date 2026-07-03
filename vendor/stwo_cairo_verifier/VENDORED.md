@@ -60,3 +60,13 @@ boundaries to measure per-phase step costs; the following were made `pub`
 (no logic changes):
 
 - `cairo_air/src/lib.cairo`: `verify_claim`, `SECURITY_BITS`
+
+### Visibility patches for the lane-2 resumable fork (`contracts/stwo_full_verifier_phases`)
+
+Same pattern as the lane-1 blake2s channel patch, for the poseidon channel
+(no logic changes):
+
+- `verifier_core/src/channel/poseidon252.cairo`: `Poseidon252Channel.digest`
+  field made pub, and `new_channel(digest)` added (checkpoint save/restore;
+  `n_draws` is always 0 at the checkpoint sites, which are immediately after
+  a `mix_*`).

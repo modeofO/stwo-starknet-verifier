@@ -23,9 +23,16 @@ pub const BYTES_PER_HASH: usize = 31;
 /// to zero. Every draw of one `felt252` increments `n_draws` by one.
 #[derive(Drop, Default)]
 pub struct Poseidon252Channel {
-    digest: felt252,
+    pub digest: felt252,
     /// Number of consecutive draws since the last value was mixed into the channel.
     n_draws: usize,
+}
+
+/// Creates a channel from a saved digest (resumable-verification checkpoint
+/// restore). Valid checkpoint sites are immediately after a `mix_*`, where
+/// `n_draws == 0`.
+pub fn new_channel(digest: felt252) -> Poseidon252Channel {
+    Poseidon252Channel { digest, n_draws: Default::default() }
 }
 
 #[generate_trait]
