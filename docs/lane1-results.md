@@ -109,3 +109,54 @@ tx1, FRI decommitment phase in tx2; both re-read the staged proof, only the
 Fiat-Shamir state crosses. Alternatively, the moment qm31 libfuncs enter
 `audited.json`, the emulation overhead collapses and single-tx verification
 almost certainly fits.
+
+---
+
+# Lane 1 SHIPPED: first Stwo fact registered on a public Starknet network (2026-07-03)
+
+The 1.21e9 per-invoke cap forced a redesign, and the result is live on
+Sepolia:
+
+## Final architecture (3 classes, 3 transactions per fact)
+
+| Class | Sierra | CASM | Sepolia class hash |
+|---|---|---|---|
+| `StwoPhase1` (library) | 46,805 | 73,546 | `0x511ab692d6e4291e47407580642d25263151c216381ba36814f6f90914f3843` |
+| `StwoPhase2` (library) | 11,677 | 22,500 | `0x541b2817d6e6a5732afb75adcfb99ce50eb7a4af79809c97b63e59992009442` |
+| `StwoFactRegistry` | 1,707 | 4,139 | `0x7308e2210332bab2c98aa58600dd7fae574084edce2d0098bad6d7e13e77a38` |
+
+Registry instance: `0x0194f44002b4af71e58ba7d30667ed565f1d420d3fb1e7c578de35170309c6aa`
+(phase class hashes pinned immutably in the constructor).
+
+Verification is split at the FRI boundary (`stwo_verifier_phases::resumable`,
+soundness notes in the module doc): phase 1 = prologue + OODS + tree Merkle
+decommitments + FRI first-layer answers, checkpointing the Fiat-Shamir digest
+(at an `n_draws == 0` site), PoW nonce, query positions, answers, and fact
+material (~130 felts of storage); phase 2 = FRI commitment replay over a
+calldata-supplied FriProof — bound to phase 1 by query-position equality —
+plus decommitment and fact registration.
+
+## The registered fact (poseidon_chain(100), recursion route)
+
+- stage tx: `0x0131383f667dfbf91afbdd60daef3902026205fa693ba9a203ca0ba8aa5fd437` (156 slots)
+- phase 1: [`0x0681808c…79a0`](https://sepolia.voyager.online/tx/0x0681808ccfaa92f35dfe9ddb44474bf718c07ef0dd40f6f0517e3d22aa3a79a0) — **873,757,120 L2 gas (72% of cap)**
+- phase 2: [`0x06b7f69f…8730`](https://sepolia.voyager.online/tx/0x06b7f69fcc931cf1e93cbae5a14e254de539e6f91609fceed60b3f93b8188730) — **815,669,840 L2 gas (67% of cap)**
+- fact: `0x640299e88691d8a8eaf2c71bcde2c72334ad177e64c4485be069c5f6dcd615c`
+  — `is_valid(fact) == true`, queryable by anyone.
+
+Devnet receipts predicted both figures to the digit — starknet-devnet 0.9 is
+a faithful pre-flight for this workload.
+
+## Operational lessons (hard-won, for the runbook)
+
+- **CASM bytecode is capped at 81,920 felts on declare** — combining both
+  phases + registry in one class hits it; the library-class split is
+  mandatory. (Settles Spike 1's cap question: it binds BOTH Sierra and CASM.)
+- sncast's automatic fee estimation multiplies by 1.5, which pushes
+  legitimately-large transactions over the per-invoke bound check; explicit
+  `--l2-gas`/`--l1-data-gas` (+prices) bounds are required. Under-provisioned
+  `l1-data-gas` REVERTS (fees burned) rather than rejecting.
+- The account `__execute__` envelope costs ~4 calldata felts: the phase-1
+  head is 4,991 slots, not 4,995.
+- Total cost of the registered fact at (spiky) Sepolia gas prices: ~49 STRK
+  across the two verify transactions; declares were ~180 STRK one-time.
