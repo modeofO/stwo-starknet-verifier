@@ -2,6 +2,7 @@
 //! (poseidon252 configuration). See docs/lane2-design.md.
 
 pub mod resumable_full;
+pub mod sponge;
 
 /// Escape markers of the packed-proof v2 encoding (see `unpack_proof_v2`).
 const U64_ESCAPE: u32 = 0xFFFFFFFF;

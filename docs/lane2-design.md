@@ -143,17 +143,30 @@ as lane 1 — see proof-only-wrapping.md).
 
 ## Build order
 
-1. **Packing v2**: felt252-escape packing (extend `pack_proof.py` +
-   `unpack_proof`), shared by both lanes' tooling.
-2. **Channel checkpoint**: `Poseidon252Channel.digest` visibility patch +
-   a `resumable_full.cairo` skeleton with phases 1 and final only (claim
-   chunking + a stubbed middle) proven in snforge against the fixture
-   proof — validates the sponge/accumulator checkpointing end to end.
+1. ~~**Packing v2**~~ **done (2026-07-03):** `pack_proof.py --v2` +
+   `unpack_proof_v2` (`0xFFFFFFFE` escapes a full felt252 as 8 LE limbs);
+   the fixture proof packs to 55,540 slots; v1 output byte-identical for
+   lane 1.
+2. ~~**Channel checkpoint + skeleton**~~ **done (2026-07-03), beyond plan:**
+   `contracts/stwo_full_verifier_phases/src/resumable_full.cairo` splits the
+   full verifier at the lookup-elements seam with *no stubbed middle* —
+   phase A (claim checks + Fiat-Shamir prologue) and phase B (re-draws the
+   lookup elements from the checkpointed pre-draw digest, rebuilds the
+   trees without re-mixing, runs verify() + verify_values()). snforge over
+   the real fixture proof: two-phase == monolithic; tampered proof and
+   forged checkpoint digest both rejected. The Poseidon channel crosses the
+   boundary as a single felt (vendored patch logged in VENDORED.md).
+   Also landed: `src/sponge.cairo`, the resumable `poseidon_hash_span`
+   (4-felt checkpoint state) — tests prove chunked absorption with a serde
+   round-trip between chunks reproduces `mix_felts` and
+   `hash_u32s_with_state` exactly. This is the chunking primitive for both
+   monsters in step 3.
 3. **The two monsters**: chunked `claim.mix_into` and chunked
-   `fri_answers` (the 6.45M and 12.75M blocks) — each is an accumulator
-   refactor of vendored code into a phases crate, with per-chunk snforge
-   cost probes.
-4. Wire the remaining blocks (OODS tx, Merkle txs, FRI txs), devnet
+   `fri_answers` (the 6.45M and 12.75M blocks) — refactor phase A/B into
+   sub-phases using the sponge (claim mix) and per-query accumulators
+   (fri_answers), with per-chunk snforge cost probes.
+4. Wire the remaining blocks (OODS tx, Merkle txs, FRI txs), per-section
+   binding digests replacing the whole-stream `proof_hash`, devnet
    pre-flight (gas per phase, digit-exact per lane-1 experience), Sepolia
    campaign under the registry's governed route list.
 5. Re-measure everything the day qm31 libfuncs appear in `audited.json`.

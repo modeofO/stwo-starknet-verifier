@@ -73,9 +73,16 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   calldata felts (cached auth), so the phase-1 head shrinks to ~4,960
   slots. See the client section in
   [`docs/architecture.md`](./docs/architecture.md).
-- **Next:** lane 2 build-out (packing v2 → poseidon channel checkpoint →
-  the two accumulator monsters); confirm the Controller envelope with a
-  live Sepolia session transaction.
+- **Lane 2 skeleton: two-phase resumable FULL verifier passes on the real
+  proof** — `contracts/stwo_full_verifier_phases`: the full Cairo verifier
+  (poseidon config) split at the lookup-elements seam, checkpoint = 3
+  felts, equivalent to the monolithic verifier in snforge; tamper and
+  forged-checkpoint rejections proven. Plus the resumable
+  `poseidon_hash_span` sponge (the chunking primitive for the claim-mix
+  and fri_answers monsters) and packing v2.
+- **Next:** lane 2 sub-phasing (chunked claim mix + fri_answers, then
+  per-section binding and class splitting); confirm the Controller
+  envelope with a live Sepolia session transaction.
 
 ## Layout
 
