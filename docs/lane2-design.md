@@ -199,8 +199,51 @@ as lane 1 — see proof-only-wrapping.md).
 4. Wire the remaining blocks (OODS tx, Merkle txs, FRI txs), per-section
    binding digests replacing the whole-stream `proof_hash`, devnet
    pre-flight (gas per phase, digit-exact per lane-1 experience), Sepolia
-   campaign under the registry's governed route list.
+   campaign under the registry's governed route list. See "Machine plan
+   v2" below for the section-driven transaction plan.
 5. Re-measure everything the day qm31 libfuncs appear in `audited.json`.
+
+## Section map (measured 2026-07-03, `tests/test_sections.cairo`)
+
+| Section | Felts | Share | Transport plan |
+|---|---|---|---|
+| claim | 23,538 | 7.8% | 165 felts of non-program claim (one tx!) + 23,373 program-entry felts (chunk-fed, the claim_mix pipeline) |
+| interaction_pow + interaction_claim | 214 | — | rides the begin tx |
+| pcs_config + commitments | 11 | — | rides the begin tx |
+| sampled_values | 18,261 | 6.1% | chunk-fed to the mix (sponge); see the constants dilemma below |
+| decommitments | 4,259 | 1.4% | one tx per witness group (client emits per-group witnesses) |
+| **queried_values** | **244,445** | **81.2%** | pure M31s → 7:1 packed ≈ 35k felts; per (tree × query-group) rows |
+| fri_proof | 10,413 | 3.5% | 2–3 txs, lane-1-style query-position binding |
+
+## Machine plan v2 (post-measurement)
+
+- **The elephant is queried_values.** 70 queries × 3,492 total columns.
+  A Merkle *row* (one query, one tree, all its columns — leaf hashes span
+  every column) is irreducible but small: the trace tree is ~286 packed
+  felts per query. Phases chunk by **(tree × query-group)** with rows in
+  calldata — storage-free transport at ~8–12 txs.
+- **Per-group decommitment witnesses are a client-side (bridge) work
+  item.** The serialized witness is deduplicated across the 70-query
+  union; a query subset needs a *different* sibling set, so the on-chain
+  side cannot slice the union witness. The bridge must emit one witness
+  per query group (the prover can decommit any query set). The vendored
+  `MerkleVerifier::verify` then runs verbatim per group — no fork.
+- **Fusion:** a (tree × query-group) tx Merkle-verifies its rows on
+  arrival and can immediately absorb them into per-(tree, group) digests
+  or feed the fri_answers accumulator — data is consumed in the tx that
+  transports it wherever possible.
+- **The sampled-values/constants dilemma:** fri_answers' quotient
+  constants derive from all 18k felts of sampled_values — too big to ride
+  every chunk tx. Candidate resolutions, to be measured: (a) a one-time
+  constants store (~25k storage felts, then reads per chunk tx), (b)
+  fusing constants derivation per column-range with range-sliced samples
+  (rows must still be Merkle-complete, so ranges only work for the
+  fri_answers side), (c) recomputing constants in 2–3 dedicated txs that
+  each cover a subset of trees. This is the main open assembly question.
+- **Revised tx estimate: ~25–40 per fact** (the 12.8e9-gas compute floor
+  said ~11; transport, rebinding and the constants overhead roughly double
+  to triple the count at lower per-tx gas). Still storage-free except
+  checkpoints. Honest sovereign-lane pricing pending devnet calibration.
 
 ## Open questions
 
