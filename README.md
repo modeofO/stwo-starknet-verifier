@@ -35,8 +35,16 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   scripts/prove-and-verify.sh fixtures/target/dev/poseidon_chain.executable.json \
       fixtures/poseidon_chain_args_100.json
   ```
-- **Next:** FactRegistry + proof-staging contracts, devnet declare/deploy,
-  real gas numbers, zk-blinding story.
+- **Lane 1 (FactRegistry): built and measured** —
+  [`docs/lane1-results.md`](./docs/lane1-results.md),
+  [`docs/architecture.md`](./docs/architecture.md).
+  `contracts/stwo_fact_registry` verifies real multiverifier proofs
+  end-to-end in snforge: **3 transactions per fact** (2 packed staging txs +
+  one verify tx at ~8.9e8 gas, 81% of the per-tx cap), 49,740 Sierra felts,
+  audited libfuncs. Consumers integrate via `is_valid(fact)`.
+- **Next:** Sepolia declare/deploy (`scripts/declare-sepolia.sh`), consumer
+  hash-chain helper, WASM feasibility probe (serverless lane 1), then lane 2
+  — the sovereign resumable verifier, the desired end state.
 
 ## Layout
 

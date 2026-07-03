@@ -1,0 +1,31 @@
+[package]
+name = "stwo_fact_registry"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "2.18.0"
+stwo_circuit_air = { path = "../../vendor/stwo_cairo_verifier/crates/circuit_air" }
+
+# NOTE: blake2s configuration (no features) — the circuit verifier only
+# supports the blake2s hasher, and blake2s libfuncs are in the audited set.
+
+[[target.starknet-contract]]
+sierra = true
+# Deployability probe: enforce the allowlist used for declared classes.
+allowed-libfuncs-list.name = "audited"
+
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
+
+[tool.snforge]
+# The verify path is ~4M steps of real STARK verification plus unpacking;
+# the default step limit is too small for the end-to-end test.
+max_n_steps = 100000000
