@@ -169,10 +169,25 @@ as lane 1 — see proof-only-wrapping.md).
    round-trip between chunks reproduces `mix_felts` and
    `hash_u32s_with_state` exactly. This is the chunking primitive for both
    monsters in step 3.
-3. **The two monsters**: chunked `claim.mix_into` and chunked
-   `fri_answers` (the 6.45M and 12.75M blocks) — refactor phase A/B into
-   sub-phases using the sponge (claim mix) and per-query accumulators
-   (fri_answers), with per-chunk snforge cost probes.
+3. **The two monsters**:
+   - ~~chunked `claim.mix_into`~~ **done (2026-07-03):**
+     `src/claim_mix.cairo` — the pipeline (`claim_mix_begin` → N
+     `claim_mix_absorb_program_entries` chunks → `claim_mix_finalize`)
+     reproduces the monolithic claim-mix digest exactly over the real
+     fixture claim, with checkpoint serde round-trips between chunks. Two
+     pausable absorbers: `ChunkedU32Mix` (the `mix_felts ∘ pack_into_qm31s`
+     stream: 8 u32 → 2 QM31 → 1 pair-packed felt, zero-padded/odd tails
+     mirrored) and `ChunkedSmallVals` (the `hash_small_vals` stream: 8
+     values per `M31_SHIFT` word, length-padded tail). Program entries are
+     the chunk unit (9 serde felts each → ~540/tx within the calldata
+     budget; the fixture's 2,597 entries ≈ 5 txs). The output hash is
+     precomputed in `begin` and applied at its transcript position in
+     `finalize`.
+   - chunked `fri_answers` (12.75M): fork `quotients.cairo` with
+     column-range chunking; state = per-query partial accumulators
+     (~70 QM31 + the running `random_coeff` power ≈ 300 felts) +
+     per-tree queried-values digests established by the Merkle phases.
+     Per-chunk snforge cost probes as for the claim mix.
 4. Wire the remaining blocks (OODS tx, Merkle txs, FRI txs), per-section
    binding digests replacing the whole-stream `proof_hash`, devnet
    pre-flight (gas per phase, digit-exact per lane-1 experience), Sepolia

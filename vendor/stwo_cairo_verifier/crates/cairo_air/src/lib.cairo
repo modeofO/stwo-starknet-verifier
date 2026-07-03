@@ -655,7 +655,7 @@ pub struct PublicData {
 }
 
 #[generate_trait]
-impl PublicDataImpl of PublicDataTrait {
+pub impl PublicDataImpl of PublicDataTrait {
     fn logup_sum(self: @PublicData, common_lookup_elements: @crate::CommonLookupElements) -> QM31 {
         let mut sum = Zero::zero();
 

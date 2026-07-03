@@ -70,3 +70,5 @@ Same pattern as the lane-1 blake2s channel patch, for the poseidon channel
   field made pub, and `new_channel(digest)` added (checkpoint save/restore;
   `n_draws` is always 0 at the checkpoint sites, which are immediately after
   a `mix_*`).
+- `cairo_air/src/lib.cairo`: `impl PublicDataImpl` made pub (the chunked
+  claim-mix pipeline and its tests need `pack_into_u32s`).

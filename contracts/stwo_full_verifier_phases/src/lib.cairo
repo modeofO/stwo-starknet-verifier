@@ -1,6 +1,7 @@
 //! Lane 2: resumable verification of the full Cairo verifier
 //! (poseidon252 configuration). See docs/lane2-design.md.
 
+pub mod claim_mix;
 pub mod resumable_full;
 pub mod sponge;
 
