@@ -126,13 +126,21 @@ obsolete; storage holds only checkpoints.
 
 ## Class splitting
 
-Spike 1: the full verifier is ~450k Sierra felts vs the 81,920-felt CASM
-cap (lane 1 measured CASM ≈ 1.6–2× Sierra for this code). Expect **~8–12
-immutable phase-library classes**, pinned in a registry constructor exactly
-like lane 1's `StwoPhase1`/`StwoPhase2`. The phase boundaries above are
-natural class boundaries; `eval_composition_polynomial_at_point` (the
-component zoo) is the biggest single class and may itself need splitting
-per component group — measure Sierra size per phase crate early.
+Measured (2026-07-03, the skeleton's library-class wrappers, audited
+allowlist **passing**):
+
+| Class | Sierra felts | vs 81,920 cap |
+|---|---|---|
+| `StwoFullPhaseA` (claim checks + prologue) | **31,075** | **fits already** |
+| `StwoFullPhaseB` (AIR eval + PCS + FRI) | **778,271** | ~9.5× over |
+
+The split burden is entirely in phase B, dominated by
+`eval_composition_polynomial_at_point`'s component zoo. Expect **~10–15
+immutable phase-library classes** once phase B is sub-phased (Merkle, FRI,
+fri_answers separate naturally; the air eval itself must split by component
+group), pinned in a registry constructor exactly like lane 1's
+`StwoPhase1`/`StwoPhase2`. Note CASM runs 1.6–2× Sierra for this code and
+the CASM cap binds too (lane 1's hard lesson).
 
 ## Client side
 

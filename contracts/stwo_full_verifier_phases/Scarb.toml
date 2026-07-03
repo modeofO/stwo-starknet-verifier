@@ -18,7 +18,13 @@ poseidon252_verifier = [
 ]
 poseidon_outputs_packing = ["stwo_cairo_air/poseidon_outputs_packing"]
 
+[[target.starknet-contract]]
+sierra = true
+# Deployability probe: enforce the allowlist used for declared classes.
+allowed-libfuncs-list.name = "audited"
+
 [dependencies]
+starknet = "2.18.0"
 stwo_cairo_air = { path = "../../vendor/stwo_cairo_verifier/crates/cairo_air" }
 stwo_verifier_core = { path = "../../vendor/stwo_cairo_verifier/crates/verifier_core" }
 stwo_constraint_framework = { path = "../../vendor/stwo_cairo_verifier/crates/constraint_framework" }
