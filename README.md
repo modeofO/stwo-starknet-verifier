@@ -85,8 +85,14 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   monolithic digest across 7 checkpointed chunks) and chunked
   `fri_answers` (`fri_chunks.cairo`: query-range chunks over sliced
   queried values, no fork needed — answers are per-query independent).
-  Both proven equivalent over the real fixture proof; all 9 lane-2 tests
-  green.
+  Both proven equivalent over the real fixture proof.
+- **Witness splitter shipped** — `split-witness` in the bridge
+  synthesizes per-query-group Merkle decommitments from
+  `ExtendedStarkProof.aux` (no re-proving; per-group witnesses cost only
+  +2.5% calldata vs the union witness), self-checked against the proof's
+  own witness and validated in snforge: vendored `MerkleVerifier::verify`
+  accepts all 5 groups × 4 trees against the monolithic roots, tamper
+  cases rejected. All 13 lane-2 tests green.
 - **Next:** assemble the production N-phase machine (per-section binding
   digests, incremental claim checks, Merkle/FRI phase wiring, class
   splitting of phase B), devnet pre-flight; confirm the Controller

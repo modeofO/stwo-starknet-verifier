@@ -201,6 +201,11 @@ as lane 1 — see proof-only-wrapping.md).
    pre-flight (gas per phase, digit-exact per lane-1 experience), Sepolia
    campaign under the registry's governed route list. See "Machine plan
    v2" below for the section-driven transaction plan.
+   - ~~witness splitter~~ **done (2026-07-03):** `split-witness` in the
+     bridge + `tests/test_witness_groups.cairo` — see the machine-plan
+     bullet below for the numbers. The extended-proof fixture is
+     regenerable (deterministic) at
+     `fixtures/poseidon_chain_n100.extended_proof.json` (gitignored).
 5. Re-measure everything the day qm31 libfuncs appear in `audited.json`.
 
 ## Section map (measured 2026-07-03, `tests/test_sections.cairo`)
@@ -222,17 +227,46 @@ as lane 1 — see proof-only-wrapping.md).
   every column) is irreducible but small: the trace tree is ~286 packed
   felts per query. Phases chunk by **(tree × query-group)** with rows in
   calldata — storage-free transport at ~8–12 txs.
-- **Per-group decommitment witnesses are a client-side (bridge) work
-  item.** The serialized witness is deduplicated across the 70-query
+- ~~**Per-group decommitment witnesses are a client-side (bridge) work
+  item.**~~ **Done (2026-07-03) — the witness splitter ships in the
+  bridge.** The serialized witness is deduplicated across the 70-query
   union; a query subset needs a *different* sibling set, so the on-chain
-  side cannot slice the union witness. The bridge must emit one witness
-  per query group (the prover can decommit any query set). The vendored
-  `MerkleVerifier::verify` then runs verbatim per group — no fork.
-  No re-proving needed: `ExtendedStarkProof.aux.trace_decommitment`
-  (`MerkleDecommitmentLiftedAux.all_node_values`, a per-layer node→hash
-  map along the opened paths) contains every sibling a subset walk can
-  need, so a witness splitter can synthesize per-group decommitments from
-  the extended proof alone.
+  side cannot slice the union witness. `split-witness` synthesizes one
+  witness per query group from `ExtendedStarkProof.aux` alone (no
+  re-proving: `MerkleDecommitmentLiftedAux.all_node_values` records both
+  children of every internal node the union walk visits, and a subset's
+  paths ⊆ the union's paths). The synthesis replays the verifier's
+  bottom-up walk over the subset positions — the emitted sibling order
+  (per layer, ascending position, leaves → root) is exactly what both the
+  Rust prover emits and the vendored Cairo `MerkleVerifier::verify`
+  consumes, which the splitter proves to itself on every run: the witness
+  synthesized for the FULL query set must equal the proof's own
+  `hash_witness`, per tree, byte for byte. Measured over the fixture
+  (group size 16 → 5 groups):
+  - Tree heights [26, 21, 21, 21] — the preprocessed tree is *taller*
+    than the lifting size (26 > 21), so the pp query remap takes the
+    up-shift branch; `prepare_preprocessed_query_positions` is applied
+    per group and re-sorted (the remap is not monotonic).
+  - Per-query row strides (columns per tree): [105, 2059, 1320, 8]
+    = 3,492 total.
+  - Witness sizes per group of 16: pp 301–322 felts, other trees
+    221–242; the 6-query tail group 117/87. **Σ per-group witnesses =
+    4,366 felts vs 4,259 in the union proof — splitting costs only
+    +2.5% calldata.** (Witnesses are full felts — poseidon hashes — and
+    don't pack.)
+  - Rows per group of 16: trace tree 32,944 M31 ≈ 4,706 packed felts —
+    at the ~4,996-felt usable cap *before* any overhead. The trace tree
+    needs smaller groups (8–12 queries/tx) or a two-tx split per group;
+    pp+interaction+composition groups fit comfortably.
+  - snforge over the real proof (`tests/test_witness_groups.cairo`):
+    vendored `MerkleVerifier::verify` accepts every (group × tree) pair
+    against the monolithic roots — 5 groups × 4 trees — with the group's
+    row slices equal to the on-chain `slice_queried_values` of the full
+    stream; tampering one witness felt or one row value → Root Mismatch.
+  - Repro: `prove-poseidon … --extended ext.json` (the re-prove is
+    deterministic — repacked output is byte-identical to the committed
+    fixture, PoW grind included), then
+    `split-witness ext.json <dir> 16`.
 - **Fusion:** a (tree × query-group) tx Merkle-verifies its rows on
   arrival and can immediately absorb them into per-(tree, group) digests
   or feed the fri_answers accumulator — data is consumed in the tx that

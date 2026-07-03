@@ -26,11 +26,24 @@
 //!       (bootloader-shaped); raw standalone-executable proofs do not (see
 //!       docs/proof-only-wrapping.md).
 //!
-//!   prove-poseidon <task> <proof_out.json> <params.json> [program_args.json]
+//!   prove-poseidon <task> <proof_out.json> <params.json> [program_args.json] [--extended <extended_out.json>]
 //!       LANE 2. Runs the task under the privacy bootloader, then proves with
 //!       the given prover-params JSON (e.g. fixtures/prover_params_poseidon.json:
 //!       poseidon252 channel) and serializes cairo-serde felts for the FULL
 //!       vendored Cairo verifier (`stwo_cairo_verifier`, poseidon build).
+//!       With --extended, also dumps the full `CairoProof` (including
+//!       `ExtendedStarkProof.aux`: per-layer Merkle node values + FRI aux) as
+//!       serde JSON — the input to `split-witness`.
+//!
+//!   split-witness <extended_proof.json> <out_dir> [group_size]
+//!       LANE 2 witness splitter. Synthesizes per-query-group Merkle
+//!       decommitments from `ExtendedStarkProof.aux` (no re-proving: the
+//!       aux's `all_node_values` holds every sibling hash a subset walk can
+//!       need) and emits, per group, a snforge-readable felt file with the
+//!       4 per-tree hash witnesses + the group's queried-value row slices
+//!       (query-major, columns sorted by log size — the Cairo verifier's
+//!       layout). Self-check: the witness synthesized for the FULL query set
+//!       must equal the proof's own `hash_witness` per tree, byte for byte.
 //!
 //!   full <task> <proof_out.json> [preimage_out.json] [program_args.json]
 //!       Legacy one-shot: prove + wrap in memory. Also the default when the
@@ -44,6 +57,7 @@ use std::path::PathBuf;
 use cairo_vm::vm::runners::cairo_pie::CairoPie;
 use circuit_cairo_serialize::proof::prepare_circuit_proof_for_cairo_verifier;
 use cairo_air::flat_claims::FlatClaim;
+use cairo_air::utils::{serialize_proof_to_file, sort_and_transpose_queried_values, ProofFormat};
 use cairo_air::verifier::INTERACTION_POW_BITS as CAIRO_INTERACTION_POW_BITS;
 use cairo_air::CairoProof;
 use circuit_cairo_verifier::all_components::all_components as all_cairo_components;
@@ -76,15 +90,20 @@ use cairo_program_runner_lib::tasks::create_cairo1_program_task;
 use cairo_program_runner_lib::Task;
 use privacy_prove::consts::CAIRO_PROVER_PARAMS;
 use privacy_prove::run_privacy_bootloader_task;
+use starknet_ff::FieldElement as FieldElement252;
 use starknet_types_core::felt::Felt;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
+use stwo::core::pcs::utils::prepare_preprocessed_query_positions;
 use stwo::core::vcs_lifted::blake2_merkle::{
     Blake2sM31MerkleChannel, Blake2sMerkleChannel, Blake2sMerkleHasher,
 };
+use stwo::core::vcs_lifted::poseidon252_merkle::{
+    Poseidon252MerkleChannel, Poseidon252MerkleHasher,
+};
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::mempool::BaseColumnPool;
-use stwo_cairo_prover::prover::prove_cairo;
+use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 type Error = Box<dyn std::error::Error>;
@@ -410,6 +429,218 @@ fn bootloader_outputs_checked(
     Ok(vec![computed])
 }
 
+// ---------------------------------------------------------------------------
+// Lane-2 witness splitter (docs/lane2-design.md, machine plan v2).
+//
+// The proof's serialized decommitment is deduplicated across the union of all
+// query paths; a query *subset* needs a different (larger) sibling set, so the
+// on-chain side cannot slice the union witness. But
+// `MerkleDecommitmentLiftedAux.all_node_values` records, per layer, the hashes
+// of BOTH children of every internal node visited by the union walk — and a
+// subset's paths are a subset of the union's paths, so every sibling a subset
+// walk needs is in that map. Synthesis is therefore a replay of the verifier's
+// bottom-up walk over the subset positions, pulling lone-node siblings from
+// the aux instead of the witness stream. The emitted order (per layer,
+// ascending position, leaves → root) is exactly the order both the Rust
+// prover emits and the vendored Cairo `MerkleVerifier::verify` consumes.
+
+type PoseidonCairoProof = CairoProof<Poseidon252MerkleHasher>;
+
+/// Replays the Merkle walk for `positions` (must be sorted + deduplicated),
+/// collecting the sibling hashes a verifier of exactly this subset consumes.
+fn synthesize_witness(
+    positions: &[usize],
+    aux: &stwo::core::vcs_lifted::verifier::MerkleDecommitmentLiftedAux<Poseidon252MerkleHasher>,
+) -> Result<Vec<FieldElement252>, Error> {
+    let all_node_values = &aux.all_node_values;
+    let mut witness = Vec::new();
+    let mut layer_positions: Vec<usize> = positions.to_vec();
+    for (layer_idx, layer) in all_node_values.iter().enumerate() {
+        let mut parents = Vec::with_capacity(layer_positions.len());
+        let mut i = 0;
+        while i < layer_positions.len() {
+            let pos = layer_positions[i];
+            if i + 1 < layer_positions.len() && layer_positions[i + 1] == (pos ^ 1) {
+                // Both children present: no witness needed.
+                i += 2;
+            } else {
+                let sibling = pos ^ 1;
+                let hash = layer.get(&sibling).ok_or_else(|| {
+                    format!("aux is missing sibling {sibling} at layer {layer_idx}")
+                })?;
+                witness.push(*hash);
+                i += 1;
+            }
+            parents.push(pos >> 1);
+        }
+        layer_positions = parents;
+    }
+    if layer_positions.len() != 1 {
+        return Err(format!("walk did not converge to the root: {layer_positions:?}").into());
+    }
+    Ok(witness)
+}
+
+fn sorted_dedup(mut v: Vec<usize>) -> Vec<usize> {
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Per-tree query positions: the preprocessed tree (index 0) queries a
+/// possibly different domain size; the mapping mirrors the prover/verifier.
+fn tree_query_positions(
+    tree_index: usize,
+    group_positions: &[usize],
+    lifting_log_size: u32,
+    pp_max_log_size: u32,
+) -> Vec<usize> {
+    if tree_index == 0 {
+        // The mapping is not monotonic; the walk needs sorted+deduped input
+        // (both the Rust prover and the Cairo verifier sort internally).
+        sorted_dedup(prepare_preprocessed_query_positions(
+            group_positions,
+            lifting_log_size,
+            pp_max_log_size,
+        ))
+    } else {
+        group_positions.to_vec()
+    }
+}
+
+fn split_witness(
+    extended_proof_path: &PathBuf,
+    out_dir: &PathBuf,
+    group_size: usize,
+) -> Result<(), Error> {
+    eprintln!("reading extended proof from {}", extended_proof_path.display());
+    let bytes = std::fs::read(extended_proof_path)?;
+    let proof: PoseidonCairoProof = serde_json::from_slice(&bytes)?;
+
+    let scheme_proof = &proof.extended_stark_proof.proof.0;
+    let aux = &proof.extended_stark_proof.aux;
+    let n_trees = scheme_proof.decommitments.len();
+    if n_trees != 4 || aux.trace_decommitment.len() != 4 {
+        return Err(format!("expected 4 trees, got {n_trees}").into());
+    }
+
+    // Global sorted+deduped query positions (the order queried-value rows and
+    // the Cairo verifier's `queries.positions` follow).
+    let positions = sorted_dedup(aux.unsorted_query_locations.clone());
+    let n_queries = positions.len();
+
+    // Tree heights from the aux itself (all_node_values has one map per layer).
+    let heights: Vec<u32> = aux
+        .trace_decommitment
+        .iter()
+        .map(|t| t.all_node_values.len() as u32)
+        .collect();
+    let lifting_log_size = heights[1];
+    if heights[2] != lifting_log_size || heights[3] != lifting_log_size {
+        return Err(format!("non-preprocessed tree heights differ: {heights:?}").into());
+    }
+    let pp_max_log_size = heights[0];
+    eprintln!(
+        "{} unique query positions; tree heights {:?} (lifting {}, preprocessed {})",
+        n_queries, heights, lifting_log_size, pp_max_log_size
+    );
+
+    // Self-check: the witness synthesized for the FULL query set must equal
+    // the proof's own hash witness, per tree — same walk, same aux, so any
+    // divergence means the layout assumptions are wrong.
+    for tree_index in 0..n_trees {
+        let tree_positions =
+            tree_query_positions(tree_index, &positions, lifting_log_size, pp_max_log_size);
+        let synthesized = synthesize_witness(
+            &tree_positions,
+            &aux.trace_decommitment[tree_index],
+        )?;
+        let expected = &scheme_proof.decommitments[tree_index].hash_witness;
+        if &synthesized != expected {
+            return Err(format!(
+                "full-set witness mismatch on tree {tree_index}: synthesized {} felts, proof has {}",
+                synthesized.len(),
+                expected.len()
+            )
+            .into());
+        }
+    }
+    eprintln!("full-set self-check passed: synthesized witnesses == proof witnesses (4 trees)");
+
+    // Queried values in the Cairo verifier's layout: per tree, query-major
+    // rows with columns sorted by log size (same felts the packed fixture
+    // carries in its queried_values section).
+    let trace_and_interaction_trace_log_sizes = proof.claim.log_sizes();
+    let sorted_queried_values = sort_and_transpose_queried_values(
+        &scheme_proof.queried_values,
+        trace_and_interaction_trace_log_sizes
+            .iter()
+            .map(|c| c.as_slice())
+            .collect(),
+    );
+    let strides: Vec<usize> = scheme_proof
+        .queried_values
+        .iter()
+        .map(|tree_cols| tree_cols.len())
+        .collect();
+    eprintln!("per-query row strides (columns per tree): {strides:?}");
+
+    std::fs::create_dir_all(out_dir)?;
+    let n_groups = n_queries.div_ceil(group_size);
+    for group in 0..n_groups {
+        let start = group * group_size;
+        let end = usize::min(start + group_size, n_queries);
+        let group_positions = &positions[start..end];
+
+        // Serde stream the snforge test deserializes:
+        //   start, n_queries, Array<Span<felt252>> (witnesses), Array<Span<M31>> (rows)
+        let mut felts: Vec<String> = Vec::new();
+        felts.push(format!("0x{:x}", start));
+        felts.push(format!("0x{:x}", end - start));
+
+        felts.push(format!("0x{:x}", n_trees));
+        let mut witness_sizes = Vec::new();
+        for tree_index in 0..n_trees {
+            let tree_positions = tree_query_positions(
+                tree_index,
+                group_positions,
+                lifting_log_size,
+                pp_max_log_size,
+            );
+            let witness = synthesize_witness(
+                &tree_positions,
+                &aux.trace_decommitment[tree_index],
+            )?;
+            witness_sizes.push(witness.len());
+            felts.push(format!("0x{:x}", witness.len()));
+            for hash in &witness {
+                felts.push(format!("0x{hash:x}"));
+            }
+        }
+
+        felts.push(format!("0x{:x}", n_trees));
+        let mut row_sizes = Vec::new();
+        for (tree_index, stride) in strides.iter().enumerate() {
+            let rows = &sorted_queried_values[tree_index][start * stride..end * stride];
+            row_sizes.push(rows.len());
+            felts.push(format!("0x{:x}", rows.len()));
+            for value in rows {
+                felts.push(format!("0x{:x}", value.0));
+            }
+        }
+
+        let path = out_dir.join(format!("witness_group_{group}.txt"));
+        std::fs::write(&path, felts.join("\n") + "\n")?;
+        eprintln!(
+            "group {group}: queries [{start}..{end}), witness felts {witness_sizes:?}, row felts {row_sizes:?}, total {} felts -> {}",
+            felts.len(),
+            path.display()
+        );
+    }
+    eprintln!("wrote {n_groups} groups (group size {group_size}) to {}", out_dir.display());
+    Ok(())
+}
+
 fn main() -> Result<(), Error> {
     tracing_subscriber::fmt().init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -417,7 +648,8 @@ fn main() -> Result<(), Error> {
         privacy_prove_cairo_bridge prove <task.pie.zip|task.executable.json> <cairo_proof_out.json> <preimage_out.json> [program_args.json]\n  \
         privacy_prove_cairo_bridge wrap <cairo_proof.json> <preimage.json> <proof_out.json>\n  \
         privacy_prove_cairo_bridge wrap-app <cairo_proof.json> <proof_out.json>\n  \
-        privacy_prove_cairo_bridge prove-poseidon <task> <proof_out.json> <params.json> [program_args.json]\n  \
+        privacy_prove_cairo_bridge prove-poseidon <task> <proof_out.json> <params.json> [program_args.json] [--extended <extended_out.json>]\n  \
+        privacy_prove_cairo_bridge split-witness <extended_proof.json> <out_dir> [group_size]\n  \
         privacy_prove_cairo_bridge [full] <task.pie.zip|task.executable.json> <proof_out.json> [preimage_out.json] [program_args.json]";
 
     match argv.first().map(String::as_str) {
@@ -453,27 +685,58 @@ fn main() -> Result<(), Error> {
             wrap_stage(&cairo_proof, &config, outputs, &out)?;
         }
         Some("prove-poseidon") => {
-            let task = argv.get(1).map(PathBuf::from).ok_or(usage)?;
-            let proof_out = argv.get(2).map(PathBuf::from).ok_or(usage)?;
-            let params = argv.get(3).map(PathBuf::from).ok_or(usage)?;
-            let args_file = argv.get(4).map(PathBuf::from);
+            // Split off the optional `--extended <path>` flag before
+            // positional parsing.
+            let mut positional: Vec<String> = Vec::new();
+            let mut extended_out: Option<PathBuf> = None;
+            let mut iter = argv.iter().skip(1);
+            while let Some(arg) = iter.next() {
+                if arg == "--extended" {
+                    extended_out =
+                        Some(PathBuf::from(iter.next().ok_or("--extended needs a path")?));
+                } else {
+                    positional.push(arg.clone());
+                }
+            }
+            let task = positional.first().map(PathBuf::from).ok_or(usage)?;
+            let proof_out = positional.get(1).map(PathBuf::from).ok_or(usage)?;
+            let params = positional.get(2).map(PathBuf::from).ok_or(usage)?;
+            let args_file = positional.get(3).map(PathBuf::from);
+
+            let proof_params: ProverParameters =
+                serde_json::from_str(&std::fs::read_to_string(&params)?)?;
+            let ChannelHash::Poseidon252 = proof_params.channel_hash else {
+                return Err("prove-poseidon expects poseidon252 channel params".into());
+            };
             let (prover_input, output_preimage) = bootloader_stage(&task, args_file)?;
             eprintln!(
                 "[prove 2/2] stwo-proving with params {} (cairo-serde output)",
                 params.display()
             );
-            stwo_cairo_prover::prover::create_and_serialize_proof(
-                prover_input,
-                false,
-                proof_out.clone(),
-                cairo_air::utils::ProofFormat::CairoSerde,
-                Some(params),
-            )?;
+            let cairo_proof =
+                prove_cairo::<Poseidon252MerkleChannel>(prover_input, proof_params)?;
+            serialize_proof_to_file(&cairo_proof, &proof_out, ProofFormat::CairoSerde)?;
             eprintln!("wrote cairo-serde proof to {}", proof_out.display());
+            if let Some(extended_path) = extended_out {
+                let json = serde_json::to_vec(&cairo_proof)?;
+                std::fs::write(&extended_path, &json)?;
+                eprintln!(
+                    "wrote extended proof with aux ({:.1} MB) to {}",
+                    json.len() as f64 / 1e6,
+                    extended_path.display()
+                );
+            }
             eprintln!(
                 "output preimage: {:?}",
                 output_preimage.iter().map(|f| format!("0x{f:x}")).collect::<Vec<_>>()
             );
+        }
+        Some("split-witness") => {
+            let extended_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;
+            let out_dir = argv.get(2).map(PathBuf::from).ok_or(usage)?;
+            let group_size: usize =
+                argv.get(3).map(|s| s.parse()).transpose()?.unwrap_or(16);
+            split_witness(&extended_in, &out_dir, group_size)?;
         }
         Some("wrap-app") => {
             let proof_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;
