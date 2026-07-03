@@ -1,0 +1,14 @@
+[package]
+name = "stwo_fact_binding"
+version = "0.1.0"
+edition = "2024_07"
+
+# Pure library: the consumer-side fact recomputation for StwoFactRegistry
+# facts (lane 1 recursion route). Contracts embed this (or copy it) to bind
+# a fact to (application program hash, application outputs).
+
+[dependencies]
+stwo_verifier_utils = { path = "../../vendor/stwo_cairo_verifier/crates/verifier_utils" }
+
+[dev-dependencies]
+cairo_test = "2.18.0"

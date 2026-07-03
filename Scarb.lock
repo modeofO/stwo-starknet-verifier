@@ -55,6 +55,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "stwo_fact_binding"
+version = "0.1.0"
+dependencies = [
+ "stwo_verifier_utils",
+]
+
+[[package]]
 name = "stwo_fact_registry"
 version = "0.1.0"
 dependencies = [

@@ -63,9 +63,13 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   `tools/lane2-probe` (claim mix 6.5M, logup 3.7M, fri_answers 12.7M, …).
   Design: ~15-tx checkpoint state machine, storage-free section feeding
   (self-authenticating / channel-bound / checkpoint classes).
+- **Consumer fact binding: done** — `contracts/stwo_fact_binding`, the
+  one-function consumer integration
+  (`compute_fact(program_hash, outputs, inner_root)` + `is_valid`); its
+  test reproduces the live Sepolia fact from application data (~0.8M gas).
 - **Next:** lane 2 build-out (packing v2 → poseidon channel checkpoint →
-  the two accumulator monsters), plus the consumer hash-chain helper and
-  the Cartridge Controller calldata-envelope measurement.
+  the two accumulator monsters), plus the Cartridge Controller
+  calldata-envelope measurement.
 
 ## Layout
 

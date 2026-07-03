@@ -141,8 +141,11 @@ proving-utils bootloader runner), not the npm package as shipped.
   multi-GB browser memory budgets — real, but an engineering project of its
   own. The native desktop client dodges all of it, which reinforces the
   egui-first client decision in `architecture.md`.
-- wasm32 compile attempt of `circuit-prover` documented below for the
-  record.
+- **wasm32 compile attempt: succeeds.** `cargo build --target
+  wasm32-unknown-unknown -p circuit-prover` at the pinned stwo-circuits rev
+  (nightly-2026-01-15) compiles the entire wrap-chain dependency tree —
+  stwo, cairo-air, cairo-vm, all circuit crates — cleanly in 25 min.
+  Compilation is a non-issue; memory is the only (fatal) wasm32 blocker.
 
 ## Status of the build-order gate
 

@@ -52,8 +52,14 @@ probes. Test fixture regenerable with `scripts/prove-and-verify.sh` +
 
 - Sepolia declare/deploy (`scripts/declare-sepolia.sh`) — also settles the
   Sierra-vs-CASM bytecode-cap question empirically.
-- Consumer-side helper for the blake2s output-preimage recomputation
-  (binding fact → application program hash + outputs).
+- ~~Consumer-side helper for the blake2s output-preimage recomputation
+  (binding fact → application program hash + outputs).~~ **Done
+  (2026-07-03):** `contracts/stwo_fact_binding` — `compute_fact(program_hash,
+  outputs, inner_root)` recomputes the full chain (bootloader preimage blake
+  → inner circuit digest → multiverifier digest → output hash → poseidon
+  fact); its test reproduces the live Sepolia fact from application data at
+  ~0.8M gas. Consumers whitelist their app's inner circuit root (printed by
+  the bridge's `wrap` stage).
 - Storage-slot reuse/cleanup policy for staged proofs (currently staged data
   persists; rewriting the same proof_id overwrites).
 - The verifier-route allowlist + ownership freeze in the registry (currently
