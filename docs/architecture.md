@@ -84,3 +84,36 @@ Lane 1 first because it ships a working end-to-end product soonest and every
 piece of it — registry, staging, fact format, consumer integration — is
 reused verbatim by lane 2. The sovereign lane is the destination; lane 1 is
 the road that happens to pass through it.
+
+## Client architecture (decided direction, not yet built)
+
+Desktop-first native app (Rust + egui), deferred until the research below
+progresses. Rationale and design:
+
+- The entire proving stack (stwo, stwo-cairo, stwo-circuits, proving-utils,
+  our bridge) is Rust — an egui app links it in-process: prove → wrap →
+  sign → submit in one binary, no servers, no WASM ceiling, full SIMD.
+  `tools/privacy-prove-cairo-bridge` is effectively its backend already.
+- **Key management via Cartridge Controller sessions** (`account_sdk` from
+  cartridge-gg/controller-rs — native Rust): the user's root account is a
+  Controller smart wallet authenticated by passkey/social (no seed phrases,
+  nothing to back up). The app holds only an ephemeral session key,
+  approved once in the system browser against explicit policies (registry
+  entrypoints, messaging calls, capped payments). Compromise of the app
+  leaks only a scoped, expiring session — never the root identity.
+- Cartridge's paymaster can sponsor fees (users need not hold STRK);
+  at ~1.7e9 gas per fact the sponsorship economics are an app decision.
+- Integration caveat to verify: `verify_phase1` uses 4,999/5,000 calldata
+  felts with a plain account envelope; session `execute_from_outside`
+  wrapping is larger, so the calldata head must shrink by a few slots —
+  measure with a real Controller transaction before hardcoding.
+- Mobile is explicitly deferred (egui is weak there; desktop/laptop is the
+  target).
+
+**Build order gate:** no app scaffolding until at least one of these lands —
+(a) proof-only wrapping (client hands the middleman a *proof*, not a
+program+witness: embed the app program in the cairo-verifier circuit config
+and match the browser prover's channel/parameters), or (b) the wrap chain
+compiling to wasm32 (memory feasibility probe first). And the golden goose
+remains **lane 2**: the sovereign resumable full-Cairo verifier, for which
+the phase-checkpoint machinery in `stwo_verifier_phases` is the seed.
