@@ -246,11 +246,20 @@ the payload uses the poseidon builtin). Paths, in preference order:
    are dominated by the bounded_int QM31-arithmetic lowering; the
    `qm31_opcode` cfg variants already exist upstream and would shrink all
    four dramatically (likely under the cap) with zero fork.
-2. **Build-time constraint-range slicer** over the generated component
-   files: split the eval body at constraint boundaries into 2 sub-airs
-   each, threading `sum` and re-reading masks (intra-component splits
-   share the same column window; the counters advance once, on the last
-   slice). Mechanical but must handle shared `let` intermediates.
+2. **Two-half fork along the generated seam.** Each oversized component
+   file already factors as `evaluate_constraints_at_point` (intermediate
+   values + constraint quotients over the TRACE masks, ~1.2k lines)
+   followed by a call to a separate `lookup_constraints(ref sum,
+   random_coeff, claimed_sum, numerator_0..~98, …)` function (logup over
+   the INTERACTION masks, ~1.2k lines). The interface between them is
+   ~99 QM31 numerators ≈ 400 felts — carryable across a transaction
+   boundary (the production wrapper stores `poseidon(state)`, not the
+   state, so checkpoint size is calldata-only). The halves consume
+   different mask streams, so the trace counter advances in half A and
+   the interaction counter in half B — consistent with the existing
+   counter model. Caveat: half A (intermediates + quotients) is likely
+   the bigger half and may need one further cut for cube_252/aggregator;
+   half-A-internal cuts must carry or recompute shared intermediates.
 3. The four families cannot be skipped for bootloader-shaped proofs, so
    there is no configuration dodge.
 
