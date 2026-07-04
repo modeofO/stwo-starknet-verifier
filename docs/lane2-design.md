@@ -191,6 +191,24 @@ The remaining work is splitting the air eval by component group
 — but it forks generated component code, so it wants a build-time slicer
 over the vendored source). Expect ~10–14 component-group classes.
 
+Seam map (verified in the vendored `cairo_air.cairo`): the eval body is a
+flat sequence of `X.evaluate_constraints_at_point(ref sum, ref pp_masks,
+ref trace_masks, ref interaction_masks, random_coeff, …)` calls — `sum`
+is a running accumulator and the two trace mask spans are consumed
+sequentially (each component pops its own columns). A component-group
+transaction therefore: re-supplies the sampled values (d_sampled-bound),
+fast-forwards the mask spans past the previous groups' columns (counts
+derivable from the claim), evaluates its component range into the
+accumulator, and checkpoints `(sum, columns_consumed)`. Group boundaries
+can be drawn at ANY of the ~15 top-level call sites (and inside
+`opcodes`/`builtins`/contexts, which are themselves flat sequences), so
+per-class sizes are tunable. The final OODS transaction then does the
+`composition_oods_eval == sum * denominator_inv` assert plus
+`mix_sampled_values` — i.e. `machine_oods_mix` splits into
+`oods_begin` (draws, composition commit, ood point) → `oods_group × N` →
+`oods_finalize` (assert + mix), with the ood point and accumulator riding
+the checkpoint.
+
 ## Client side
 
 `prove-poseidon` in the bridge is the client reference path (bootloader →
