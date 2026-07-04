@@ -1,30 +1,45 @@
 #!/usr/bin/env python3
-"""Two-half fork generator for the four oversized generated component evals.
+"""Multi-part fork generator for the four oversized generated component evals.
 
 The vendored files (cairo_air/src/components/{blake_compress_opcode,
-blake_round,cube_252,poseidon_aggregator}.cairo) exceed the 81,920-felt
-Sierra class cap when wrapped alone (docs/lane2-design.md, "Class sizes
-v2"). Each factors as a generated `evaluate_constraints_at_point`
-(intermediates + constraint quotients over the TRACE masks, accumulating
-per-relation numerators and combined lookup denominators) followed by a
-single call to a file-private `lookup_constraints(...)` (logup constraints
-over the INTERACTION masks). The interface between the two is a flat list
-of QM31 values — the call site's arguments.
+blake_round,cube_252,poseidon_aggregator}.cairo) exceed the Starknet class
+caps when wrapped alone (docs/lane2-design.md, "The two-half seam fork").
+Each factors as a generated `evaluate_constraints_at_point` (intermediates
++ constraint quotients over the TRACE masks, accumulating per-relation
+numerators and combined lookup denominators) followed by a single call to
+a file-private `lookup_constraints(...)` (logup constraints over the
+INTERACTION masks). The interface between the two is a flat list of QM31
+values — the call site's arguments.
 
 This script forks each file along that seam into
-contracts/stwo_full_verifier_phases/src/split/<name>.cairo:
+contracts/stwo_full_verifier_phases/src/split/<name>.cairo, and — where
+one half still exceeds the caps — cuts that half once more:
 
-- `half_a(component, ref sum, ref preprocessed_mask_values,
-  ref trace_mask_values, random_coeff) -> Array<QM31>` — the eval body up
-  to the seam, verbatim (`self` renamed to `component`); returns the seam
-  carry `[claimed_sum, numerator_0.., <combined lookup sums>..]`.
-- `half_b(log_size, ref sum, ref interaction_trace_mask_values,
-  random_coeff, carry)` — unpacks the carry and calls the verbatim copy of
-  `lookup_constraints`.
+- A-side parts (`half_a`, or `half_a1`/`half_a2`/…): the eval body split
+  at tail-statement boundaries. Carrying raw column values is a losing
+  trade (~90 Sierra felts per carried value), so every A part re-reads
+  the trace-mask destructure itself — the sampled values are digest-bound
+  and re-supplied to every transaction — and unboxes only the columns its
+  own statements use (`_` for the rest). Earlier parts read a COPY of the
+  trace span (their family wrappers do not advance the trace counter);
+  the LAST A part pops for real. The inter-part carry is then only the
+  current value of every numerator/denominator accumulator plus the tmp
+  intermediates (dataflow-computed, all QM31) that cross the boundary.
+  Parts after the first receive the Component rebuilt by their family
+  wrapper from the carry's claimed_sum (`NewComponentImpl::new` — no
+  second claimed_sums consumption).
+- B-side parts (`half_b`, or `half_b1`/`half_b2`): the verbatim
+  `lookup_constraints` copy, split at a logup constraint boundary. The
+  telescoping structure (constraint k reads interaction column quad k and
+  quad k-1) means the B1→B2 carry is the standard value list plus the
+  boundary column quad.
 
-Concatenating half_a + half_b == the vendored
-`evaluate_constraints_at_point` (asserted over the real fixture proof in
-tests/test_oods_chunks.cairo). Re-run after bumping the vendored commit:
+Every part's incoming/outgoing carry starts with [claimed_sum,
+numerator_0.., <combined lookup sums>..] in the seam call's argument
+order; A-internal and B-internal cuts append their extra values after.
+Concatenating the parts == the vendored `evaluate_constraints_at_point`
+(asserted over the real fixture proof in tests/test_oods_chunks.cairo).
+Re-run after bumping the vendored commit:
 
     python3 scripts/split_component_evals.py
 """
@@ -36,33 +51,86 @@ ROOT = Path(__file__).resolve().parent.parent
 VENDOR = ROOT / "vendor/stwo_cairo_verifier/crates/cairo_air/src/components"
 OUT = ROOT / "contracts/stwo_full_verifier_phases/src/split"
 
-COMPONENTS = [
-    "blake_compress_opcode",
-    "blake_round",
-    "cube_252",
-    "poseidon_aggregator",
-]
+# a_cuts: cut the eval tail before each statement whose text starts with
+# the anchor, `(anchor, occurrence)` — parts = len+1 ([] = single A part).
+# b_cut: number of logup constraints in B1 (None = single B part).
+# Cut positions are size-driven (docs/lane2-design.md): the trace unpack
+# is nearly free; the inlined subroutine calls and the wide combine_qm31
+# statements dominate — blake_round isolates its blake_g and blake_round
+# combines as their own parts; poseidon_aggregator isolates the 869-line
+# hades permutation as its own part.
+SPECS = {
+    "blake_compress_opcode": {"a_cuts": [], "b_cut": None},
+    "blake_round": {
+        "a_cuts": [("blake_g_sum_49 = component", 0), ("blake_round_sum_57 = component", 0)],
+        "b_cut": None,
+    },
+    "cube_252": {"a_cuts": [], "b_cut": 23},
+    "poseidon_aggregator": {
+        "a_cuts": [
+            ("poseidon_hades_permutation_evaluate(", 0),
+            ("felt_252_unpack_from_27_evaluate(", 0),
+        ],
+        "b_cut": None,
+    },
+}
 
-HEADER = """\
-//! Two-half fork of the vendored `{name}` component eval along the
+DOC_HEADER = """\
+//! Multi-part fork of the vendored `{name}` component eval along the
 //! generated `lookup_constraints` seam — see docs/lane2-design.md ("The
-//! OODS split") and the family wrappers in `oods_chunks.cairo`.
+//! two-half seam fork") and the family wrappers in `oods_chunks.cairo`.
 //!
 //! GENERATED by scripts/split_component_evals.py from
 //! vendor/stwo_cairo_verifier/crates/cairo_air/src/components/{name}.cairo
 //! — do not edit by hand; re-run the script after a vendor bump.
-
-use core::num::traits::Zero;
-{subroutine_imports}use stwo_cairo_air::components::{name}::Component;
-{seq_import}use stwo_constraint_framework::{{
-    CommonLookupElements, LookupElementsImpl, PreprocessedMaskValues, PreprocessedMaskValuesImpl,
-}};
-use stwo_verifier_core::ColumnSpan;
-use stwo_verifier_core::fields::Invertible;
-use stwo_verifier_core::fields::m31::{{M31, m31}};
-use stwo_verifier_core::fields::qm31::{{QM31, QM31Impl, QM31Trait, qm31_const}};
-use stwo_verifier_core::utils::pow2;
 """
+
+
+def header(name: str, code: str, subroutine_imports: str) -> str:
+    """Emit only the imports the generated code actually needs (trait
+    imports keyed by the method names that require them in scope)."""
+    words = set(WORD.findall(code))
+
+    def framework_imports() -> str:
+        items = []
+        if "combine_qm31" in words:
+            items.append("LookupElementsImpl")
+        if "PreprocessedMaskValues" in words:
+            items.append("PreprocessedMaskValues")
+        if "get_and_mark_used" in words:
+            items.append("PreprocessedMaskValuesImpl")
+        if not items:
+            return ""
+        return f"use stwo_constraint_framework::{{{', '.join(sorted(items))}}};\n"
+
+    qm31_items = ["QM31"]
+    if "QM31Impl" in words:
+        qm31_items.append("QM31Impl")
+    if "qm31_const" in words:
+        qm31_items.append("qm31_const")
+    m31_items = [i for i in ("M31", "m31") if i in words]
+    lines = [DOC_HEADER.format(name=name), ""]
+    if "Zero" in words:
+        lines.append("use core::num::traits::Zero;")
+    if subroutine_imports:
+        lines.append(subroutine_imports.rstrip("\n"))
+    lines.append(f"use stwo_cairo_air::components::{name}::Component;")
+    if "seq_column_idx" in words:
+        lines.append("use stwo_cairo_air::preprocessed_columns::seq_column_idx;")
+    fw = framework_imports()
+    if fw:
+        lines.append(fw.rstrip("\n"))
+    lines.append("use stwo_verifier_core::ColumnSpan;")
+    if "inverse" in words:
+        lines.append("use stwo_verifier_core::fields::Invertible;")
+    if m31_items:
+        lines.append(f"use stwo_verifier_core::fields::m31::{{{', '.join(m31_items)}}};")
+    lines.append(f"use stwo_verifier_core::fields::qm31::{{{', '.join(qm31_items)}}};")
+    if "pow2" in words:
+        lines.append("use stwo_verifier_core::utils::pow2;")
+    return "\n".join(lines) + "\n"
+
+WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def dedent4(text: str) -> str:
@@ -71,7 +139,70 @@ def dedent4(text: str) -> str:
     )
 
 
-def fork(name: str) -> None:
+def statements(body: str) -> list[str]:
+    """Split a (dedented) function body into top-level statements: chunks
+    starting at a bracket-depth-0 line indented exactly 4 spaces."""
+    stmts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for line in body.split("\n"):
+        if depth == 0 and re.match(r"^    \S", line) and current:
+            stmts.append("\n".join(current))
+            current = []
+        current.append(line)
+        depth += line.count("(") + line.count("[") + line.count("{")
+        depth -= line.count(")") + line.count("]") + line.count("}")
+    if current:
+        stmts.append("\n".join(current))
+    return stmts
+
+
+def defined_names(stmt: str) -> list[str]:
+    """Names bound by a `let` statement (destructure lists included)."""
+    text = stmt.strip()
+    if not text.startswith("let "):
+        return []
+    if text.startswith("let ["):
+        inner = text[len("let [") : text.index("]")]
+        return [n.strip() for n in inner.split(",") if n.strip()]
+    m = re.match(r"let (?:mut )?([A-Za-z_][A-Za-z0-9_]*)", text)
+    return [m.group(1)] if m else []
+
+
+def strip_unused_prelude(part: str, packed: list[str]) -> str:
+    """Drop the `let log_size/column_size = ...;` prelude lines from an
+    A-part when the name is never read within the part (the seam moved
+    their consumers into another part). Iterates because dropping
+    column_size can orphan log_size."""
+    text = part
+    while True:
+        for name in ("column_size", "log_size"):
+            # The claim.log_size field access is not a use of the local.
+            uses = len(re.findall(rf"(?<!claim\.){name}\b", text))
+            uses -= 1 if name in packed else 0
+            if uses == 1:
+                text = re.sub(rf"    let {name} = [^\n]*;\n", "", text, count=1)
+                break
+        else:
+            return text
+
+
+def carry_pack(values: list[str], var: str = "carry") -> str:
+    lines = [f"    let mut {var}: Array<QM31> = array![];"]
+    lines += [f"    {var}.append({v});" for v in values]
+    return "\n".join(lines)
+
+
+def carry_unpack(values: list[str], mut_names: set[str]) -> str:
+    lines = []
+    for v in values:
+        kw = "let mut" if v in mut_names else "let"
+        lines.append(f"    {kw} {v} = *carry.pop_front().unwrap();")
+    lines.append('    assert!(carry.is_empty(), "carry length");')
+    return "\n".join(lines)
+
+
+def fork(name: str, spec: dict) -> None:
     src = (VENDOR / f"{name}.cairo").read_text()
 
     # --- seam call site ------------------------------------------------
@@ -87,44 +218,29 @@ def fork(name: str) -> None:
     assert interaction_i == column_i + 1
     numerators = args[3:column_i]
     lookup_sums = args[interaction_i + 1 :]
-    carried = ["claimed_sum"] + numerators + lookup_sums
+    seam_values = ["claimed_sum"] + numerators + lookup_sums
+    call_args = ",\n        ".join(args)
 
-    # --- half A: eval body up to the seam ------------------------------
+    # --- A side: eval body up to the seam -------------------------------
     eval_start = src.index("fn evaluate_constraints_at_point(")
     body_start = src.index("\n    ) {\n", eval_start) + len("\n    ) {\n")
     a_body = src[body_start : call.start()]
     assert "interaction_trace_mask_values" not in a_body, name
     a_body = re.sub(r"\bself\b", "component", a_body)
     a_body = dedent4(a_body.rstrip())
+    assert '"' not in a_body, f"{name}: string literal breaks depth tracking"
 
-    carry_pack = "\n".join(f"    carry.append({v});" for v in carried)
-    carry_unpack = "\n".join(
-        f"    let {v} = *carry.pop_front().unwrap();" for v in carried
-    )
+    mut_decls = re.findall(r"let mut (\w+): QM31 = Zero::zero\(\);", a_body)
+    assert set(mut_decls) == set(numerators + lookup_sums), name
 
-    # --- lookup_constraints: verbatim copy ------------------------------
-    l_start = src.index("\nfn lookup_constraints(") + 1
-    l_end = src.index("\n}\n", l_start) + len("\n}\n")
-    lookup_fn = src[l_start:l_end]
-
-    call_args = ",\n        ".join(args)
-
-    subroutine_imports = "".join(
-        line.replace("use crate::", "use stwo_cairo_air::") + "\n"
-        for line in src.split("\n")
-        if line.startswith("use crate::components::subroutines::")
-    )
-    seq_import = (
-        "use stwo_cairo_air::preprocessed_columns::seq_column_idx;\n"
-        if "seq_column_idx" in a_body
-        else ""
-    )
-
-    out = f"""{HEADER.format(name=name, subroutine_imports=subroutine_imports, seq_import=seq_import)}
+    parts_a: list[str] = []
+    if not spec["a_cuts"]:
+        parts_a.append(
+            f"""\
 /// Half A: intermediates + constraint quotients over the TRACE masks
 /// ({len(numerators)} relation numerators). Returns the seam carry
 /// (claimed_sum + numerators + combined lookup denominators,
-/// {len(carried)} QM31s = {len(carried) * 4} felts).
+/// {len(seam_values)} QM31s = {len(seam_values) * 4} felts).
 pub fn half_a(
     component: @Component,
     ref sum: QM31,
@@ -132,14 +248,25 @@ pub fn half_a(
     ref trace_mask_values: ColumnSpan<Span<QM31>>,
     random_coeff: QM31,
 ) -> Array<QM31> {{
-{a_body}
-    let mut carry: Array<QM31> = array![];
-{carry_pack}
+{strip_unused_prelude(a_body, seam_values)}
+{carry_pack(seam_values)}
     carry
-}}
+}}"""
+        )
+    else:
+        parts_a = fork_a(name, a_body, spec["a_cuts"], seam_values, mut_decls)
 
+    # --- B side: lookup_constraints -------------------------------------
+    l_start = src.index("\nfn lookup_constraints(") + 1
+    l_end = src.index("\n}\n", l_start) + len("\n}\n")
+    lookup_fn = src[l_start:l_end]
+
+    parts_b: list[str] = []
+    if spec["b_cut"] is None:
+        parts_b.append(
+            f"""\
 /// Half B: the logup constraints over the INTERACTION masks, resumed from
-/// half A's seam carry.
+/// the seam carry.
 pub fn half_b(
     log_size: u32,
     ref sum: QM31,
@@ -148,24 +275,304 @@ pub fn half_b(
     mut carry: Span<QM31>,
 ) {{
     let column_size = m31(pow2(log_size));
-{carry_unpack}
-    assert!(carry.is_empty(), "carry length");
+{carry_unpack(seam_values, set())}
     lookup_constraints(
         {call_args},
     );
 }}
 
 {lookup_fn}"""
+        )
+    else:
+        parts_b.append(fork_b(name, lookup_fn, spec["b_cut"], seam_values))
 
+    code = "\n\n".join(parts_a + parts_b)
+    subroutine_imports = "".join(
+        line.replace("use crate::", "use stwo_cairo_air::") + "\n"
+        for line in src.split("\n")
+        if line.startswith("use crate::components::subroutines::")
+        and line.rstrip(";").rsplit("::", 1)[-1] in code
+    )
+    out = header(name, code, subroutine_imports) + "\n" + code + "\n"
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"{name}.cairo").write_text(out)
     print(
-        f"{name}: {len(numerators)} numerators, {len(carried)} carried QM31s, "
-        f"half_a {a_body.count(chr(10))} lines, lookup_constraints "
-        f"{lookup_fn.count(chr(10))} lines"
+        f"{name}: {len(numerators)} numerators, "
+        f"A parts {len(parts_a)}, B parts {2 if spec['b_cut'] else 1}"
     )
 
 
+def fork_a(
+    name: str,
+    a_body: str,
+    a_cuts: list[tuple[str, int]],
+    seam_values: list[str],
+    mut_decls: list[str],
+) -> list[str]:
+    """Split the eval body (everything before the lookup_constraints seam)
+    into len(a_cuts)+1 parts at tail-statement boundaries. Every part
+    re-reads the trace destructure (the family wrappers give earlier parts
+    a COPY of the trace span; only the last part pops for real) and
+    unboxes only the columns its own statements use, so the inter-part
+    carry is just claimed_sum + the accumulators + crossing tmps."""
+    stmts = statements(a_body)
+
+    # Locate the structural sections: prelude / destructure / unboxes / tail.
+    di = next(
+        i
+        for i, s in enumerate(stmts)
+        if "trace_mask_values" in s and "multi_pop_front" in s
+    )
+    destructure = stmts[di]
+    columns = [
+        c.strip().rstrip(",")
+        for c in destructure[destructure.index("[") + 1 : destructure.index("]")].split("\n")
+        if c.strip().rstrip(",")
+    ]
+    unbox_pat = re.compile(r"let \[(\w+)\]: \[QM31; 1\] =")
+    unbox_by_col: dict[str, str] = {}
+    j = di + 1
+    while j < len(stmts):
+        m = unbox_pat.search(stmts[j].replace("\n", " "))
+        if not m:
+            break
+        unbox_by_col[m.group(1)] = stmts[j]
+        j += 1
+    assert len(unbox_by_col) == len(columns), name
+    prelude, tail = stmts[:di], stmts[j:]
+
+    seq_stmts = [s for s in prelude if "get_and_mark_used" in s]
+    simple = {"log_size", "claimed_sum", "column_size"}
+    for s in prelude:
+        for n in defined_names(s):
+            assert (
+                n in simple or n in mut_decls or s in seq_stmts
+            ), f"{name}: unexpected prelude statement defining {n}"
+
+    # Tail cut indices from the (anchor, occurrence) specs.
+    cuts = []
+    for anchor, occurrence in a_cuts:
+        hits = [i for i, s in enumerate(tail) if anchor in s]
+        cuts.append(hits[occurrence])
+    assert cuts == sorted(cuts) and len(set(cuts)) == len(cuts), name
+    bounds = [0] + cuts + [len(tail)]
+    tail_parts = [tail[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+    n_parts = len(tail_parts)
+
+    # Crossing tmps at each boundary b: defined in tail parts <= b, used
+    # in tail parts > b (columns re-read, accumulators carried anyway,
+    # simple lets recomputed).
+    part_words = [set(WORD.findall("\n".join(p))) for p in tail_parts]
+    boundary_tmps: list[list[str]] = []
+    for b in range(n_parts - 1):
+        after = set().union(*part_words[b + 1 :])
+        tmps: list[str] = []
+        for p in tail_parts[: b + 1]:
+            for s in p:
+                for n in defined_names(s):
+                    if (
+                        n in after
+                        and n not in simple
+                        and n not in mut_decls
+                        and n not in columns
+                        and n not in tmps
+                    ):
+                        tmps.append(n)
+        boundary_tmps.append(tmps)
+
+    def masked_destructure(used: set[str]) -> str:
+        col_list = "\n".join(
+            f"        {c}," if c in used else "        _," for c in columns
+        )
+        # Rebuild the destructure with the original tail (type + rhs).
+        rhs = destructure[destructure.index("]") :]
+        return f"    let [\n{col_list}\n    {rhs}"
+
+    parts: list[str] = []
+    for p in range(n_parts):
+        first, last = p == 0, p == n_parts - 1
+        text_words = part_words[p]
+        cols_used = {c for c in columns if c in text_words}
+        blocks: list[str] = []
+        if first:
+            blocks += [s for s in prelude if s not in seq_stmts]
+        else:
+            blocks.append("    let claimed_sum = *component.claimed_sum;")
+            if "column_size" in text_words:
+                blocks.insert(
+                    0, "    let log_size = *(component.claim.log_size);"
+                )
+                blocks.append("    let column_size = m31(pow2(log_size));")
+            pops = mut_decls + boundary_tmps[p - 1]
+            blocks.append(carry_unpack(pops, set(mut_decls)))
+        for s in seq_stmts:
+            if defined_names(s)[0] in text_words:
+                blocks.append(s)
+        blocks.append(masked_destructure(cols_used))
+        blocks += [unbox_by_col[c] for c in columns if c in cols_used]
+        blocks.append("\n    core::internal::revoke_ap_tracking();\n")
+        blocks += tail_parts[p]
+        out_values = (
+            seam_values
+            if last
+            else ["claimed_sum"] + mut_decls + boundary_tmps[p]
+        )
+        blocks.append(carry_pack(out_values, "out"))
+        blocks.append("    out")
+        body = strip_unused_prelude("\n".join(blocks), out_values)
+
+        suffix = "" if n_parts == 1 else str(p + 1)
+        carry_param = (
+            "" if first else "\n    mut carry: Span<QM31>,"
+        )
+        pp_param = (
+            "\n    ref preprocessed_mask_values: PreprocessedMaskValues,"
+            if "preprocessed_mask_values" in body
+            else ""
+        )
+        doc = (
+            f"/// A part {p + 1}/{n_parts} of the trace-mask eval: re-reads the\n"
+            f"/// trace destructure ({len(cols_used)}/{len(columns)} columns unboxed) and "
+            + (
+                "returns the seam\n/// carry for half B "
+                f"({len(out_values)} QM31s = {len(out_values) * 4} felts)."
+                if last
+                else f"returns the mid-A\n/// carry: claimed_sum + the {len(mut_decls)} accumulators + "
+                f"{len(boundary_tmps[p])} crossing tmps\n"
+                f"/// ({len(out_values)} QM31s = {len(out_values) * 4} felts)."
+            )
+        )
+        parts.append(
+            f"""\
+{doc}
+pub fn half_a{suffix}(
+    component: @Component,
+    ref sum: QM31,{pp_param}
+    ref trace_mask_values: ColumnSpan<Span<QM31>>,
+    random_coeff: QM31,{carry_param}
+) -> Array<QM31> {{
+{body}
+}}"""
+        )
+    return parts
+
+
+def fork_b(name: str, lookup_fn: str, k: int, seam_values: list[str]) -> str:
+    """Split lookup_constraints at logup constraint boundary `k`: B1 folds
+    constraints 0..k-1 over the first interaction column quads, B2 the
+    rest. Relies on the telescoping structure: constraint j reads quad j
+    and quad j-1, so the B1→B2 carry is just the values B2's constraints
+    still need (claimed_sum + the unconsumed numerators/denominators)
+    plus the boundary quad."""
+    body_start = lookup_fn.index("\n) {\n") + len("\n) {\n")
+    body = lookup_fn[body_start:].rstrip().rstrip("}").rstrip()
+
+    # The unpack: one big multi_pop_front destructure + per-column unboxes.
+    unpack_m = re.search(
+        r"    let \[\n(.*?)\n    \]: \[Span<QM31>; (\d+)\] =\n"
+        r"        \(\*interaction_trace_mask_values\n"
+        r"        \.multi_pop_front\(\)\n"
+        r"        \.unwrap\(\)\)\n"
+        r"        \.unbox\(\);\n",
+        body,
+        re.S,
+    )
+    columns = [c.strip().rstrip(",") for c in unpack_m.group(1).split("\n")]
+    n_cols = int(unpack_m.group(2))
+    assert len(columns) == n_cols
+
+    rest = body[unpack_m.end() :]
+    revoke = "    core::internal::revoke_ap_tracking();"
+    unboxes_text, _, constraints_text = rest.partition(revoke)
+
+    # Per-column unbox statements, keyed by column name.
+    unbox_stmts = statements("\n" + unboxes_text.strip("\n"))
+    unbox_by_col: dict[str, str] = {}
+    for s in unbox_stmts:
+        if not s.strip():
+            continue
+        m = re.search(r"= \(\*(\w+)\.try_into\(\)\.unwrap\(\)\)", s.replace("\n", " "))
+        unbox_by_col[m.group(1)] = s
+
+    # Constraint pairs: (let constraint_quotient = ...; sum = ...;).
+    con_stmts = [s for s in statements("\n" + constraints_text.strip("\n")) if s.strip()]
+    assert len(con_stmts) % 2 == 0
+    pairs = [con_stmts[i] + "\n" + con_stmts[i + 1] for i in range(0, len(con_stmts), 2)]
+    for i in range(0, len(con_stmts), 2):
+        assert "constraint_quotient" in con_stmts[i]
+        assert con_stmts[i + 1].strip() == "sum = sum * random_coeff + constraint_quotient;"
+
+    cut_col = 4 * k
+    b1_cols, b2_cols = columns[:cut_col], columns[cut_col:]
+    b1_pairs, b2_pairs = pairs[:k], pairs[k:]
+    boundary_quad = columns[cut_col - 4 : cut_col]
+
+    # Sanity: B1 constraints only read B1 columns; B2 only reads B2
+    # columns + the boundary quad.
+    b1_used = set(re.findall(r"\btrace_2_col\d+\b", "\n".join(b1_pairs)))
+    assert b1_used <= set(b1_cols), name
+    b2_used = set(re.findall(r"\btrace_2_col\d+(?:_neg1)?\b", "\n".join(b2_pairs)))
+    b2_avail = {c for c in b2_cols} | {c + "_neg1" for c in b2_cols} | set(boundary_quad)
+    assert b2_used <= b2_avail, name
+
+    def unpack_block(cols: list[str]) -> str:
+        col_list = "\n".join(f"        {c}," for c in cols)
+        unboxes = "\n".join(unbox_by_col[c] for c in cols)
+        return (
+            f"    let [\n{col_list}\n    ]: [Span<QM31>; {len(cols)}] =\n"
+            f"        (*interaction_trace_mask_values\n"
+            f"        .multi_pop_front()\n"
+            f"        .unwrap())\n"
+            f"        .unbox();\n{unboxes}\n\n{revoke}"
+        )
+
+    # B2 only needs the values its own constraints read: claimed_sum, the
+    # numerators/denominators from relation index 2k on, and the boundary
+    # quad (constraint j pairs numerators/denominators 2j and 2j+1).
+    n_relations = len(seam_values[1:]) // 2
+    numerators = seam_values[1 : 1 + n_relations]
+    lookup_sums = seam_values[1 + n_relations :]
+    b1_carry_out = ["claimed_sum"] + numerators[2 * k :] + lookup_sums[2 * k :] + boundary_quad
+    b2_used = set(WORD.findall("\n".join(b2_pairs)))
+    assert not b2_used & set(numerators[: 2 * k]), name
+    assert not b2_used & set(lookup_sums[: 2 * k]), name
+    return f"""\
+/// Half B1: logup constraints 0..{k - 1} over the first {cut_col}
+/// INTERACTION mask columns. Returns the carry for half B2: claimed_sum +
+/// the unconsumed numerators/denominators + the boundary column quad
+/// ({len(b1_carry_out)} QM31s = {len(b1_carry_out) * 4} felts).
+pub fn half_b1(
+    ref sum: QM31,
+    ref interaction_trace_mask_values: ColumnSpan<Span<QM31>>,
+    random_coeff: QM31,
+    mut carry: Span<QM31>,
+) -> Array<QM31> {{
+{carry_unpack(seam_values, set())}
+{unpack_block(b1_cols)}
+
+{chr(10).join(b1_pairs)}
+
+{carry_pack(b1_carry_out, "out")}
+    out
+}}
+
+/// Half B2: logup constraints {k}..{len(pairs) - 1} over the remaining
+/// {len(b2_cols)} INTERACTION mask columns, resumed from half B1's carry.
+pub fn half_b2(
+    log_size: u32,
+    ref sum: QM31,
+    ref interaction_trace_mask_values: ColumnSpan<Span<QM31>>,
+    random_coeff: QM31,
+    mut carry: Span<QM31>,
+) {{
+    let column_size = m31(pow2(log_size));
+{carry_unpack(b1_carry_out, set())}
+{unpack_block(b2_cols)}
+
+{chr(10).join(b2_pairs)}
+}}"""
+
+
 if __name__ == "__main__":
-    for component in COMPONENTS:
-        fork(component)
+    for component, spec in SPECS.items():
+        fork(component, spec)

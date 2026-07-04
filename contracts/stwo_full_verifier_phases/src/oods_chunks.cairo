@@ -43,10 +43,15 @@
 //! `lookup_constraints` seam (`src/split/`): half A evaluates the trace-
 //! mask constraint quotients and leaves the seam values (claimed_sum +
 //! relation numerators + combined lookup denominators, 57–199 QM31s) in
-//! the checkpoint's `carry`; half B — necessarily the next family —
-//! resumes from the carry and evaluates the interaction-mask logup
-//! constraints. The trace counter advances in half A, the interaction
-//! counter in half B; construction (one claimed sum) happens in half A:
+//! the checkpoint's `carry`; half B — necessarily a later family in the
+//! same component — resumes from the carry and evaluates the
+//! interaction-mask logup constraints. The trace counter advances in
+//! half A, the interaction counter in half B; construction (one claimed
+//! sum) happens in the component's first part. Where one half still
+//! exceeds a declare cap it is cut once more (blake_round and
+//! poseidon_aggregator half A → A1|A2 with the crossing `let`
+//! intermediates in the carry; cube_252 half B → B1|B2 at a logup
+//! constraint boundary with the boundary column quad in the carry):
 //!   0..5   opcode sub-airs (add, add_small, add_ap, assert_eq,
 //!          assert_eq_imm, assert_eq_double_deref),
 //!   6, 7   blake_compress halves A and B,
@@ -54,16 +59,18 @@
 //!          jnz_taken, jump_abs, jump_double_deref, jump_rel,
 //!          jump_rel_imm, mul, mul_small, qm31_add_mul, ret),
 //!   20     verify_instruction,
-//!   21..26 blake context sub-airs (blake_round gate: blake_round halves
-//!          A and B, blake_g, blake_round_sigma, triple_xor_32, xor_12),
-//!   27     builtins,
-//!   28..35 poseidon context sub-airs (poseidon_aggregator gate:
-//!          aggregator halves A and B, 3_partial_rounds_chain,
-//!          full_round_chain, cube_252 halves A and B, round_keys,
-//!          range_check_252_width_27),
-//!   36     memory_address_to_id, 37 memory_id_to_big,
-//!   38     memory_id_to_small, 39 range_checks,
-//!   40..43 verify_bitwise_xor_4/7/8/9.
+//!   21..28 blake context sub-airs (blake_round gate: blake_round parts
+//!          A1 (reads + early combines), A2 (the blake_g combines), A3
+//!          (the blake_round combines) and B, blake_g,
+//!          blake_round_sigma, triple_xor_32, xor_12),
+//!   29     builtins,
+//!   30..40 poseidon context sub-airs (poseidon_aggregator gate:
+//!          aggregator parts A1, A2 (the hades permutation alone), A3
+//!          and B, 3_partial_rounds_chain, full_round_chain, cube_252
+//!          parts A, B1 and B2, round_keys, range_check_252_width_27),
+//!   41     memory_address_to_id, 42 memory_id_to_big,
+//!   43     memory_id_to_small, 44 range_checks,
+//!   45..48 verify_bitwise_xor_4/7/8/9.
 //!
 //! Equivalence with `machine_oods_mix` over the real proof is asserted in
 //! `tests/test_oods_chunks.cairo`, including a checkpoint serde round-trip
@@ -102,8 +109,8 @@ use crate::machine::{
 use crate::split;
 
 /// Number of component families in the vendored eval sequence (40 sub-airs
-/// with the four oversized evals each counted as two half-families).
-pub const N_FAMILIES: u32 = 44;
+/// with the four oversized evals split into 2–4 part-families each).
+pub const N_FAMILIES: u32 = 49;
 
 /// Checkpoint state between OODS group transactions.
 #[derive(Drop, Serde)]
@@ -976,9 +983,9 @@ pub fn family_ret_opcode(ref ctx: OodsGroupCtx) {
 // ---------------------------------------------------------------------------
 // Blake context sub-airs (all-or-nothing on blake_round, as vendored).
 
-pub fn family_blake_round_a(ref ctx: OodsGroupCtx) {
+pub fn family_blake_round_a1(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
-        head, elements, mut pp, mut trace, interaction, mut claimed_sums, mut sum,
+        head, elements, pp, trace, interaction, mut claimed_sums, mut sum,
         random_coeff, trace_total, interaction_total, sums_total, mut carry,
     } = ctx;
     assert!(carry.is_empty(), "carry not consumed");
@@ -987,14 +994,68 @@ pub fn family_blake_round_a(ref ctx: OodsGroupCtx) {
             @head.claim.blake_round, ref claimed_sums, @elements,
         )
             .unwrap();
-        carry = split::blake_round::half_a(
-            @component, ref sum, ref pp, ref trace, random_coeff,
+        // Part A1 reads a COPY of the trace span — the trace counter
+        // advances when part A2 re-reads the same columns for real.
+        let mut trace_read = trace;
+        carry = split::blake_round::half_a1(
+            @component, ref sum, ref trace_read, random_coeff,
         );
     } else {
         assert!(head.claim.blake_g.is_none());
         assert!(head.claim.blake_round_sigma.is_none());
         assert!(head.claim.triple_xor_32.is_none());
         assert!(head.claim.verify_bitwise_xor_12.is_none());
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_blake_round_a2(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
+    } = ctx;
+    if let Some(claim) = (@head.claim.blake_round).as_snap() {
+        // Rebuild the component from the carried claimed_sum — the
+        // claimed_sums stream was consumed by part A1.
+        let mut carry_span = carry.span();
+        let claimed_sum = *carry_span.pop_front().unwrap();
+        let component = components::blake_round::NewComponentImpl::new(
+            claim, claimed_sum, @elements,
+        );
+        // Not the last A part — reads a COPY of the trace span.
+        let mut trace_read = trace;
+        carry = split::blake_round::half_a2(
+            @component, ref sum, ref trace_read, random_coeff, carry_span,
+        );
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_blake_round_a3(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, pp, mut trace, interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
+    } = ctx;
+    if let Some(claim) = (@head.claim.blake_round).as_snap() {
+        let mut carry_span = carry.span();
+        let claimed_sum = *carry_span.pop_front().unwrap();
+        let component = components::blake_round::NewComponentImpl::new(
+            claim, claimed_sum, @elements,
+        );
+        // Last A part — pops the trace columns for real.
+        carry = split::blake_round::half_a3(
+            @component, ref sum, ref trace, random_coeff, carry_span,
+        );
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
@@ -1107,9 +1168,9 @@ pub fn family_verify_bitwise_xor_12(ref ctx: OodsGroupCtx) {
 // ---------------------------------------------------------------------------
 // Poseidon context sub-airs (all-or-nothing on poseidon_aggregator).
 
-pub fn family_poseidon_aggregator_a(ref ctx: OodsGroupCtx) {
+pub fn family_poseidon_aggregator_a1(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
-        head, elements, mut pp, mut trace, interaction, mut claimed_sums, mut sum,
+        head, elements, pp, trace, interaction, mut claimed_sums, mut sum,
         random_coeff, trace_total, interaction_total, sums_total, mut carry,
     } = ctx;
     assert!(carry.is_empty(), "carry not consumed");
@@ -1118,8 +1179,11 @@ pub fn family_poseidon_aggregator_a(ref ctx: OodsGroupCtx) {
             @head.claim.poseidon_aggregator, ref claimed_sums, @elements,
         )
             .unwrap();
-        carry = split::poseidon_aggregator::half_a(
-            @component, ref sum, ref pp, ref trace, random_coeff,
+        // Part A1 reads a COPY of the trace span — the trace counter
+        // advances when part A2 re-reads the same columns for real.
+        let mut trace_read = trace;
+        carry = split::poseidon_aggregator::half_a1(
+            @component, ref sum, ref trace_read, random_coeff,
         );
     } else {
         assert!(head.claim.poseidon_3_partial_rounds_chain.is_none());
@@ -1127,6 +1191,57 @@ pub fn family_poseidon_aggregator_a(ref ctx: OodsGroupCtx) {
         assert!(head.claim.cube_252.is_none());
         assert!(head.claim.poseidon_round_keys.is_none());
         assert!(head.claim.range_check_252_width_27.is_none());
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_poseidon_aggregator_a2(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, mut pp, trace, interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
+    } = ctx;
+    if let Some(claim) = (@head.claim.poseidon_aggregator).as_snap() {
+        // Rebuild the component from the carried claimed_sum — the
+        // claimed_sums stream was consumed by part A1.
+        let mut carry_span = carry.span();
+        let claimed_sum = *carry_span.pop_front().unwrap();
+        let component = components::poseidon_aggregator::NewComponentImpl::new(
+            claim, claimed_sum, @elements,
+        );
+        // Not the last A part — reads a COPY of the trace span.
+        let mut trace_read = trace;
+        carry = split::poseidon_aggregator::half_a2(
+            @component, ref sum, ref pp, ref trace_read, random_coeff, carry_span,
+        );
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_poseidon_aggregator_a3(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, pp, mut trace, interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
+    } = ctx;
+    if let Some(claim) = (@head.claim.poseidon_aggregator).as_snap() {
+        let mut carry_span = carry.span();
+        let claimed_sum = *carry_span.pop_front().unwrap();
+        let component = components::poseidon_aggregator::NewComponentImpl::new(
+            claim, claimed_sum, @elements,
+        );
+        // Last A part — pops the trace columns for real.
+        carry = split::poseidon_aggregator::half_a3(
+            @component, ref sum, ref trace, random_coeff, carry_span,
+        );
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
@@ -1213,14 +1328,30 @@ pub fn family_cube_252_a(ref ctx: OodsGroupCtx) {
     };
 }
 
-pub fn family_cube_252_b(ref ctx: OodsGroupCtx) {
+pub fn family_cube_252_b1(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, pp, trace, mut interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
+    } = ctx;
+    if head.claim.poseidon_aggregator.is_some() {
+        carry = split::cube_252::half_b1(ref sum, ref interaction, random_coeff, carry.span());
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_cube_252_b2(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, pp, trace, mut interaction, claimed_sums, mut sum,
         random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.poseidon_aggregator.is_some() {
         let claim = (@head.claim.cube_252).as_snap().unwrap();
-        split::cube_252::half_b(
+        split::cube_252::half_b2(
             *claim.log_size, ref sum, ref interaction, random_coeff, carry.span(),
         );
     } else {

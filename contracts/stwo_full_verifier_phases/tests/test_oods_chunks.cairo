@@ -17,13 +17,17 @@ use stwo_full_verifier_phases::oods_chunks::{
     family_add_ap_opcode, family_add_opcode, family_add_opcode_small, family_assert_eq_opcode,
     family_assert_eq_opcode_double_deref, family_assert_eq_opcode_imm,
     family_blake_compress_opcode_a, family_blake_compress_opcode_b, family_blake_g,
-    family_blake_round_a, family_blake_round_b, family_blake_round_sigma, family_builtins,
-    family_call_opcode_abs, family_call_opcode_rel_imm, family_cube_252_a, family_cube_252_b,
+    family_blake_round_a1, family_blake_round_a2, family_blake_round_a3,
+    family_blake_round_b,
+    family_blake_round_sigma, family_builtins, family_call_opcode_abs,
+    family_call_opcode_rel_imm, family_cube_252_a, family_cube_252_b1, family_cube_252_b2,
     family_jnz_opcode_non_taken, family_jnz_opcode_taken, family_jump_opcode_abs,
     family_jump_opcode_double_deref, family_jump_opcode_rel, family_jump_opcode_rel_imm,
     family_memory_address_to_id, family_memory_id_to_big, family_memory_id_to_small,
     family_mul_opcode, family_mul_opcode_small, family_poseidon_3_partial_rounds_chain,
-    family_poseidon_aggregator_a, family_poseidon_aggregator_b, family_poseidon_full_round_chain,
+    family_poseidon_aggregator_a1, family_poseidon_aggregator_a2,
+    family_poseidon_aggregator_a3, family_poseidon_aggregator_b,
+    family_poseidon_full_round_chain,
     family_poseidon_round_keys, family_qm_31_add_mul_opcode, family_range_check_252_width_27,
     family_range_checks, family_ret_opcode, family_triple_xor_32, family_verify_bitwise_xor_12,
     family_verify_bitwise_xor_4, family_verify_bitwise_xor_7, family_verify_bitwise_xor_8,
@@ -137,10 +141,10 @@ fn test_chunked_oods_matches_monolithic() {
     // Monolithic reference.
     let expected = machine_oods_mix(state_a, head, sampled);
 
-    // Chunked: begin → group txs over the 44-family sequence (each oversized
-    // component eval split into half A / half B, with the seam carry riding
-    // the checkpoint) → finalize, with a checkpoint round-trip between every
-    // transaction — in particular between every half-A and its half-B.
+    // Chunked: begin → group txs over the 49-family sequence (each oversized
+    // component eval split into 2–4 parts, with the seam carry riding the
+    // checkpoint) → finalize, with a checkpoint round-trip between every
+    // transaction — in particular between every part and its successor.
     let mut state = roundtrip(oods_begin(state_b, head, sampled));
 
     // Opcode sub-airs 0..5.
@@ -206,62 +210,77 @@ fn drive_tail_from_blake_compress_b(
     family_verify_instruction(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
 
-    // blake context: blake_round halves (21, 22) then the rest (23..26).
+    // blake context: blake_round parts (21..24) then the rest (25..28).
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 21);
-    family_blake_round_a(ref ctx);
+    family_blake_round_a1(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 22);
-    family_blake_round_b(ref ctx);
+    family_blake_round_a2(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 23);
-    family_blake_g(ref ctx);
+    family_blake_round_a3(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 24);
+    family_blake_round_b(ref ctx);
+    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 25);
+    family_blake_g(ref ctx);
+    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 26);
     family_blake_round_sigma(ref ctx);
     family_triple_xor_32(ref ctx);
     family_verify_bitwise_xor_12(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 3));
 
-    // builtins (27).
-    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 27);
+    // builtins (29).
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 29);
     family_builtins(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
 
-    // poseidon context: aggregator halves (28, 29), chains (30, 31),
-    // cube_252 halves (32, 33), tail (34, 35).
-    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 28);
-    family_poseidon_aggregator_a(ref ctx);
-    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
-    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 29);
-    family_poseidon_aggregator_b(ref ctx);
-    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
+    // poseidon context: aggregator parts (30..33), chains (34, 35),
+    // cube_252 parts (36..38), tail (39, 40).
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 30);
-    family_poseidon_3_partial_rounds_chain(ref ctx);
+    family_poseidon_aggregator_a1(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 31);
-    family_poseidon_full_round_chain(ref ctx);
+    family_poseidon_aggregator_a2(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 32);
-    family_cube_252_a(ref ctx);
+    family_poseidon_aggregator_a3(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 33);
-    family_cube_252_b(ref ctx);
+    family_poseidon_aggregator_b(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
     let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 34);
+    family_poseidon_3_partial_rounds_chain(ref ctx);
+    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 35);
+    family_poseidon_full_round_chain(ref ctx);
+    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 36);
+    family_cube_252_a(ref ctx);
+    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 37);
+    family_cube_252_b1(ref ctx);
+    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 38);
+    family_cube_252_b2(ref ctx);
+    state = roundtrip(oods_group_epilogue(state_after, ctx, 1));
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 39);
     family_poseidon_round_keys(ref ctx);
     family_range_check_252_width_27(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 2));
 
-    // memory + range_checks (36..39).
-    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 36);
+    // memory + range_checks (41..44).
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 41);
     family_memory_address_to_id(ref ctx);
     family_memory_id_to_big(ref ctx);
     family_memory_id_to_small(ref ctx);
     family_range_checks(ref ctx);
     state = roundtrip(oods_group_epilogue(state_after, ctx, 4));
 
-    // The xor tail (40..43).
-    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 40);
+    // The xor tail (45..48).
+    let (state_after, mut ctx) = oods_group_prologue(state, head, sampled, 45);
     family_verify_bitwise_xor_4(ref ctx);
     family_verify_bitwise_xor_7(ref ctx);
     family_verify_bitwise_xor_8(ref ctx);
