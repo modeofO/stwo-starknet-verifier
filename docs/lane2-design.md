@@ -246,28 +246,60 @@ the payload uses the poseidon builtin). Paths, in preference order:
    are dominated by the bounded_int QM31-arithmetic lowering; the
    `qm31_opcode` cfg variants already exist upstream and would shrink all
    four dramatically (likely under the cap) with zero fork.
-2. **Two-half fork along the generated seam.** Each oversized component
-   file already factors as `evaluate_constraints_at_point` (intermediate
-   values + constraint quotients over the TRACE masks, ~1.2k lines)
-   followed by a call to a separate `lookup_constraints(ref sum,
-   random_coeff, claimed_sum, numerator_0..~98, …)` function (logup over
-   the INTERACTION masks, ~1.2k lines). The interface between them is
-   ~99 QM31 numerators ≈ 400 felts — carryable across a transaction
-   boundary (the production wrapper stores `poseidon(state)`, not the
-   state, so checkpoint size is calldata-only). The halves consume
-   different mask streams, so the trace counter advances in half A and
-   the interaction counter in half B — consistent with the existing
-   counter model. Caveat: half A (intermediates + quotients) is likely
-   the bigger half and may need one further cut for cube_252/aggregator;
-   half-A-internal cuts must carry or recompute shared intermediates.
+2. ~~**Two-half fork along the generated seam.**~~ **Built and proven
+   equivalent (2026-07-04) — see "The two-half seam fork" below.**
 3. The four families cannot be skipped for bootloader-shaped proofs, so
    there is no configuration dodge.
 
-With merging of small neighbours (fitting groups sum to ~447k ≈ 6 full
-classes) the eventual OODS phase is ~8–10 group txs; today's
-fine-grained shape is ~20. Deployable classes today: Claim, Lookup,
-Group, Fri, OodsBegin, OodsFinalize + 16 family-group classes = **22 of
-26 under the caps**.
+### The two-half seam fork (built 2026-07-04, `src/split/`)
+
+`scripts/split_component_evals.py` forks each oversized component file
+along its generated seam: `evaluate_constraints_at_point` factors as
+intermediates + constraint quotients over the TRACE masks followed by a
+single call to a file-private `lookup_constraints(ref sum, random_coeff,
+claimed_sum, numerator_0.., column_size, ref interaction_masks,
+<combined lookup sums>..)` (logup over the INTERACTION masks). The fork
+emits `half_a` (returns the seam values as a carry array:
+claimed_sum + numerators + combined lookup denominators, 57–199 QM31s =
+228–796 felts) and `half_b` (unpacks the carry, calls the verbatim
+`lookup_constraints` copy). In `oods_chunks.cairo` each half is its own
+family (N_FAMILIES 40 → 44; A must be immediately followed by its B via
+the existing family-order counter), the carry rides the
+`OodsEvalState` checkpoint (production stores `poseidon(state)`, so the
+cost is calldata-only), the trace counter advances in half A, the
+interaction counter in half B, and construction (one claimed sum) is
+half A's. `tests/test_oods_chunks.cairo`: 44-family chunked ==
+`machine_oods_mix` on the real proof with a serde round-trip between
+every pair of transactions (carry included), and a tampered carry felt
+between half A and half B is rejected at the OODS equation
+("Invalid OODS eval"). Suite: 26/26 green.
+
+**Class sizes v3** (scarb 2.18.0; two caps enforced at declare: 81,920
+Sierra felts AND 4,089,446 bytes of contract-class JSON without debug
+info — the byte cap binds first, at ~66k felts for this code shape;
+it was not checked in the v2 numbers):
+
+| Class | Sierra felts | Class bytes | Verdict |
+|---|---|---|---|
+| blake_compress half A / B | 52,404 / 58,749 | 3.22M / 3.58M | **both fit** |
+| blake_round half A / B | 67,601 / 43,520 | **4.199M** / 2.62M | B fits; A felt-fits but 2.7% over the byte cap |
+| cube_252 half A / B | 62,347 / **93,060** | 3.87M / 5.75M | A fits; B (the 99-relation logup) needs one more cut |
+| poseidon_aggregator half A / B | **126,799** / 20,187 | 8.00M / 1.10M | B fits; A (2,134 lines of intermediates) needs one more cut |
+
+Also surfaced by the byte cap: the pre-existing `StwoOodsF05` group
+(mul + mul_small, 69,270 felts / 4.295M bytes) exceeds it — fixed by
+regrouping, no fork needed. Remaining surgery, all inside the generator:
+cut poseidon_aggregator/blake_round half A once more (A1|A2; carry =
+all numerator/sum values so far + the `let` intermediates that cross
+the cut, dataflow-computed), and cut cube_252 half B at a logup
+constraint boundary (B1|B2; the telescoping structure means the extra
+carry is just the boundary column quad, 4 QM31s).
+
+With merging of small neighbours the eventual OODS phase is ~8–10 group
+txs; today's fine-grained shape is ~22. Deployable classes today:
+Claim, Lookup, Group, Fri, OodsBegin, OodsFinalize + group classes —
+**28 of 32 under both caps** (over: poseidon_aggregator A, cube_252 B,
+blake_round A and F05 on the byte cap only).
 
 ## Client side
 

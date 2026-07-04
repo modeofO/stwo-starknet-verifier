@@ -37,25 +37,38 @@
 //! poseidon_outputs_packing variant). The three families whose composite
 //! classes exceeded the Sierra cap (opcodes 232k, blake 107k, poseidon
 //! 350k) are split one level deeper — their sub-airs are themselves flat
-//! `try_new → evaluate` sequences:
-//!   0..18  the 19 opcode sub-airs (add, add_small, add_ap, assert_eq,
-//!          assert_eq_imm, assert_eq_double_deref, blake_compress,
-//!          call_abs, call_rel_imm, jnz_non_taken, jnz_taken, jump_abs,
-//!          jump_double_deref, jump_rel, jump_rel_imm, mul, mul_small,
-//!          qm31_add_mul, ret),
-//!   19     verify_instruction,
-//!   20..24 blake context sub-airs (blake_round gate: blake_round,
-//!          blake_g, blake_round_sigma, triple_xor_32, xor_12),
-//!   25     builtins,
-//!   26..31 poseidon context sub-airs (poseidon_aggregator gate:
-//!          aggregator, 3_partial_rounds_chain, full_round_chain,
-//!          cube_252, round_keys, range_check_252_width_27),
-//!   32     memory_address_to_id, 33 memory_id_to_big,
-//!   34     memory_id_to_small, 35 range_checks,
-//!   36..39 verify_bitwise_xor_4/7/8/9.
+//! `try_new → evaluate` sequences. The four sub-airs whose single evals
+//! STILL exceed the cap (blake_compress 92k, blake_round 94k, cube_252
+//! 133k, poseidon_aggregator 134k) are split once more along the generated
+//! `lookup_constraints` seam (`src/split/`): half A evaluates the trace-
+//! mask constraint quotients and leaves the seam values (claimed_sum +
+//! relation numerators + combined lookup denominators, 57–199 QM31s) in
+//! the checkpoint's `carry`; half B — necessarily the next family —
+//! resumes from the carry and evaluates the interaction-mask logup
+//! constraints. The trace counter advances in half A, the interaction
+//! counter in half B; construction (one claimed sum) happens in half A:
+//!   0..5   opcode sub-airs (add, add_small, add_ap, assert_eq,
+//!          assert_eq_imm, assert_eq_double_deref),
+//!   6, 7   blake_compress halves A and B,
+//!   8..19  opcode sub-airs (call_abs, call_rel_imm, jnz_non_taken,
+//!          jnz_taken, jump_abs, jump_double_deref, jump_rel,
+//!          jump_rel_imm, mul, mul_small, qm31_add_mul, ret),
+//!   20     verify_instruction,
+//!   21..26 blake context sub-airs (blake_round gate: blake_round halves
+//!          A and B, blake_g, blake_round_sigma, triple_xor_32, xor_12),
+//!   27     builtins,
+//!   28..35 poseidon context sub-airs (poseidon_aggregator gate:
+//!          aggregator halves A and B, 3_partial_rounds_chain,
+//!          full_round_chain, cube_252 halves A and B, round_keys,
+//!          range_check_252_width_27),
+//!   36     memory_address_to_id, 37 memory_id_to_big,
+//!   38     memory_id_to_small, 39 range_checks,
+//!   40..43 verify_bitwise_xor_4/7/8/9.
 //!
 //! Equivalence with `machine_oods_mix` over the real proof is asserted in
-//! `tests/test_oods_chunks.cairo`.
+//! `tests/test_oods_chunks.cairo`, including a checkpoint serde round-trip
+//! of the carry between every half-A and half-B transaction and a
+//! carry-tamper rejection.
 
 use core::array::SpanTrait;
 use core::dict::SquashedFelt252DictTrait;
@@ -86,9 +99,11 @@ use crate::machine::{
     check_head, FriCommitPhaseState, Head, log_trace_degree_bound_of, OodsPhaseState,
     rebuild_all_trees,
 };
+use crate::split;
 
-/// Number of component families in the vendored eval sequence.
-pub const N_FAMILIES: u32 = 40;
+/// Number of component families in the vendored eval sequence (40 sub-airs
+/// with the four oversized evals each counted as two half-families).
+pub const N_FAMILIES: u32 = 44;
 
 /// Checkpoint state between OODS group transactions.
 #[derive(Drop, Serde)]
@@ -108,6 +123,10 @@ pub struct OodsEvalState {
     pub trace_done: u32,
     pub interaction_done: u32,
     pub pp_used_mask: u128,
+    /// Seam carry of a two-half component eval: filled by a half-A family,
+    /// consumed by the immediately following half-B family (enforced by
+    /// the family order), empty at every other boundary.
+    pub carry: Array<QM31>,
     pub program_fact_hash: felt252,
 }
 
@@ -128,6 +147,7 @@ pub struct OodsGroupCtx {
     pub trace_total: u32,
     pub interaction_total: u32,
     pub sums_total: u32,
+    pub carry: Array<QM31>,
 }
 
 fn u128_bit(index: u32) -> u128 {
@@ -203,6 +223,7 @@ pub fn oods_begin(
         trace_done: 0,
         interaction_done: 0,
         pp_used_mask: 0,
+        carry: array![],
         program_fact_hash,
     }
 }
@@ -217,10 +238,27 @@ pub fn oods_group_prologue(
     sampled_felts: Span<felt252>,
     first_family: u32,
 ) -> (OodsEvalState, OodsGroupCtx) {
+    let OodsEvalState {
+        d_head,
+        d_sampled,
+        digest_pre_draw,
+        digest_post_comp_commit,
+        random_coeff,
+        ood_x,
+        ood_y,
+        sum,
+        families_done,
+        sums_done,
+        trace_done,
+        interaction_done,
+        pp_used_mask,
+        carry,
+        program_fact_hash,
+    } = state;
     // Groups must run in the vendored eval order, exactly once each.
-    assert!(state.families_done == first_family, "family order");
-    let h = check_head(head, state.d_head);
-    assert(poseidon_hash_span(sampled_felts) == state.d_sampled, 'sampled binding');
+    assert!(families_done == first_family, "family order");
+    let h = check_head(head, d_head);
+    assert(poseidon_hash_span(sampled_felts) == d_sampled, 'sampled binding');
 
     let (pp, trace, interaction) = split_masks(sampled_felts);
     let pp_dict = PreprocessedMaskValuesImpl::new(pp);
@@ -231,17 +269,14 @@ pub fn oods_group_prologue(
     let interaction_total = SpanTrait::len(interaction);
     let sums_all = h.interaction_claim.claimed_sums.span();
     let sums_total = SpanTrait::len(sums_all);
-    let trace_ff = trace.slice(state.trace_done, trace_total - state.trace_done);
-    let interaction_ff = interaction
-        .slice(state.interaction_done, interaction_total - state.interaction_done);
-    let sums_ff = sums_all.slice(state.sums_done, sums_total - state.sums_done);
+    let trace_ff = trace.slice(trace_done, trace_total - trace_done);
+    let interaction_ff = interaction.slice(interaction_done, interaction_total - interaction_done);
+    let sums_ff = sums_all.slice(sums_done, sums_total - sums_done);
 
     // Deterministic per-tx redraw of the lookup elements.
-    let mut draw_channel = new_channel(state.digest_pre_draw);
+    let mut draw_channel = new_channel(digest_pre_draw);
     let elements = LookupElementsImpl::draw(ref draw_channel);
 
-    let sum = state.sum;
-    let random_coeff = state.random_coeff;
     let ctx = OodsGroupCtx {
         head: h,
         elements,
@@ -254,6 +289,24 @@ pub fn oods_group_prologue(
         trace_total,
         interaction_total,
         sums_total,
+        carry,
+    };
+    let state = OodsEvalState {
+        d_head,
+        d_sampled,
+        digest_pre_draw,
+        digest_post_comp_commit,
+        random_coeff,
+        ood_x,
+        ood_y,
+        sum,
+        families_done,
+        sums_done,
+        trace_done,
+        interaction_done,
+        pp_used_mask,
+        carry: array![],
+        program_fact_hash,
     };
     (state, ctx)
 }
@@ -273,6 +326,7 @@ pub fn oods_group_epilogue(
         trace_total,
         interaction_total,
         sums_total,
+        carry,
     } = ctx;
 
     // This transaction's preprocessed-column usage bits.
@@ -305,6 +359,7 @@ pub fn oods_group_epilogue(
         trace_done: _,
         interaction_done: _,
         pp_used_mask,
+        carry: _,
         program_fact_hash,
     } = state;
     OodsEvalState {
@@ -321,6 +376,7 @@ pub fn oods_group_epilogue(
         trace_done: trace_total - SpanTrait::len(trace),
         interaction_done: interaction_total - SpanTrait::len(interaction),
         pp_used_mask: pp_used_mask | used_mask,
+        carry,
         program_fact_hash,
     }
 }
@@ -333,7 +389,7 @@ pub fn oods_group_epilogue(
 pub fn family_verify_instruction(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let component = components::verify_instruction::NewComponentImpl::try_new(
         @head.claim.verify_instruction, ref claimed_sums, @elements,
@@ -345,7 +401,7 @@ pub fn family_verify_instruction(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
@@ -353,7 +409,7 @@ pub fn family_verify_instruction(ref ctx: OodsGroupCtx) {
 pub fn family_builtins(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let components = BuiltinComponentsImpl::new(@head.claim, @elements, ref claimed_sums);
     components
@@ -363,7 +419,7 @@ pub fn family_builtins(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
@@ -371,7 +427,7 @@ pub fn family_builtins(ref ctx: OodsGroupCtx) {
 pub fn family_memory_address_to_id(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let component = components::memory_address_to_id::NewComponentImpl::try_new(
         @head.claim.memory_address_to_id, ref claimed_sums, @elements,
@@ -383,14 +439,14 @@ pub fn family_memory_address_to_id(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_memory_id_to_big(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     // Construction mirrors CairoAirNewImpl::new's id_to_big loop, including
     // the id-overflow assert.
@@ -417,14 +473,14 @@ pub fn family_memory_id_to_big(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_memory_id_to_small(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let component = components::memory_id_to_small::NewComponentImpl::try_new(
         @head.claim.memory_id_to_small, ref claimed_sums, @elements,
@@ -436,14 +492,14 @@ pub fn family_memory_id_to_small(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_range_checks(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let components = RangeChecksComponentsImpl::new(@head.claim, @elements, ref claimed_sums);
     components
@@ -452,14 +508,14 @@ pub fn family_range_checks(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_verify_bitwise_xor_4(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let component = components::verify_bitwise_xor_4::NewComponentImpl::try_new(
         @head.claim.verify_bitwise_xor_4, ref claimed_sums, @elements,
@@ -471,14 +527,14 @@ pub fn family_verify_bitwise_xor_4(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_verify_bitwise_xor_7(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let component = components::verify_bitwise_xor_7::NewComponentImpl::try_new(
         @head.claim.verify_bitwise_xor_7, ref claimed_sums, @elements,
@@ -490,14 +546,14 @@ pub fn family_verify_bitwise_xor_7(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_verify_bitwise_xor_8(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let component = components::verify_bitwise_xor_8::NewComponentImpl::try_new(
         @head.claim.verify_bitwise_xor_8, ref claimed_sums, @elements,
@@ -509,14 +565,14 @@ pub fn family_verify_bitwise_xor_8(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_verify_bitwise_xor_9(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     let component = components::verify_bitwise_xor_9::NewComponentImpl::try_new(
         @head.claim.verify_bitwise_xor_9, ref claimed_sums, @elements,
@@ -528,7 +584,7 @@ pub fn family_verify_bitwise_xor_9(ref ctx: OodsGroupCtx) {
         );
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
@@ -539,7 +595,7 @@ pub fn family_verify_bitwise_xor_9(ref ctx: OodsGroupCtx) {
 pub fn family_add_opcode(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     // Mirrors OpcodeComponentsImpl::new's precondition.
     assert!(head.claim.generic_opcode.is_none(), "The generic opcode is not supported.");
@@ -553,14 +609,14 @@ pub fn family_add_opcode(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_add_opcode_small(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::add_opcode_small::NewComponentImpl::try_new(
         @head.claim.add_opcode_small, ref claimed_sums, @elements,
@@ -572,14 +628,14 @@ pub fn family_add_opcode_small(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_add_ap_opcode(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::add_ap_opcode::NewComponentImpl::try_new(
         @head.claim.add_ap_opcode, ref claimed_sums, @elements,
@@ -591,14 +647,14 @@ pub fn family_add_ap_opcode(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_assert_eq_opcode(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::assert_eq_opcode::NewComponentImpl::try_new(
         @head.claim.assert_eq_opcode, ref claimed_sums, @elements,
@@ -610,14 +666,14 @@ pub fn family_assert_eq_opcode(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_assert_eq_opcode_imm(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::assert_eq_opcode_imm::NewComponentImpl::try_new(
         @head.claim.assert_eq_opcode_imm, ref claimed_sums, @elements,
@@ -629,14 +685,14 @@ pub fn family_assert_eq_opcode_imm(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_assert_eq_opcode_double_deref(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::assert_eq_opcode_double_deref::NewComponentImpl::try_new(
         @head.claim.assert_eq_opcode_double_deref, ref claimed_sums, @elements,
@@ -648,33 +704,51 @@ pub fn family_assert_eq_opcode_double_deref(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
-pub fn family_blake_compress_opcode(ref ctx: OodsGroupCtx) {
+pub fn family_blake_compress_opcode_a(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
-        head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        head, elements, mut pp, mut trace, interaction, mut claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
     } = ctx;
+    assert!(carry.is_empty(), "carry not consumed");
     if let Some(component) = components::blake_compress_opcode::NewComponentImpl::try_new(
         @head.claim.blake_compress_opcode, ref claimed_sums, @elements,
     ) {
-        component
-                .evaluate_constraints_at_point(
-                    ref sum, ref pp, ref trace, ref interaction, random_coeff, [].span(),
-                );
+        carry = split::blake_compress_opcode::half_a(
+            @component, ref sum, ref pp, ref trace, random_coeff,
+        );
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_blake_compress_opcode_b(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, pp, trace, mut interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
+    } = ctx;
+    if let Some(claim) = (@head.claim.blake_compress_opcode).as_snap() {
+        split::blake_compress_opcode::half_b(
+            *claim.log_size, ref sum, ref interaction, random_coeff, carry.span(),
+        );
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry: array![],
     };
 }
 
 pub fn family_call_opcode_abs(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::call_opcode_abs::NewComponentImpl::try_new(
         @head.claim.call_opcode_abs, ref claimed_sums, @elements,
@@ -686,14 +760,14 @@ pub fn family_call_opcode_abs(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_call_opcode_rel_imm(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::call_opcode_rel_imm::NewComponentImpl::try_new(
         @head.claim.call_opcode_rel_imm, ref claimed_sums, @elements,
@@ -705,14 +779,14 @@ pub fn family_call_opcode_rel_imm(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_jnz_opcode_non_taken(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::jnz_opcode_non_taken::NewComponentImpl::try_new(
         @head.claim.jnz_opcode_non_taken, ref claimed_sums, @elements,
@@ -724,14 +798,14 @@ pub fn family_jnz_opcode_non_taken(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_jnz_opcode_taken(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::jnz_opcode_taken::NewComponentImpl::try_new(
         @head.claim.jnz_opcode_taken, ref claimed_sums, @elements,
@@ -743,14 +817,14 @@ pub fn family_jnz_opcode_taken(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_jump_opcode_abs(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::jump_opcode_abs::NewComponentImpl::try_new(
         @head.claim.jump_opcode_abs, ref claimed_sums, @elements,
@@ -762,14 +836,14 @@ pub fn family_jump_opcode_abs(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_jump_opcode_double_deref(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::jump_opcode_double_deref::NewComponentImpl::try_new(
         @head.claim.jump_opcode_double_deref, ref claimed_sums, @elements,
@@ -781,14 +855,14 @@ pub fn family_jump_opcode_double_deref(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_jump_opcode_rel(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::jump_opcode_rel::NewComponentImpl::try_new(
         @head.claim.jump_opcode_rel, ref claimed_sums, @elements,
@@ -800,14 +874,14 @@ pub fn family_jump_opcode_rel(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_jump_opcode_rel_imm(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::jump_opcode_rel_imm::NewComponentImpl::try_new(
         @head.claim.jump_opcode_rel_imm, ref claimed_sums, @elements,
@@ -819,14 +893,14 @@ pub fn family_jump_opcode_rel_imm(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_mul_opcode(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::mul_opcode::NewComponentImpl::try_new(
         @head.claim.mul_opcode, ref claimed_sums, @elements,
@@ -838,14 +912,14 @@ pub fn family_mul_opcode(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_mul_opcode_small(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::mul_opcode_small::NewComponentImpl::try_new(
         @head.claim.mul_opcode_small, ref claimed_sums, @elements,
@@ -857,14 +931,14 @@ pub fn family_mul_opcode_small(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_qm_31_add_mul_opcode(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::qm_31_add_mul_opcode::NewComponentImpl::try_new(
         @head.claim.qm_31_add_mul_opcode, ref claimed_sums, @elements,
@@ -876,14 +950,14 @@ pub fn family_qm_31_add_mul_opcode(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_ret_opcode(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if let Some(component) = components::ret_opcode::NewComponentImpl::try_new(
         @head.claim.ret_opcode, ref claimed_sums, @elements,
@@ -895,27 +969,27 @@ pub fn family_ret_opcode(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 // ---------------------------------------------------------------------------
 // Blake context sub-airs (all-or-nothing on blake_round, as vendored).
 
-pub fn family_blake_round(ref ctx: OodsGroupCtx) {
+pub fn family_blake_round_a(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
-        head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        head, elements, mut pp, mut trace, interaction, mut claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
     } = ctx;
+    assert!(carry.is_empty(), "carry not consumed");
     if head.claim.blake_round.is_some() {
         let component = components::blake_round::NewComponentImpl::try_new(
             @head.claim.blake_round, ref claimed_sums, @elements,
         )
             .unwrap();
-            component
-            .evaluate_constraints_at_point(
-                ref sum, ref pp, ref trace, ref interaction, random_coeff, [].span(),
-            );
+        carry = split::blake_round::half_a(
+            @component, ref sum, ref pp, ref trace, random_coeff,
+        );
     } else {
         assert!(head.claim.blake_g.is_none());
         assert!(head.claim.blake_round_sigma.is_none());
@@ -924,14 +998,32 @@ pub fn family_blake_round(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_blake_round_b(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, pp, trace, mut interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
+    } = ctx;
+    if let Some(claim) = (@head.claim.blake_round).as_snap() {
+        split::blake_round::half_b(
+            *claim.log_size, ref sum, ref interaction, random_coeff, carry.span(),
+        );
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry: array![],
     };
 }
 
 pub fn family_blake_g(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.blake_round.is_some() {
         let component = components::blake_g::NewComponentImpl::try_new(
@@ -945,14 +1037,14 @@ pub fn family_blake_g(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_blake_round_sigma(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.blake_round.is_some() {
         let component = components::blake_round_sigma::NewComponentImpl::try_new(
@@ -966,14 +1058,14 @@ pub fn family_blake_round_sigma(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_triple_xor_32(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.blake_round.is_some() {
         let component = components::triple_xor_32::NewComponentImpl::try_new(
@@ -987,14 +1079,14 @@ pub fn family_triple_xor_32(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_verify_bitwise_xor_12(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.blake_round.is_some() {
         let component = components::verify_bitwise_xor_12::NewComponentImpl::try_new(
@@ -1008,27 +1100,27 @@ pub fn family_verify_bitwise_xor_12(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 // ---------------------------------------------------------------------------
 // Poseidon context sub-airs (all-or-nothing on poseidon_aggregator).
 
-pub fn family_poseidon_aggregator(ref ctx: OodsGroupCtx) {
+pub fn family_poseidon_aggregator_a(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
-        head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        head, elements, mut pp, mut trace, interaction, mut claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
     } = ctx;
+    assert!(carry.is_empty(), "carry not consumed");
     if head.claim.poseidon_aggregator.is_some() {
         let component = components::poseidon_aggregator::NewComponentImpl::try_new(
             @head.claim.poseidon_aggregator, ref claimed_sums, @elements,
         )
             .unwrap();
-            component
-            .evaluate_constraints_at_point(
-                ref sum, ref pp, ref trace, ref interaction, random_coeff, [].span(),
-            );
+        carry = split::poseidon_aggregator::half_a(
+            @component, ref sum, ref pp, ref trace, random_coeff,
+        );
     } else {
         assert!(head.claim.poseidon_3_partial_rounds_chain.is_none());
         assert!(head.claim.poseidon_full_round_chain.is_none());
@@ -1038,14 +1130,32 @@ pub fn family_poseidon_aggregator(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_poseidon_aggregator_b(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, pp, trace, mut interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
+    } = ctx;
+    if let Some(claim) = (@head.claim.poseidon_aggregator).as_snap() {
+        split::poseidon_aggregator::half_b(
+            *claim.log_size, ref sum, ref interaction, random_coeff, carry.span(),
+        );
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry: array![],
     };
 }
 
 pub fn family_poseidon_3_partial_rounds_chain(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.poseidon_aggregator.is_some() {
         let component = components::poseidon_3_partial_rounds_chain::NewComponentImpl::try_new(
@@ -1059,14 +1169,14 @@ pub fn family_poseidon_3_partial_rounds_chain(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_poseidon_full_round_chain(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.poseidon_aggregator.is_some() {
         let component = components::poseidon_full_round_chain::NewComponentImpl::try_new(
@@ -1080,35 +1190,52 @@ pub fn family_poseidon_full_round_chain(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
-pub fn family_cube_252(ref ctx: OodsGroupCtx) {
+pub fn family_cube_252_a(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
-        head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        head, elements, mut pp, mut trace, interaction, mut claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, mut carry,
     } = ctx;
+    assert!(carry.is_empty(), "carry not consumed");
     if head.claim.poseidon_aggregator.is_some() {
         let component = components::cube_252::NewComponentImpl::try_new(
             @head.claim.cube_252, ref claimed_sums, @elements,
         )
             .unwrap();
-            component
-            .evaluate_constraints_at_point(
-                ref sum, ref pp, ref trace, ref interaction, random_coeff, [].span(),
-            );
+        carry = split::cube_252::half_a(@component, ref sum, ref pp, ref trace, random_coeff);
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+pub fn family_cube_252_b(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, pp, trace, mut interaction, claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
+    } = ctx;
+    if head.claim.poseidon_aggregator.is_some() {
+        let claim = (@head.claim.cube_252).as_snap().unwrap();
+        split::cube_252::half_b(
+            *claim.log_size, ref sum, ref interaction, random_coeff, carry.span(),
+        );
+    } else {
+        assert!(carry.is_empty(), "carry not consumed");
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry: array![],
     };
 }
 
 pub fn family_poseidon_round_keys(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.poseidon_aggregator.is_some() {
         let component = components::poseidon_round_keys::NewComponentImpl::try_new(
@@ -1122,14 +1249,14 @@ pub fn family_poseidon_round_keys(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
 pub fn family_range_check_252_width_27(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
-        random_coeff, trace_total, interaction_total, sums_total,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
     } = ctx;
     if head.claim.poseidon_aggregator.is_some() {
         let component = components::range_check_252_width_27::NewComponentImpl::try_new(
@@ -1143,7 +1270,7 @@ pub fn family_range_check_252_width_27(ref ctx: OodsGroupCtx) {
     }
     ctx = OodsGroupCtx {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
-        interaction_total, sums_total,
+        interaction_total, sums_total, carry,
     };
 }
 
@@ -1167,9 +1294,11 @@ pub fn oods_finalize(
         trace_done,
         interaction_done,
         pp_used_mask,
+        carry,
         program_fact_hash,
     } = state;
     assert!(families_done == N_FAMILIES, "family groups incomplete");
+    assert!(carry.is_empty(), "carry not consumed");
     let h = check_head(head, d_head);
     assert(poseidon_hash_span(sampled_felts) == d_sampled, 'sampled binding');
 

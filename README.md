@@ -116,11 +116,24 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   component evals (blake_compress 92k, blake_round 94k,
   poseidon_aggregator 134k, cube_252 133k Sierra felts) — shrink via the
   qm31-opcode watch item or a build-time constraint-range slicer.
-- **Next:** land the four oversized component evals (qm31 opcode or
-  constraint slicer), wire packed calldata + write-once checkpoint
-  storage into the class wrappers, devnet pre-flight, Sepolia campaign
-  under the registry's governed route list; confirm the Controller
-  envelope with a live Sepolia session transaction.
+- **Two-half seam fork: built and proven equivalent (2026-07-04)** —
+  `scripts/split_component_evals.py` forks each of the four oversized
+  component evals at its generated `lookup_constraints` seam into
+  half A (trace-mask constraint quotients) and half B (interaction-mask
+  logup), with the seam values (57–199 QM31s) riding the checkpoint as
+  a `carry`; 44-family chunked == monolithic on the real proof, carry
+  tamper rejected, 26/26 tests green. blake_compress solved outright
+  (52k/59k). Also surfaced: the 4,089,446-byte class cap binds before
+  the 81,920-felt cap (~66k felts). Still over: poseidon_aggregator
+  half A (127k), cube_252 half B (93k), blake_round half A
+  (byte cap only, 2.7%), and the pre-existing mul group (byte cap) —
+  all fixable by one more generator cut / regrouping.
+- **Next:** finish the remaining three cuts (A1|A2 for
+  poseidon_aggregator + blake_round, B1|B2 for cube_252) and the mul
+  regroup, wire packed calldata + write-once checkpoint storage into
+  the class wrappers, devnet pre-flight, Sepolia campaign under the
+  registry's governed route list; confirm the Controller envelope with
+  a live Sepolia session transaction.
 
 ## Layout
 
