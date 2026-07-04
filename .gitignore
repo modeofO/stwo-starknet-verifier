@@ -14,3 +14,4 @@ profile*.pb.gz
 
 # Regenerable large fixture (prove-poseidon --extended; deterministic, ~6 MB)
 fixtures/poseidon_chain_n100.extended_proof.json
+__pycache__/
