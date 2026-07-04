@@ -124,23 +124,72 @@ obsolete; storage holds only checkpoints.
   with different calldata must either produce the identical checkpoint or
   abort (prevents mid-flight state swaps).
 
+## The machine (built 2026-07-03, `src/machine.cairo`)
+
+The production-shaped N-phase state machine exists as pure functions — one
+per transaction type, serde-able checkpoints between them, per-section
+binding digests replacing the skeleton's whole-stream `proof_hash`:
+
+```
+begin → claim chunks × N → claim finalize (trace commit + interaction PoW)
+      → lookup chunks × N (rolling-digest-bound program re-supply)
+      → lookup finalize (zero check + interaction mix/commit)
+      → OODS + sampled mix → FRI commit + queries PoW + sampling
+      → fused Merkle+fri_answers group txs × G → FRI decommit + fact
+```
+
+Fixture instantiation: **21 transactions** (1 + 5 + 1 + 5 + 1 + 1 + 1 + 5 +
+1). `tests/test_machine.cairo` drives the full sequence over the real proof
+with a checkpoint serde round-trip between every pair of transactions:
+output == `verify_full_monolithic`, and the machine lands on the skeleton's
+seam digests (pre-draw, post-prologue) exactly. Tamper tests: a flipped
+head felt and a lookup re-supply at different chunk boundaries are both
+rejected. Binding per section class:
+
+- **head** (small claim with a 6-entry program prefix + pow + interaction
+  claim + config + commitments + queries-PoW nonce + salt, ~600 felts):
+  `d_head` saved at begin, checked on every re-supply.
+- **program entries**: transcript-bound via the claim-mix pipeline +
+  rolling chunk digest for the lookup phase's second pass (boundary-exact).
+- **sampled values**: `d_sampled` saved at the OODS tx (also
+  transcript-bound by `mix_sampled_values`).
+- **rows/witnesses**: self-authenticating (Merkle-verified on arrival).
+- **fri section**: lane-1 query-equality — finalize re-runs the FRI
+  commitment transcript from the checkpointed digest and requires the
+  re-derived query positions to equal the checkpointed ones.
+- **fact material**: `program_hash` rides the checkpoint as a resumable
+  sponge over `construct_f252(value)` per entry (≡ the vendored
+  `hash_memory_section`), so the finalize tx never needs the program.
+
+Notes: the lookup phase re-transports the program (~3.4k packed felts —
+the transcript needs it twice: claim mix before the element draw, logup
+after); group txs currently recompute quotient constants statelessly (the
+one-time packed store is a contract-level optimization, see the settled
+dilemma above); a chunk/group can be any size, so bigger programs or
+different query counts only change N and G.
+
 ## Class splitting
 
-Measured (2026-07-03, the skeleton's library-class wrappers, audited
-allowlist **passing**):
+Measured (2026-07-03, machine-phase library classes, audited allowlist
+**passing**, `lib.cairo` wrappers):
 
-| Class | Sierra felts | vs 81,920 cap |
-|---|---|---|
-| `StwoFullPhaseA` (claim checks + prologue) | **31,075** | **fits already** |
-| `StwoFullPhaseB` (AIR eval + PCS + FRI) | **778,271** | ~9.5× over |
+| Class | Entrypoints | Sierra felts | vs 81,920 cap |
+|---|---|---|---|
+| `StwoMachineClaim` | begin, claim_chunk, claim_finalize | **29,251** | **fits (36%)** |
+| `StwoMachineLookup` | lookup_chunk, lookup_finalize | **20,731** | **fits (25%)** |
+| `StwoMachineOods` | oods_mix | **762,148** | **9.3× over** |
+| `StwoMachineGroup` | group (Merkle + fri_answers) | **27,335** | **fits (33%)** |
+| `StwoMachineFri` | fri_commit, finalize | **28,386** | **fits (35%)** |
 
-The split burden is entirely in phase B, dominated by
-`eval_composition_polynomial_at_point`'s component zoo. Expect **~10–15
-immutable phase-library classes** once phase B is sub-phased (Merkle, FRI,
-fri_answers separate naturally; the air eval itself must split by component
-group), pinned in a registry constructor exactly like lane 1's
-`StwoPhase1`/`StwoPhase2`. Note CASM runs 1.6–2× Sierra for this code and
-the CASM cap binds too (lane 1's hard lesson).
+(Historical: the pre-machine skeleton measured `StwoFullPhaseA` 31,075 /
+`StwoFullPhaseB` 778,271.) **The entire class-size problem has collapsed
+to one function**: `eval_composition_polynomial_at_point`'s component zoo
+inside the OODS transaction. Everything else deploys as-is (4 classes at
+25–36% of the cap; CASM expected 1.6–2× Sierra — verify at declare).
+The remaining work is splitting the air eval by component group
+(chunk-fed accumulator over component ranges, same pattern as claim/logup
+— but it forks generated component code, so it wants a build-time slicer
+over the vendored source). Expect ~10–14 component-group classes.
 
 ## Client side
 

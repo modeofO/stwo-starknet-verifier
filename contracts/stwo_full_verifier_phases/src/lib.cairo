@@ -70,6 +70,202 @@ mod StwoFullPhaseB {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Machine class wrappers (docs/lane2-design.md, machine plan v2): the phase
+// families of `machine.cairo`, one library class each, to measure Sierra/CASM
+// class sizes against the declare caps. Production wiring (packed sections,
+// write-once checkpoint storage, registry route) comes on top of these.
+
+#[starknet::interface]
+pub trait IStwoMachineClaim<TContractState> {
+    fn begin(
+        self: @TContractState, head: Span<felt252>, program_len: u32,
+    ) -> Array<felt252>;
+    fn claim_chunk(
+        self: @TContractState, state: Span<felt252>, entries: Span<felt252>,
+    ) -> Array<felt252>;
+    fn claim_finalize(
+        self: @TContractState, state: Span<felt252>, head: Span<felt252>,
+    ) -> Array<felt252>;
+}
+
+#[starknet::interface]
+pub trait IStwoMachineLookup<TContractState> {
+    fn lookup_chunk(
+        self: @TContractState, state: Span<felt252>, entries: Span<felt252>,
+    ) -> Array<felt252>;
+    fn lookup_finalize(
+        self: @TContractState, state: Span<felt252>, head: Span<felt252>,
+    ) -> Array<felt252>;
+}
+
+#[starknet::interface]
+pub trait IStwoMachineOods<TContractState> {
+    fn oods_mix(
+        self: @TContractState,
+        state: Span<felt252>,
+        head: Span<felt252>,
+        sampled: Span<felt252>,
+    ) -> Array<felt252>;
+}
+
+#[starknet::interface]
+pub trait IStwoMachineGroup<TContractState> {
+    fn group(
+        self: @TContractState,
+        state: Span<felt252>,
+        head: Span<felt252>,
+        sampled: Span<felt252>,
+        rows: Span<felt252>,
+        witnesses: Span<felt252>,
+    ) -> Array<felt252>;
+}
+
+#[starknet::interface]
+pub trait IStwoMachineFri<TContractState> {
+    fn fri_commit(
+        self: @TContractState, state: Span<felt252>, head: Span<felt252>, fri: Span<felt252>,
+    ) -> Array<felt252>;
+    fn finalize(
+        self: @TContractState, state: Span<felt252>, head: Span<felt252>, fri: Span<felt252>,
+    ) -> (felt252, felt252);
+}
+
+fn serialize_state<T, +Serde<T>, +Drop<T>>(state: T) -> Array<felt252> {
+    let mut serialized = array![];
+    Serde::serialize(@state, ref serialized);
+    serialized
+}
+
+fn deserialize_state<T, +Serde<T>>(mut span: Span<felt252>) -> T {
+    Serde::deserialize(ref span).expect('state deser')
+}
+
+#[starknet::contract]
+mod StwoMachineClaim {
+    use stwo_verifier_utils::MemorySection;
+    use super::{IStwoMachineClaim, deserialize_state, machine, serialize_state};
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl StwoMachineClaimImpl of IStwoMachineClaim<ContractState> {
+        fn begin(
+            self: @ContractState, head: Span<felt252>, program_len: u32,
+        ) -> Array<felt252> {
+            serialize_state(machine::machine_begin(head, program_len))
+        }
+        fn claim_chunk(
+            self: @ContractState, state: Span<felt252>, mut entries: Span<felt252>,
+        ) -> Array<felt252> {
+            let section: MemorySection = Serde::deserialize(ref entries).expect('entries');
+            serialize_state(machine::machine_claim_chunk(deserialize_state(state), section))
+        }
+        fn claim_finalize(
+            self: @ContractState, state: Span<felt252>, head: Span<felt252>,
+        ) -> Array<felt252> {
+            serialize_state(machine::machine_claim_finalize(deserialize_state(state), head))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoMachineLookup {
+    use stwo_verifier_utils::MemorySection;
+    use super::{IStwoMachineLookup, deserialize_state, machine, serialize_state};
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl StwoMachineLookupImpl of IStwoMachineLookup<ContractState> {
+        fn lookup_chunk(
+            self: @ContractState, state: Span<felt252>, mut entries: Span<felt252>,
+        ) -> Array<felt252> {
+            let section: MemorySection = Serde::deserialize(ref entries).expect('entries');
+            serialize_state(machine::machine_lookup_chunk(deserialize_state(state), section))
+        }
+        fn lookup_finalize(
+            self: @ContractState, state: Span<felt252>, head: Span<felt252>,
+        ) -> Array<felt252> {
+            serialize_state(machine::machine_lookup_finalize(deserialize_state(state), head))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoMachineOods {
+    use super::{IStwoMachineOods, deserialize_state, machine, serialize_state};
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl StwoMachineOodsImpl of IStwoMachineOods<ContractState> {
+        fn oods_mix(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            serialize_state(machine::machine_oods_mix(deserialize_state(state), head, sampled))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoMachineGroup {
+    use stwo_verifier_core::fields::m31::M31;
+    use stwo_verifier_core::pcs::verifier::QueriedValues;
+    use super::{IStwoMachineGroup, deserialize_state, machine, serialize_state};
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl StwoMachineGroupImpl of IStwoMachineGroup<ContractState> {
+        fn group(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+            mut rows: Span<felt252>,
+            mut witnesses: Span<felt252>,
+        ) -> Array<felt252> {
+            let rows: QueriedValues = Serde::deserialize(ref rows).expect('rows');
+            let witnesses: Array<Span<felt252>> = Serde::deserialize(ref witnesses)
+                .expect('witnesses');
+            serialize_state(
+                machine::machine_group(deserialize_state(state), head, sampled, rows, witnesses),
+            )
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoMachineFri {
+    use super::{IStwoMachineFri, deserialize_state, machine, serialize_state};
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl StwoMachineFriImpl of IStwoMachineFri<ContractState> {
+        fn fri_commit(
+            self: @ContractState, state: Span<felt252>, head: Span<felt252>, fri: Span<felt252>,
+        ) -> Array<felt252> {
+            serialize_state(machine::machine_fri_commit(deserialize_state(state), head, fri))
+        }
+        fn finalize(
+            self: @ContractState, state: Span<felt252>, head: Span<felt252>, fri: Span<felt252>,
+        ) -> (felt252, felt252) {
+            let out = machine::machine_finalize(deserialize_state(state), head, fri);
+            (out.program_hash, out.output_hash)
+        }
+    }
+}
+
 /// Escape markers of the packed-proof v2 encoding (see `unpack_proof_v2`).
 const U64_ESCAPE: u32 = 0xFFFFFFFF;
 const FELT_ESCAPE: u32 = 0xFFFFFFFE;

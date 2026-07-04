@@ -93,10 +93,24 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   own witness and validated in snforge: vendored `MerkleVerifier::verify`
   accepts all 5 groups × 4 trees against the monolithic roots, tamper
   cases rejected. All 20 lane-2 tests green (incl. the constants probes).
-- **Next:** assemble the production N-phase machine (per-section binding
-  digests, incremental claim checks, Merkle/FRI phase wiring, class
-  splitting of phase B), devnet pre-flight; confirm the Controller
-  envelope with a live Sepolia session transaction.
+- **The N-phase machine: built and proven equivalent (2026-07-03)** —
+  `stwo_full_verifier_phases/src/machine.cairo`: the full production-shaped
+  sequence (begin → claim chunks → lookup chunks → OODS+mix → FRI commit →
+  fused Merkle/fri_answers group txs → FRI decommit + fact, **21 txs** on
+  the fixture) runs as pure functions with serde checkpoints between every
+  transaction and per-section binding digests, and produces exactly the
+  monolithic verifier's output on the real proof (tamper cases rejected).
+  Incremental claim pipeline included: chunked `lookup_sum`
+  (`lookup_chunks.cairo`), `verify_claim` proven prefix-only, and the
+  settled constants verdict (one-time packed store; measured in
+  `test_constants_probe.cairo`). Class sizes: **4 of 5 machine classes fit
+  the caps today** (25–36%); only the OODS class (composition-eval
+  component zoo, 762k Sierra felts) needs splitting.
+- **Next:** split `eval_composition_polynomial_at_point` by component
+  group (the last oversized class), wire packed calldata + write-once
+  checkpoint storage into the class wrappers, devnet pre-flight, Sepolia
+  campaign under the registry's governed route list; confirm the
+  Controller envelope with a live Sepolia session transaction.
 
 ## Layout
 
