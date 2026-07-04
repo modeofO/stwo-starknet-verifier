@@ -191,23 +191,74 @@ The remaining work is splitting the air eval by component group
 — but it forks generated component code, so it wants a build-time slicer
 over the vendored source). Expect ~10–14 component-group classes.
 
-Seam map (verified in the vendored `cairo_air.cairo`): the eval body is a
-flat sequence of `X.evaluate_constraints_at_point(ref sum, ref pp_masks,
-ref trace_masks, ref interaction_masks, random_coeff, …)` calls — `sum`
-is a running accumulator and the two trace mask spans are consumed
-sequentially (each component pops its own columns). A component-group
-transaction therefore: re-supplies the sampled values (d_sampled-bound),
-fast-forwards the mask spans past the previous groups' columns (counts
-derivable from the claim), evaluates its component range into the
-accumulator, and checkpoints `(sum, columns_consumed)`. Group boundaries
-can be drawn at ANY of the ~15 top-level call sites (and inside
-`opcodes`/`builtins`/contexts, which are themselves flat sequences), so
-per-class sizes are tunable. The final OODS transaction then does the
-`composition_oods_eval == sum * denominator_inv` assert plus
-`mix_sampled_values` — i.e. `machine_oods_mix` splits into
-`oods_begin` (draws, composition commit, ood point) → `oods_group × N` →
-`oods_finalize` (assert + mix), with the ood point and accumulator riding
-the checkpoint.
+### The OODS split (built 2026-07-03, `src/oods_chunks.cairo`)
+
+`machine_oods_mix` is now split as `oods_begin → oods_group × N →
+oods_finalize` over a **40-family sequence** (the 13 top-level eval call
+sites, with the three oversized composites — opcodes, blake context,
+poseidon context — split one level deeper into their sub-airs, which are
+themselves flat `try_new → evaluate` sequences). Mechanics:
+
+- Each group transaction re-supplies head + sampled (digest-bound),
+  fast-forwards the three sequentially-consumed streams — trace masks,
+  interaction masks, AND the interaction claim's `claimed_sums` (family
+  *construction* consumes them in the same order) — to the checkpointed
+  offsets, rebuilds only its families' components from the claim + the
+  re-drawn lookup elements, evaluates into the `sum` accumulator, and
+  checkpoints `(sum, families_done, trace/interaction/sums counters,
+  pp_used_mask)`.
+- `validate_mask_usage` splits as: counters must equal the totals at
+  finalize, and each transaction ORs its preprocessed-column usage bits
+  into a u128 checkpoint mask (column count asserted ≤ 128; fixture has
+  105) that finalize compares against the columns carrying samples —
+  preserving the anti-junk-quotient check across transactions.
+- Family order is enforced (`families_done == first_family` per group,
+  all 40 at finalize), so the concatenated consumption is exactly the
+  monolithic sequence. The blake/poseidon all-or-nothing gates and their
+  `is_none` asserts live in each context's first sub-family.
+- `oods_finalize` checks completeness, asserts the OODS equation over the
+  accumulated sum, runs `mix_sampled_values`, and emits the SAME
+  `FriCommitPhaseState` the monolithic `machine_oods_mix` produces — the
+  rest of the machine is untouched.
+
+`tests/test_oods_chunks.cairo`: chunked (begin + 16 grouped txs +
+finalize, serde round-trips between all) == `machine_oods_mix` on every
+output field including the transcript seam digest; family-skip rejected.
+
+**Class sizes v2** (all 40 families wrapped in 20 measurement classes,
+audited allowlist passing):
+
+| Class(es) | Sierra felts | vs 81,920 cap |
+|---|---|---|
+| OodsBegin / OodsFinalize | 11,821 / 21,412 | fit |
+| 16 group classes (36 families: all opcodes except blake_compress, verify_instruction, blake_g/sigma/xor12/triple_xor, builtins, poseidon 3_partial+full_round+round_keys+rc_252_w27, memory, range_checks, xor4–9) | 14,294 – 69,078 | **all fit** |
+| `blake_compress_opcode` (alone) | 92,377 | 1.13× over |
+| `blake_round` (alone) | 93,875 | 1.15× over |
+| `cube_252` (alone) | 133,115 | 1.62× over |
+| `poseidon_aggregator` (alone) | 133,888 | 1.63× over |
+
+**The last blocker is exactly four generated single-component evals.**
+Each is a ~2,600–3,000-line generated `evaluate_constraints_at_point`
+(~50 `constraint_quotient` statements + logup), and every
+privacy-bootloader proof enables all four (the bootloader uses blake;
+the payload uses the poseidon builtin). Paths, in preference order:
+1. **qm31 opcode in `audited.json`** (existing watch item): these felts
+   are dominated by the bounded_int QM31-arithmetic lowering; the
+   `qm31_opcode` cfg variants already exist upstream and would shrink all
+   four dramatically (likely under the cap) with zero fork.
+2. **Build-time constraint-range slicer** over the generated component
+   files: split the eval body at constraint boundaries into 2 sub-airs
+   each, threading `sum` and re-reading masks (intra-component splits
+   share the same column window; the counters advance once, on the last
+   slice). Mechanical but must handle shared `let` intermediates.
+3. The four families cannot be skipped for bootloader-shaped proofs, so
+   there is no configuration dodge.
+
+With merging of small neighbours (fitting groups sum to ~447k ≈ 6 full
+classes) the eventual OODS phase is ~8–10 group txs; today's
+fine-grained shape is ~20. Deployable classes today: Claim, Lookup,
+Group, Fri, OodsBegin, OodsFinalize + 16 family-group classes = **22 of
+26 under the caps**.
 
 ## Client side
 

@@ -5,6 +5,7 @@ pub mod claim_mix;
 pub mod fri_chunks;
 pub mod lookup_chunks;
 pub mod machine;
+pub mod oods_chunks;
 pub mod resumable_full;
 pub mod sponge;
 
@@ -262,6 +263,536 @@ mod StwoMachineFri {
         ) -> (felt252, felt252) {
             let out = machine::machine_finalize(deserialize_state(state), head, fri);
             (out.program_hash, out.output_hash)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OODS chunk classes: begin + one class per component family (the split of
+// the 762k-felt StwoMachineOods; families can be merged into fewer classes
+// wherever the summed sizes stay under the caps) + finalize.
+
+#[starknet::interface]
+pub trait IStwoOodsBegin<TContractState> {
+    fn oods_begin(
+        self: @TContractState, state: Span<felt252>, head: Span<felt252>, sampled: Span<felt252>,
+    ) -> Array<felt252>;
+}
+
+/// One OODS component-family group transaction.
+#[starknet::interface]
+pub trait IStwoOodsGroup<TContractState> {
+    fn run(
+        self: @TContractState, state: Span<felt252>, head: Span<felt252>, sampled: Span<felt252>,
+    ) -> Array<felt252>;
+}
+
+#[starknet::interface]
+pub trait IStwoOodsFinalize<TContractState> {
+    fn oods_finalize(
+        self: @TContractState, state: Span<felt252>, head: Span<felt252>, sampled: Span<felt252>,
+    ) -> Array<felt252>;
+}
+
+#[starknet::contract]
+mod StwoOodsBegin {
+    use super::{IStwoOodsBegin, deserialize_state, oods_chunks, serialize_state};
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsBegin<ContractState> {
+        fn oods_begin(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            serialize_state(oods_chunks::oods_begin(deserialize_state(state), head, sampled))
+        }
+    }
+}
+
+// Group classes F00..F19 cover the 40-family sequence consecutively
+// (family index map in oods_chunks.cairo); heavyweight sub-airs isolated
+// into their own classes so their sizes are exact.
+#[starknet::contract]
+mod StwoOodsF00 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 0,
+            );
+            oods_chunks::family_add_opcode(ref ctx);
+            oods_chunks::family_add_opcode_small(ref ctx);
+            oods_chunks::family_add_ap_opcode(ref ctx);
+            oods_chunks::family_assert_eq_opcode(ref ctx);
+            oods_chunks::family_assert_eq_opcode_imm(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 5))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF01 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 5,
+            );
+            oods_chunks::family_assert_eq_opcode_double_deref(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF02 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 6,
+            );
+            oods_chunks::family_blake_compress_opcode(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF03 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 7,
+            );
+            oods_chunks::family_call_opcode_abs(ref ctx);
+            oods_chunks::family_call_opcode_rel_imm(ref ctx);
+            oods_chunks::family_jnz_opcode_non_taken(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 3))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF04 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 10,
+            );
+            oods_chunks::family_jnz_opcode_taken(ref ctx);
+            oods_chunks::family_jump_opcode_abs(ref ctx);
+            oods_chunks::family_jump_opcode_double_deref(ref ctx);
+            oods_chunks::family_jump_opcode_rel(ref ctx);
+            oods_chunks::family_jump_opcode_rel_imm(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 5))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF05 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 15,
+            );
+            oods_chunks::family_mul_opcode(ref ctx);
+            oods_chunks::family_mul_opcode_small(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 2))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF06 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 17,
+            );
+            oods_chunks::family_qm_31_add_mul_opcode(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF07 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 18,
+            );
+            oods_chunks::family_ret_opcode(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF08 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 19,
+            );
+            oods_chunks::family_verify_instruction(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF09 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 20,
+            );
+            oods_chunks::family_blake_round(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF10 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 21,
+            );
+            oods_chunks::family_blake_g(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF11 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 22,
+            );
+            oods_chunks::family_blake_round_sigma(ref ctx);
+            oods_chunks::family_triple_xor_32(ref ctx);
+            oods_chunks::family_verify_bitwise_xor_12(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 3))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF12 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 25,
+            );
+            oods_chunks::family_builtins(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF13 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 26,
+            );
+            oods_chunks::family_poseidon_aggregator(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF14 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 27,
+            );
+            oods_chunks::family_poseidon_3_partial_rounds_chain(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF15 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 28,
+            );
+            oods_chunks::family_poseidon_full_round_chain(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF16 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 29,
+            );
+            oods_chunks::family_cube_252(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF17 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 30,
+            );
+            oods_chunks::family_poseidon_round_keys(ref ctx);
+            oods_chunks::family_range_check_252_width_27(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 2))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF18 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 32,
+            );
+            oods_chunks::family_memory_address_to_id(ref ctx);
+            oods_chunks::family_memory_id_to_big(ref ctx);
+            oods_chunks::family_memory_id_to_small(ref ctx);
+            oods_chunks::family_range_checks(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 4))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsF19 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 36,
+            );
+            oods_chunks::family_verify_bitwise_xor_4(ref ctx);
+            oods_chunks::family_verify_bitwise_xor_7(ref ctx);
+            oods_chunks::family_verify_bitwise_xor_8(ref ctx);
+            oods_chunks::family_verify_bitwise_xor_9(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 4))
+        }
+    }
+}
+
+#[starknet::contract]
+mod StwoOodsFinalize {
+    use super::{IStwoOodsFinalize, deserialize_state, oods_chunks, serialize_state};
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsFinalize<ContractState> {
+        fn oods_finalize(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            serialize_state(oods_chunks::oods_finalize(deserialize_state(state), head, sampled))
         }
     }
 }

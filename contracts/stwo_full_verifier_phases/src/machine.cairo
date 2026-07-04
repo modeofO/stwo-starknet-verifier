@@ -141,7 +141,7 @@ pub fn parse_head(mut head: Span<felt252>) -> Head {
 
 /// `assert(poseidon(head) == d_head)` — every post-begin transaction's first
 /// step for its re-supplied head bytes.
-fn check_head(head: Span<felt252>, d_head: felt252) -> Head {
+pub fn check_head(head: Span<felt252>, d_head: felt252) -> Head {
     assert(poseidon_hash_span(head) == d_head, 'head binding');
     parse_head(head)
 }
@@ -179,7 +179,7 @@ fn absorb_fact_entries(ref sponge: SpongeState, entries: MemorySection) {
 
 /// Rebuilds all four Merkle-tree verifiers from head data (no channel
 /// mixing — the roots were mixed during phases 1–6 and are digest-bound).
-fn rebuild_all_trees(head: @Head) -> CommitmentSchemeVerifier {
+pub fn rebuild_all_trees(head: @Head) -> CommitmentSchemeVerifier {
     let log_blowup_factor = *head.pcs_config.fri_config.log_blowup_factor;
     let commitments: @Box<[Hash; 4]> = (*head.commitments).try_into().unwrap();
     let [
@@ -212,7 +212,7 @@ fn rebuild_all_trees(head: @Head) -> CommitmentSchemeVerifier {
 /// The trace tree's height IS the trace LDE log size (blowup + max trace
 /// column degree bound). Reading it directly works for the 4-tree scheme,
 /// where the vendored `get_trace_lde_log_size` (fixed 3-tree unbox) doesn't.
-fn log_trace_degree_bound_of(scheme: @CommitmentSchemeVerifier, log_blowup_factor: u32) -> u32 {
+pub fn log_trace_degree_bound_of(scheme: @CommitmentSchemeVerifier, log_blowup_factor: u32) -> u32 {
     *scheme.trees.at(1).tree_height - log_blowup_factor
 }
 

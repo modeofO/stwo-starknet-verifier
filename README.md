@@ -106,11 +106,21 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   `test_constants_probe.cairo`). Class sizes: **4 of 5 machine classes fit
   the caps today** (25–36%); only the OODS class (composition-eval
   component zoo, 762k Sierra felts) needs splitting.
-- **Next:** split `eval_composition_polynomial_at_point` by component
-  group (the last oversized class), wire packed calldata + write-once
-  checkpoint storage into the class wrappers, devnet pre-flight, Sepolia
-  campaign under the registry's governed route list; confirm the
-  Controller envelope with a live Sepolia session transaction.
+- **OODS split: built and proven equivalent (2026-07-03)** —
+  `oods_chunks.cairo`: the component zoo now runs as `oods_begin` → group
+  txs over a 40-family sequence (sub-air granularity) → `oods_finalize`,
+  with the sum accumulator, stream counters and a preprocessed-usage
+  bitmask riding the checkpoint; chunked == monolithic on the real proof
+  including the transcript seam. Class sizes v2: **22 of 26 machine
+  classes fit the caps today**; the last four are single generated
+  component evals (blake_compress 92k, blake_round 94k,
+  poseidon_aggregator 134k, cube_252 133k Sierra felts) — shrink via the
+  qm31-opcode watch item or a build-time constraint-range slicer.
+- **Next:** land the four oversized component evals (qm31 opcode or
+  constraint slicer), wire packed calldata + write-once checkpoint
+  storage into the class wrappers, devnet pre-flight, Sepolia campaign
+  under the registry's governed route list; confirm the Controller
+  envelope with a live Sepolia session transaction.
 
 ## Layout
 
