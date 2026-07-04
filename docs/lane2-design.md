@@ -206,6 +206,30 @@ as lane 1 — see proof-only-wrapping.md).
      bullet below for the numbers. The extended-proof fixture is
      regenerable (deterministic) at
      `fixtures/poseidon_chain_n100.extended_proof.json` (gitignored).
+   - ~~incremental verify_claim + lookup_sum~~ **done (2026-07-03):**
+     `src/lookup_chunks.cairo` + `tests/test_lookup_chunks.cairo`.
+     Two findings collapsed this into a small module:
+     1. **`verify_claim` needs no chunking.** It reads the first 6
+        program entries (`verify_program` pops exactly 6), the
+        builtin/segment ranges and the per-component claims — all
+        small-claim data. Proven on the real proof: a doctored claim
+        whose program span holds only a 6-entry prefix deserializes and
+        passes the vendored `verify_claim` verbatim. The begin tx runs
+        it over the small claim + first program chunk.
+     2. **`lookup_sum` is a flat field sum** — per-entry inverse terms
+        + state terms + claimed sums — so it chunks by program-entry
+        ranges with one QM31 accumulator in the checkpoint.
+        `lookup_sum_program_chunk` builds `PublicMemoryEntries` from a
+        chunk (base address = `initial_pc + offset`) and calls the
+        vendored `sum_public_memory_entries` verbatim (made pub, logged
+        in VENDORED.md); `lookup_sum_rest` covers the non-program terms
+        via `get_entries` over an emptied program section (non-program
+        addresses never depend on it). Chunked (5 × 540 entries) ==
+        monolithic == 0 on the real claim; a tampered entry limb breaks
+        the sum. The lookup elements are re-drawn per tx from the
+        checkpointed pre-draw digest — nothing else rides the
+        checkpoint but the accumulator. No binding digest needed: the
+        same chunk bytes feed the claim-mix absorber in the same tx.
 5. Re-measure everything the day qm31 libfuncs appear in `audited.json`.
 
 ## Section map (measured 2026-07-03, `tests/test_sections.cairo`)

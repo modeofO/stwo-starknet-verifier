@@ -830,7 +830,7 @@ pub impl PublicDataImpl of PublicDataTrait {
 }
 
 #[cfg(feature: "qm31_opcode")]
-fn sum_public_memory_entries(
+pub fn sum_public_memory_entries(
     pub_memory_entries: PublicMemoryEntries, common_lookup_elements: @crate::CommonLookupElements,
 ) -> QM31 {
     let mut sum = Zero::zero();
@@ -866,7 +866,7 @@ fn sum_public_memory_entries(
 #[cfg(not(feature: "qm31_opcode"))]
 // An alternative implementation that uses batch inverse, for the case that we don't have an opcode
 // for it.
-fn sum_public_memory_entries(
+pub fn sum_public_memory_entries(
     pub_memory_entries: PublicMemoryEntries, common_lookup_elements: @CommonLookupElements,
 ) -> QM31 {
     // Gather values to be inverted and summed.

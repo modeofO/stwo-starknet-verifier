@@ -72,3 +72,11 @@ Same pattern as the lane-1 blake2s channel patch, for the poseidon channel
   a `mix_*`).
 - `cairo_air/src/lib.cairo`: `impl PublicDataImpl` made pub (the chunked
   claim-mix pipeline and its tests need `pack_into_u32s`).
+
+### Visibility patches for the chunked lookup_sum (`contracts/stwo_full_verifier_phases/src/lookup_chunks.cairo`)
+
+No logic changes:
+
+- `cairo_air/src/lib.cairo`: `sum_public_memory_entries` (both
+  `qm31_opcode` cfg variants) made pub — the chunked lookup-sum pipeline
+  calls it per program-entry chunk and for the non-program entries.

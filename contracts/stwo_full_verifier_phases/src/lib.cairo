@@ -3,6 +3,7 @@
 
 pub mod claim_mix;
 pub mod fri_chunks;
+pub mod lookup_chunks;
 pub mod resumable_full;
 pub mod sponge;
 
