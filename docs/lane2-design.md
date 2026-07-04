@@ -271,14 +271,38 @@ as lane 1 — see proof-only-wrapping.md).
   arrival and can immediately absorb them into per-(tree, group) digests
   or feed the fri_answers accumulator — data is consumed in the tx that
   transports it wherever possible.
-- **The sampled-values/constants dilemma:** fri_answers' quotient
-  constants derive from all 18k felts of sampled_values — too big to ride
-  every chunk tx. Candidate resolutions, to be measured: (a) a one-time
-  constants store (~25k storage felts, then reads per chunk tx), (b)
-  fusing constants derivation per column-range with range-sliced samples
-  (rows must still be Merkle-complete, so ranges only work for the
-  fri_answers side), (c) recomputing constants in 2–3 dedicated txs that
-  each cover a subset of trees. This is the main open assembly question.
+- ~~**The sampled-values/constants dilemma**~~ **measured and settled
+  (2026-07-03, `tests/test_constants_probe.cairo`).** The isolated costs
+  over the real proof (l2_gas deltas between probes sharing one replay):
+  - fri_answers **prelude** (build_samples_with_randomness + sample
+    batches + `QuotientConstantsImpl::gen` over all sampled values) =
+    **184.3e6 gas ≈ 15% of a 1.21e9 tx** — this is what a
+    recompute-per-chunk tx pays.
+  - **per query: 21.1e6 gas**, exactly linear (1-query and 16-query
+    probes agree to 4 digits). Compute never binds: even 50 queries/tx
+    ≈ 1.1e9 would fit — **queries per tx is calldata-bound, not
+    compute-bound.**
+  - Sizes (from the extended proof): 3,903 samples in the α chain
+    (212 columns × 3 + 3,267 × 1); constants =
+    3,903 α·c QM31s + per-batch sums ≈ **2.9k packed slots** (column
+    indices are derivable on-chain from the claim, so they need not be
+    stored); sampled-values re-supply ≈ **2.6k packed felts**. Rows cost
+    ≈ 499 packed felts/query (3,492 cols / 7) + ~60 witness felts/query.
+  - Consequences for a fused (Merkle + fri_answers) group tx under the
+    ~4,996-felt calldata cap: with samples re-supplied per tx (stateless
+    recompute), fixed 2.6k felts leaves room for only ~4 queries/tx →
+    **~18 fused txs**; with a **one-time packed constants store** the
+    group tx carries rows only → ~8–9 queries/tx → **~8 fused txs + 1
+    store tx** (store: 2.9k slots < the 4,000-entry state-diff cap,
+    derivation 184e6 gas, input = digest-bound samples, write-once
+    checkpoint semantics; per-tx reads ~3e6 gas, negligible).
+  - **Verdict: (a) the one-time packed constants store** — halves the
+    fri_answers tx count at equal soundness (constants are deterministic
+    state derived from channel-bound samples). Stateless recompute (c)
+    stays the zero-storage fallback and is what the equivalence tests
+    exercise today; column-range slicing (b) matches (a)'s tx count only
+    by forking the vendored accumulation loop and transposing the row
+    binding — not worth the surgery.
 - **Revised tx estimate: ~25–40 per fact** (the 12.8e9-gas compute floor
   said ~11; transport, rebinding and the constants overhead roughly double
   to triple the count at lower per-tx gas). Still storage-free except
