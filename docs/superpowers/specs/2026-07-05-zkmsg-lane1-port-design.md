@@ -95,8 +95,10 @@ verification path, slimmer v1 schema:
     [commitment, ephemeral_pubkey, merkle_root].span(), …)` (the crate
     bakes the multiverifier inner root and reproduces the live Sepolia
     fact from application data — proven by its existing test).
-  - Constructor pins `(registry_address, circuit_program_hash)`. No
-    owner, no setters, immutable. `set_verifier` does not exist.
+  - Constructor pins `(registry_address, circuit_program_hash,
+    inner_root)` — the inner cairo-verifier circuit root is app-shape
+    dependent and printed by the wrap stage; all three are immutable. No
+    owner, no setters. `set_verifier` does not exist.
   - `send_handshake` dropped (v1 has no ratchet).
   - **Replay guard**: `consumed_commitments: Map<felt252, bool>` — a
     registered fact is world-readable, so without this anyone could
