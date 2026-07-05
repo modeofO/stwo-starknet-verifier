@@ -22,14 +22,15 @@
 //!
 //! Two proof sections exceed the ~4,996-felt usable calldata cap and are
 //! consumed by MANY transactions, so they arrive once via `stage` (packed
-//! v2, lane-1 `stage_proof` precedent; ≤ ~3,990 slots per staging tx under
-//! the 4,000-entry state-diff cap) and are read back from storage:
+//! v2, lane-1 `stage_proof` precedent; ≤ ~1,900 slots per staging tx —
+//! the block bouncer's 4,000-felt state-diff budget counts key + value =
+//! TWO felts per storage write, devnet-measured) and are read back:
 //!
-//! - `SECTION_SAMPLED` (~2.6k slots, 1 staging tx): read by `oods_begin`,
+//! - `SECTION_SAMPLED` (~2.6k slots, 2 staging txs): read by `oods_begin`,
 //!   every `oods_group`, `oods_finalize` and every fused `group` tx.
 //!   Binding: the machine's `d_sampled` checkpoint digest (saved by
 //!   `oods_begin` from the transcript-bound mix).
-//! - `SECTION_FRI` (~8k slots, 3 staging txs): read by `fri_commit` and
+//! - `SECTION_FRI` (~8k slots, 5 staging txs): read by `fri_commit` and
 //!   `finalize`. Binding: `d_fri` rides the checkpoint from `fri_commit`
 //!   to `finalize` (plus the lane-1 query-equality re-derivation).
 //!

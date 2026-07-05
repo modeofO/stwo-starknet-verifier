@@ -236,6 +236,21 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   exceeds a cap — the earlier "~10–12" guess missed that the byte cap
   (~66k Sierra felts), not CASM, binds. Family functions, machine and
   router unchanged; the qm31 gate re-probe the same day: still rejected.
+- **Devnet drive: the gas oracle falsifies the staged-fri design
+  (2026-07-05)** — `scripts/devnet_drive.py` declared all 23 blake
+  classes, froze the registry route list and drove the real proof with
+  per-tx receipts. Three corrections the estimates missed: the state-diff
+  cap counts FELTS (2/write → `STAGE_CHUNK` 3,900 → 1,900; staging txs
+  4 → 7); storage writes bill ~495k gas each (a staging tx = 946M, 78%
+  of the invoke cap); staged READS cost ~122k gas/slot all-in, so
+  `fri_commit`'s 8,045-slot load needs 2.22e9 sierra gas — **over the
+  ~1e9 per-invoke execute budget: the staged-fri store is dead on 0.14
+  pricing**. Everything else measured production-ready (OODS group txs
+  328–381M each). Fix designed (fri transport v3): the fri bulk is
+  self-authenticating against the layer commitments and `FriProof`
+  serializes per layer — commitment slice via calldata in fri_commit,
+  layer-batched calldata decommit chunks, fri staging deleted. See the
+  devnet section in [`docs/lane2-design.md`](./docs/lane2-design.md).
 - **Next:** the qm31 gate-probe re-test on Starknet version bumps,
   devnet declare pre-flight of the 36 blake classes + a devnet router
   drive with real gas numbers, Sepolia campaign under the registry's

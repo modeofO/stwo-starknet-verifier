@@ -1,11 +1,13 @@
 //! qm31-pivot router drive: the REAL blake2s-channel fixture proof driven
 //! end-to-end through the deployed router — the production transaction
-//! shape of the sovereign lane. 45 transactions: 1 sampled staging + 3 fri
+//! shape of the sovereign lane. 48 transactions: 2 sampled staging + 5 fri
 //! staging + begin + 5 claim chunks + claim finalize + 5 lookup chunks +
 //! lookup finalize + oods begin + 15 merged OODS group classes + oods
 //! finalize + fri commit + 9 fused 8-query group txs + finalize. Every tx's
 //! calldata is COUNTED and asserted under the ~4,996-felt usable cap and
-//! every staging tx under the 4,000-entry state-diff cap — this test is
+//! every staging tx under the block state-diff budget (4,000 felts, at
+//! TWO felts per storage write — measured on devnet, where a 2,617-write
+//! tx weighed state_diff_size 5,214) — this test is
 //! the measured "everything fits" claim for the pivot, executed.
 //!
 //! The fact must land in the shared registry with program/output hashes
@@ -50,9 +52,10 @@ const PROOF_ID: felt252 = 'poseidon_chain_n100_blake';
 /// Usable felts per invoke transaction (5,000 minus the account-call
 /// envelope; docs/lane2-design.md).
 const CALLDATA_CAP: u32 = 4_996;
-/// Staged slots per staging tx: the 4,000-entry state-diff cap binds
-/// before the calldata cap here.
-const STAGE_CHUNK: u32 = 3_900;
+/// Staged slots per staging tx: the bouncer's 4,000-felt state-diff
+/// budget counts key + value = 2 felts PER WRITE (devnet-measured), so
+/// ~1,950 writes is the real bound; 1,900 is the production chunk.
+const STAGE_CHUNK: u32 = 1_900;
 
 #[derive(Drop)]
 struct Streams {
@@ -226,10 +229,10 @@ fn test_router_blake_full_drive_registers_fact() {
     let n_entries = program.len();
     let mut txs = 0_u32;
 
-    // Write-once staging: sampled 2,6xx slots -> 1 tx; fri 8,0xx -> 3 txs.
+    // Write-once staging: sampled 2,6xx slots -> 2 txs; fri 8,0xx -> 5 txs.
     txs += stage_section(router, SECTION_SAMPLED, sampled_p);
     txs += stage_section(router, SECTION_FRI, fri_p);
-    assert!(txs == 4, "staging txs");
+    assert!(txs == 7, "staging txs");
     let sampled_slots = SpanTrait::len(sampled_p);
     let fri_slots = SpanTrait::len(fri_p);
 
@@ -312,7 +315,7 @@ fn test_router_blake_full_drive_registers_fact() {
     let (program_hash, output_hash) = router
         .finalize(PROOF_ID, state.span(), head_p, head_n, fri_slots, fri_n);
     txs += 1;
-    assert!(txs == 45, "total transactions");
+    assert!(txs == 48, "total transactions");
 
     // Same fact definition as the poseidon build: the vendored poseidon
     // section hashes (contract-side binding, not stwo transcript state).

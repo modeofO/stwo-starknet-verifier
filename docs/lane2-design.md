@@ -662,6 +662,63 @@ head-deser + redraw prologues), worst fused group tx still 4,872 felts,
 every tx's calldata still asserted under the cap; **poseidon 41 txs**
 (was 56) at ~29.5e9 (was ~34.2e9). Suites: blake 5/5, poseidon 30/30.
 
+## Devnet drive: the gas oracle falsifies the staged-fri design (2026-07-05)
+
+`scripts/devnet_drive.py` (starknet-devnet 0.9.0 --seed 42, blockifier
+0.14 rules): declared ALL 23 blake-build classes (the 15 merged groups
+included), deployed registry → `add_route(router)` → `freeze_routes()`,
+and drove the real blake proof with per-transaction receipts. Three
+findings, in increasing severity:
+
+- **The state-diff cap counts FELTS, not entries: 2 per storage write.**
+  A 2,617-write staging tx weighs `state_diff_size: 5,214` against the
+  block bouncer's 4,000 — the snforge drives' `STAGE_CHUNK = 3_900`
+  assumption was wrong (estimates lie; the bouncer doesn't). The real
+  write budget is ~1,950 slots/tx; production `STAGE_CHUNK = 1_900`
+  (sampled 2 staging txs, fri would be 5).
+- **Storage writes bill ~495k gas each all-in**: a 1,900-write staging
+  tx = 945.8M L2 gas, 78% of the 1.21e9 invoke cap. Staging is ~10×
+  dearer than snforge's model suggested.
+- **Staged-section READS cost ~122k gas per slot all-in** (read syscall
+  + unpack share): every OODS group tx (2,617-slot sampled read + a
+  near-zero qm31 eval) measured 328–381M; `fri_commit`, which loads the
+  8,045-slot fri section, needs **2.22e9 sierra gas — over the ~1e9
+  per-invoke execute budget (0.14 versioned constants) and even the
+  2.0e9 per-BLOCK sierra capacity. The staged-fri design is dead on
+  0.14 pricing**, and `finalize` (same load + the decommit walk) is
+  equally dead.
+
+Measured per-tx receipts up to the rejection (l2_gas): staging 222–946M
+(7 txs, 5.3e9 total); begin 24M; claim chunks 309–384M; claim_finalize
+22.6M; lookup chunks 132–166M; lookup_finalize 24.1M; oods_begin 326.8M;
+15 OODS groups 328–381M; oods_finalize 539.5M. The claim/lookup/OODS
+machinery is production-ready as measured; only the fri transport fails.
+
+**The fix (fri transport v3) — the fri section never needed storage:**
+
+- The bulk of the fri section (per-layer queried evals + hash
+  witnesses) is **self-authenticating** against the layer commitments —
+  exactly the doc's own fusion principle ("rows and witnesses are
+  Merkle-verified on arrival; storing them would buy nothing"). Only
+  the commitment slice (layer roots + last-layer poly, a few hundred
+  felts) is transcript-relevant, and its integrity comes from
+  Fiat-Shamir itself (roots are mixed before queries are drawn — the
+  same soundness argument as the monolithic verifier reading the proof
+  from calldata).
+- `FriProof` serializes PER LAYER (first_layer + inner_layers[] +
+  last_layer_poly), so the client slices the existing serialization at
+  layer boundaries — no witness re-synthesis.
+- v3 shape: `fri_commit` takes the commitment slice as CALLDATA
+  (~150M); the decommit walk splits into ~2-3 layer-batched chunk txs,
+  each carrying its layers' evals+witnesses as calldata (folded values
+  ride the checkpoint, ~40 packed felts); `finalize` keeps the
+  last-layer check + query-equality re-derivation + fact registration.
+  SECTION_FRI staging is deleted (5 staging txs and ~2e9 of double
+  loads gone). The 17 OODS txs likewise switch their sampled supply to
+  calldata (they have room; d_sampled already binds either source);
+  the 9 fused group txs keep the staged sampled read (rows leave no
+  calldata room) — sampled staging stays.
+
 ## The calldata emitter (built 2026-07-05, bridge `emit-calldata`)
 
 `privacy_prove_cairo_bridge emit-calldata <extended_proof.json> <dir>`

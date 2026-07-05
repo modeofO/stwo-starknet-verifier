@@ -21,9 +21,11 @@ features — so this script temporarily flips the phases package's default
 feature set to the qm31/blake build and restores Scarb.toml afterwards.
 
 Every step entrypoint returns the next serialized machine state, but an
-invoke's return value is not available over RPC — so each step first
-issues the same calldata as a CALL (read-only, against the same
-checkpoint storage) to obtain the state to echo next, then INVOKEs it.
+invoke's return value is not available over RPC — and a read-only CALL
+cannot stand in for it, because starknet_call runs with caller 0x0 and
+the router's checkpoints are caller-keyed. So each step INVOKEs and then
+extracts the entrypoint's retdata from starknet_traceTransaction (the
+router call's `result` inside the account's execute_invocation).
 """
 
 import argparse
@@ -51,7 +53,12 @@ SINGLE_CLASSES = [
 ALL_CLASSES = SINGLE_CLASSES[:3] + GROUP_CLASSES + SINGLE_CLASSES[3:]
 
 CHUNK_ENTRIES = 540
-STAGE_CHUNK = 3_900
+# The bouncer counts state-diff FELTS (key + value = 2 per storage write,
+# plus account nonce/fee-transfer overhead) against a 4,000-felt cap —
+# measured on devnet: a 2,617-write staging tx weighs state_diff_size
+# 5,214. So the write budget is ~1,950 slots per staging tx; 1,900 is the
+# safe production chunk.
+STAGE_CHUNK = 1_900
 SECTION_SAMPLED = hex(int.from_bytes(b"sampled", "big"))
 SECTION_FRI = hex(int.from_bytes(b"fri", "big"))
 PROOF_ID = hex(int.from_bytes(b"devnet_blake_drive", "big"))
@@ -116,17 +123,22 @@ class Driver:
     def step(self, label, function, calldata, returns_state=True):
         calldata = felts(calldata)
         n_felts = len(calldata)
-        new_state = None
-        if returns_state:
-            res = sncast(["call", "--contract-address", self.router,
-                          "--function", function, "--calldata"] + calldata,
-                         self.account, self.url)
-            new_state = res["response"] if isinstance(res.get("response"), list) \
-                else res.get("response_raw", res.get("response"))
         inv = sncast(["invoke", "--contract-address", self.router,
                       "--function", function, "--calldata"] + calldata,
                      self.account, self.url)
         rec = wait_receipt(self.url, inv["transaction_hash"])
+        new_state = None
+        if returns_state:
+            trace = rpc(self.url, "starknet_traceTransaction",
+                        [inv["transaction_hash"]])
+            retdata = trace["execute_invocation"]["calls"][0]["result"]
+            if function == "finalize":
+                new_state = retdata  # (program_hash, output_hash)
+            else:
+                # Array<felt252> retdata = [len, elements...]; echoing it as a
+                # Span argument re-serializes to exactly the same shape.
+                assert int(retdata[0], 16) == len(retdata) - 1, retdata[:3]
+                new_state = retdata[1:]
         res_gas = rec["execution_resources"]
         row = {
             "label": label,
@@ -170,8 +182,9 @@ def main():
         flip_features(to_blake=True)
         try:
             for name in ALL_CLASSES:
-                res = sncast(["declare", "--contract-name", name], args.account,
-                             args.url, cwd=PKG_DIR)
+                res = sncast(["declare", "--contract-name", name,
+                              "--package", "stwo_full_verifier_phases"],
+                             args.account, args.url, cwd=PKG_DIR)
                 hashes[name] = res["class_hash"]
                 print(f"declared {name:<22} {res['class_hash']}")
         finally:
@@ -228,7 +241,8 @@ def main():
         for off in range(0, len(slots), STAGE_CHUNK):
             chunk = slots[off:off + STAGE_CHUNK]
             d.step(f"stage {('sampled' if section == SECTION_SAMPLED else 'fri')}@{off}",
-                   "stage", [PROOF_ID, section, hex(off)] + span(chunk))
+                   "stage", [PROOF_ID, section, hex(off)] + span(chunk),
+                   returns_state=False)
 
     print("== machine ==")
     state = d.step("begin", "begin",
@@ -257,12 +271,12 @@ def main():
                    + [hex(head_n), hex(fri_slots), hex(fri_n)])
 
     for i, g in enumerate(m["groups"]):
-        rows = read_slots(args.calldata_dir / g["rows_file"])
-        wits = read_slots(args.calldata_dir / g["witnesses_file"])
+        rows = read_slots(args.calldata_dir / g["rows"]["file"])
+        wits = read_slots(args.calldata_dir / g["witnesses"]["file"])
         state = d.step(f"group {i:02d}", "group",
                        [PROOF_ID] + span(state) + span(head) + [hex(head_n)]
-                       + sampled_args + span(rows) + [hex(g["rows_n_values"])]
-                       + span(wits) + [hex(g["witnesses_n_values"])])
+                       + sampled_args + span(rows) + [hex(g["rows"]["n_values"])]
+                       + span(wits) + [hex(g["witnesses"]["n_values"])])
 
     out = d.step("finalize", "finalize",
                  [PROOF_ID] + span(state) + span(head)

@@ -1,5 +1,5 @@
-//! End-to-end router drive over the REAL fixture proof: 41 transactions
-//! (1 sampled staging + 3 fri staging → begin → 5 claim chunks → claim
+//! End-to-end router drive over the REAL fixture proof: 44 transactions
+//! (2 sampled staging + 5 fri staging → begin → 5 claim chunks → claim
 //! finalize → 5 lookup chunks → lookup finalize → oods begin → 15 merged
 //! OODS group classes → oods finalize → fri commit → 5 fused group txs →
 //! finalize), the sampled/fri sections staged write-once and read back
@@ -45,10 +45,11 @@ const CHUNK_ENTRIES: u32 = 540;
 const N_GROUPS: u32 = 5;
 const FELTS_PER_ENTRY: u32 = 9;
 const PROOF_ID: felt252 = 'poseidon_chain_n100';
-/// Staged slots per staging transaction: bounded by the 4,000-entry
-/// state-diff cap (minus the tx's own nonce/fee entries) and trivially
-/// within the ~4,996-felt calldata cap.
-const STAGE_CHUNK: u32 = 3_900;
+/// Staged slots per staging transaction: the bouncer's 4,000-felt
+/// state-diff budget counts key + value = 2 felts PER WRITE
+/// (devnet-measured), so ~1,950 writes is the real bound; 1,900 is the
+/// production chunk (trivially within the ~4,996-felt calldata cap).
+const STAGE_CHUNK: u32 = 1_900;
 
 #[derive(Drop)]
 struct Streams {
@@ -204,12 +205,12 @@ fn test_router_full_drive_registers_fact() {
     let program = streams.program;
     let n_entries = program.len();
 
-    // Write-once staging of the two over-cap sections (1 + 3 txs on this
+    // Write-once staging of the two over-cap sections (2 + 5 txs on this
     // fixture: sampled 2,609 slots, fri 8,873 slots).
     let sampled_txs = stage_section(router, SECTION_SAMPLED, sampled_p);
     let fri_txs = stage_section(router, SECTION_FRI, fri_p);
-    assert!(sampled_txs == 1, "sampled staging txs");
-    assert!(fri_txs == 3, "fri staging txs");
+    assert!(sampled_txs == 2, "sampled staging txs");
+    assert!(fri_txs == 5, "fri staging txs");
     let sampled_slots = SpanTrait::len(sampled_p);
     let fri_slots = SpanTrait::len(fri_p);
 

@@ -1,0 +1,47 @@
+registry 0x06ff4f1f0d64e9dc2d3a43492147ebb63b3eaada933052ec13e13be2576cb573
+router 0x04a7d51e1cd7bd017962591826eaecbb6f5728f7c3e534b4e71e92088c3d2687
+registry.add_route ok
+registry.freeze_routes ok
+== staging ==
+  stage sampled@0        calldata  1904  l2_gas   942,845,200
+  stage sampled@1900     calldata   721  l2_gas   355,426,240
+  stage fri@0            calldata  1904  l2_gas   945,819,200
+  stage fri@1900         calldata  1904  l2_gas   945,819,200
+  stage fri@3800         calldata  1904  l2_gas   945,819,200
+  stage fri@5700         calldata  1904  l2_gas   945,819,200
+  stage fri@7600         calldata   449  l2_gas   222,299,600
+== machine ==
+  begin                  calldata    73  l2_gas    23,969,440
+  claim_chunk chunk_00.txt calldata   792  l2_gas   380,166,720
+  claim_chunk chunk_01.txt calldata   799  l2_gas   379,882,560
+  claim_chunk chunk_02.txt calldata   815  l2_gas   381,564,480
+  claim_chunk chunk_03.txt calldata   855  l2_gas   383,889,280
+  claim_chunk chunk_04.txt calldata   675  l2_gas   308,847,680
+  claim_finalize         calldata   140  l2_gas    22,588,480
+  lookup_chunk chunk_00.txt calldata   761  l2_gas   162,208,000
+  lookup_chunk chunk_01.txt calldata   756  l2_gas   161,822,400
+  lookup_chunk chunk_02.txt calldata   776  l2_gas   163,444,800
+  lookup_chunk chunk_03.txt calldata   804  l2_gas   165,668,160
+  lookup_chunk chunk_04.txt calldata   628  l2_gas   132,127,040
+  lookup_finalize        calldata    92  l2_gas    24,062,720
+  oods_begin             calldata    93  l2_gas   326,787,840
+  oods_group 00          calldata   118  l2_gas   330,035,840
+  oods_group 01          calldata   118  l2_gas   335,835,840
+  oods_group 02          calldata   714  l2_gas   337,487,360
+  oods_group 03          calldata   118  l2_gas   329,035,840
+  oods_group 04          calldata   118  l2_gas   334,555,840
+  oods_group 05          calldata   594  l2_gas   338,712,960
+  oods_group 06          calldata   594  l2_gas   342,032,960
+  oods_group 07          calldata   118  l2_gas   334,675,840
+  oods_group 08          calldata   454  l2_gas   335,596,160
+  oods_group 09          calldata   346  l2_gas   331,603,200
+  oods_group 10          calldata   118  l2_gas   328,595,840
+  oods_group 11          calldata   118  l2_gas   336,475,840
+  oods_group 12          calldata   914  l2_gas   341,151,360
+  oods_group 13          calldata   562  l2_gas   350,229,120
+  oods_group 14          calldata   118  l2_gas   380,675,840
+  oods_finalize          calldata   117  l2_gas   539,510,720
+sncast failed: sncast --json --account devnet42 invoke --contract-address 0x04a7d51e1cd7bd017962591826eaecbb6f5728f7c3e534b4e71e92088c3d2687 --function...
+
+{"command":"invoke","error":"Transaction execution error = TransactionExecutionErrorData { transaction_index: 0, execution_error: Message(\"Transaction size exceeds the maximum block capacity. Max block capacity: BouncerWeights { l1_gas: 4950000, message_segment_length: 18446744073709551615, n_events: 5000, n_txs: 18446744073709551615, state_diff_size: 4000, sierra_gas: 2000000000, proving_gas: 18446744073709551615, receipt_l2_gas: 18446744073709551615 }, transaction size: BouncerWeights { l1_gas: 0, message_segment_length: 0, n_events: 1, n_txs: 1, state_diff_size: 8, sierra_gas: 2222097772, proving_gas: 3270358629395477583, receipt_l2_gas: 1011473920 }.\") }","type":"error"}
+
