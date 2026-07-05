@@ -67,7 +67,6 @@ use stwo_cairo_air::claims::{CairoClaim, CairoClaimFlattenTrait, CairoClaimImpl}
 use stwo_cairo_air::preprocessed_columns::preprocessed_root;
 use stwo_cairo_air::{INTERACTION_POW_BITS, PublicDataImpl, SECURITY_BITS, verify_claim};
 use stwo_constraint_framework::LookupElementsImpl;
-use stwo_verifier_core::channel::poseidon252::new_channel;
 use stwo_verifier_core::channel::{Channel, ChannelTrait};
 use stwo_verifier_core::circle::{ChannelGetRandomCirclePointImpl, CirclePoint};
 use stwo_verifier_core::fields::Invertible;
@@ -87,9 +86,15 @@ use stwo_verifier_core::verifier::{Air, VerificationError, try_extract_compositi
 use stwo_verifier_core::Hash;
 use stwo_verifier_utils::{MemorySection, construct_f252};
 use stwo_verifier_utils::poseidon252::encode_and_hash_memory_section;
+#[cfg(feature: "poseidon252_verifier")]
 use crate::claim_mix::{
     ClaimMixState, claim_mix_absorb_program_entries, claim_mix_begin, claim_mix_finalize,
 };
+#[cfg(not(feature: "poseidon252_verifier"))]
+use crate::claim_mix_blake::{
+    ClaimMixState, claim_mix_absorb_program_entries, claim_mix_begin, claim_mix_finalize,
+};
+use crate::channel_compat::new_channel;
 use crate::lookup_chunks::{lookup_sum_program_chunk, lookup_sum_rest};
 use crate::resumable_full::{FullVerificationOutput, rebuild_tree};
 use crate::sponge::{SpongeState, sponge_absorb, sponge_finalize, sponge_start};
@@ -240,7 +245,7 @@ pub struct LookupPhaseState {
     pub roll_check: felt252,
     pub entries_summed: u32,
     pub accumulator: QM31,
-    pub digest_pre_draw: felt252,
+    pub digest_pre_draw: Hash,
     pub program_fact_hash: felt252,
 }
 
@@ -248,8 +253,8 @@ pub struct LookupPhaseState {
 #[derive(Drop, Serde)]
 pub struct OodsPhaseState {
     pub d_head: felt252,
-    pub digest_pre_draw: felt252,
-    pub digest_post_prologue: felt252,
+    pub digest_pre_draw: Hash,
+    pub digest_post_prologue: Hash,
     pub program_fact_hash: felt252,
 }
 
@@ -257,8 +262,8 @@ pub struct OodsPhaseState {
 #[derive(Drop, Serde)]
 pub struct FriCommitPhaseState {
     pub d_head: felt252,
-    pub digest_pre_draw: felt252,
-    pub digest_pre_fri: felt252,
+    pub digest_pre_draw: Hash,
+    pub digest_pre_fri: Hash,
     pub d_sampled: felt252,
     pub ood_x: QM31,
     pub ood_y: QM31,
@@ -269,7 +274,7 @@ pub struct FriCommitPhaseState {
 #[derive(Drop, Serde)]
 pub struct GroupPhaseState {
     pub d_head: felt252,
-    pub digest_pre_fri: felt252,
+    pub digest_pre_fri: Hash,
     pub d_sampled: felt252,
     pub ood_x: QM31,
     pub ood_y: QM31,
@@ -620,7 +625,7 @@ pub fn machine_group(
     head: Span<felt252>,
     sampled_felts: Span<felt252>,
     rows: QueriedValues,
-    witnesses: Array<Span<felt252>>,
+    witnesses: Array<Span<Hash>>,
 ) -> GroupPhaseState {
     let GroupPhaseState {
         d_head, digest_pre_fri, d_sampled, ood_x, ood_y, query_positions, queries_done,

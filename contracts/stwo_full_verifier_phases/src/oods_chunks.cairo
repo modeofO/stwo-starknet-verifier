@@ -91,8 +91,8 @@ use stwo_constraint_framework::{
     AirComponent, CommonLookupElements, LookupElementsImpl, PreprocessedMaskValues,
     PreprocessedMaskValuesImpl,
 };
-use stwo_verifier_core::channel::poseidon252::new_channel;
 use stwo_verifier_core::channel::ChannelTrait;
+use crate::channel_compat::new_channel;
 use stwo_verifier_core::circle::{ChannelGetRandomCirclePointImpl, CirclePoint};
 use stwo_verifier_core::fields::Invertible;
 use stwo_verifier_core::fields::m31::P_U32;
@@ -117,10 +117,10 @@ pub const N_FAMILIES: u32 = 49;
 pub struct OodsEvalState {
     pub d_head: felt252,
     pub d_sampled: felt252,
-    pub digest_pre_draw: felt252,
+    pub digest_pre_draw: Hash,
     /// Channel digest right after the composition commit mix (the site
     /// finalize resumes from for `mix_sampled_values`).
-    pub digest_post_comp_commit: felt252,
+    pub digest_post_comp_commit: Hash,
     pub random_coeff: QM31,
     pub ood_x: QM31,
     pub ood_y: QM31,

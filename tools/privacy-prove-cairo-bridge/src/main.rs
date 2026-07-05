@@ -486,13 +486,36 @@ fn bootloader_outputs_checked(
 // prover emits and the vendored Cairo `MerkleVerifier::verify` consumes.
 
 type PoseidonCairoProof = CairoProof<Poseidon252MerkleHasher>;
+type BlakeCairoProof = CairoProof<Blake2sMerkleHasher>;
+
+/// Emission of a Merkle-witness hash into the snforge felt stream, matching
+/// the vendored Cairo `Serde<Hash>`: one felt for a poseidon hash, 8 LE u32
+/// words for a blake2s hash.
+trait WitnessHashFelts {
+    fn to_hex_felts(&self) -> Vec<String>;
+}
+
+impl WitnessHashFelts for FieldElement252 {
+    fn to_hex_felts(&self) -> Vec<String> {
+        vec![format!("0x{self:x}")]
+    }
+}
+
+impl WitnessHashFelts for stwo::core::vcs::blake2_hash::Blake2sHash {
+    fn to_hex_felts(&self) -> Vec<String> {
+        self.0
+            .chunks_exact(4)
+            .map(|c| format!("0x{:x}", u32::from_le_bytes(c.try_into().unwrap())))
+            .collect()
+    }
+}
 
 /// Replays the Merkle walk for `positions` (must be sorted + deduplicated),
 /// collecting the sibling hashes a verifier of exactly this subset consumes.
-fn synthesize_witness(
+fn synthesize_witness<H: stwo::core::vcs_lifted::MerkleHasherLifted>(
     positions: &[usize],
-    aux: &stwo::core::vcs_lifted::verifier::MerkleDecommitmentLiftedAux<Poseidon252MerkleHasher>,
-) -> Result<Vec<FieldElement252>, Error> {
+    aux: &stwo::core::vcs_lifted::verifier::MerkleDecommitmentLiftedAux<H>,
+) -> Result<Vec<H::Hash>, Error> {
     let all_node_values = &aux.all_node_values;
     let mut witness = Vec::new();
     let mut layer_positions: Vec<usize> = positions.to_vec();
@@ -553,11 +576,27 @@ fn split_witness(
     extended_proof_path: &PathBuf,
     out_dir: &PathBuf,
     group_size: usize,
+    blake: bool,
 ) -> Result<(), Error> {
     eprintln!("reading extended proof from {}", extended_proof_path.display());
     let bytes = std::fs::read(extended_proof_path)?;
-    let proof: PoseidonCairoProof = serde_json::from_slice(&bytes)?;
+    if blake {
+        let proof: BlakeCairoProof = serde_json::from_slice(&bytes)?;
+        split_witness_impl(&proof, out_dir, group_size)
+    } else {
+        let proof: PoseidonCairoProof = serde_json::from_slice(&bytes)?;
+        split_witness_impl(&proof, out_dir, group_size)
+    }
+}
 
+fn split_witness_impl<H: stwo::core::vcs_lifted::MerkleHasherLifted>(
+    proof: &CairoProof<H>,
+    out_dir: &PathBuf,
+    group_size: usize,
+) -> Result<(), Error>
+where
+    H::Hash: WitnessHashFelts,
+{
     let scheme_proof = &proof.extended_stark_proof.proof.0;
     let aux = &proof.extended_stark_proof.aux;
     let n_trees = scheme_proof.decommitments.len();
@@ -655,7 +694,7 @@ fn split_witness(
             witness_sizes.push(witness.len());
             felts.push(format!("0x{:x}", witness.len()));
             for hash in &witness {
-                felts.push(format!("0x{hash:x}"));
+                felts.extend(hash.to_hex_felts());
             }
         }
 
@@ -1072,11 +1111,22 @@ fn main() -> Result<(), Error> {
             );
         }
         Some("split-witness") => {
-            let extended_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;
-            let out_dir = argv.get(2).map(PathBuf::from).ok_or(usage)?;
+            // Optional `--blake` flag: the extended proof is a blake2s-channel
+            // (qm31-pivot) proof; witnesses emit as 8 LE u32 words per hash.
+            let mut positional: Vec<String> = Vec::new();
+            let mut blake = false;
+            for arg in argv.iter().skip(1) {
+                if arg == "--blake" {
+                    blake = true;
+                } else {
+                    positional.push(arg.clone());
+                }
+            }
+            let extended_in = positional.first().map(PathBuf::from).ok_or(usage)?;
+            let out_dir = positional.get(1).map(PathBuf::from).ok_or(usage)?;
             let group_size: usize =
-                argv.get(3).map(|s| s.parse()).transpose()?.unwrap_or(16);
-            split_witness(&extended_in, &out_dir, group_size)?;
+                positional.get(2).map(|s| s.parse()).transpose()?.unwrap_or(16);
+            split_witness(&extended_in, &out_dir, group_size, blake)?;
         }
         Some("emit-calldata") => {
             let extended_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;

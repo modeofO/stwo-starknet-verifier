@@ -66,7 +66,10 @@ pub fn sponge_finalize(state: SpongeState) -> felt252 {
     r0
 }
 
+// The reference channel these tests compare against is the poseidon one;
+// the sponge itself (fact hashing, binding digests) is build-independent.
 #[cfg(test)]
+#[cfg(feature: "poseidon252_verifier")]
 mod tests {
     use core::poseidon::poseidon_hash_span;
     use stwo_verifier_core::channel::poseidon252::new_channel;

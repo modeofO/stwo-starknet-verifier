@@ -171,9 +171,25 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   machine split + router, but ~5× less total CASM, no mul_252 blowup,
   and the client reverts to the fast blake2s prover). The probe README
   is the 30-second re-test.
-- **Next:** fri-section staging + the one-time constants store (the two
-  calldata-cap items), the qm31 gate-probe re-test on Starknet version
-  bumps (pivot plan documented), Sepolia campaign under the registry's
+- **The qm31 pivot measured AND the machine ported (2026-07-05)** — the
+  gate re-probe still rejects at the Sepolia gateway, but snforge 0.61
+  EXECUTES qm31 libfuncs (proven in `tools/qm31-gate-probe`'s tests), so
+  the pivot is fully locally testable. `prove-blake` shipped in the
+  bridge (two traps found: the verifier's default build wants the PLAIN
+  `blake2s` channel, not `blake2s_m31`, and pins the `canonical`
+  WITH-pedersen trace): client proving drops **257 s → ~6 s** (14.1 GB
+  peak); verification drops 34.2M → **26.6M steps** on the qm31 build
+  (per-stage map in the design doc — the opcode annihilates OODS eval
+  11× but fri_answers/prologue are bookkeeping-bound). The machine now
+  builds BOTH channels from one source (`Hash`-typed checkpoints,
+  `claim_mix_blake` pausable blake2s absorbers, `split-witness --blake`)
+  and the full blake machine sequence == monolithic on the real blake
+  proof in snforge; poseidon suite still 30/30.
+- **Next:** re-derive the 49-family OODS split + class sizing on the
+  qm31 build (`scripts/size_classes.sh --blake`), blake transport
+  (emit-calldata + router drive), fri-section staging + constants store
+  decisions from blake measurements, the qm31 gate-probe re-test on
+  Starknet version bumps, Sepolia campaign under the registry's
   governed route list; confirm the Controller envelope with a live
   Sepolia session transaction.
 

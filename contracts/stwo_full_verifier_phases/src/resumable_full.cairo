@@ -35,8 +35,8 @@ use stwo_cairo_air::cairo_air::CairoAirNewImpl;
 use stwo_cairo_air::preprocessed_columns::preprocessed_root;
 use stwo_cairo_air::{CairoProof, INTERACTION_POW_BITS, SECURITY_BITS, verify_claim};
 use stwo_constraint_framework::LookupElementsImpl;
-use stwo_verifier_core::channel::poseidon252::new_channel;
 use stwo_verifier_core::channel::{Channel, ChannelTrait};
+use crate::channel_compat::new_channel;
 use stwo_verifier_core::circle::ChannelGetRandomCirclePointImpl;
 use stwo_verifier_core::fields::Invertible;
 use stwo_verifier_core::fields::m31::M31Trait;
@@ -70,10 +70,10 @@ const N_COMPOSITION_COLUMNS: usize = 8;
 pub struct FullCheckpoint {
     /// Channel digest immediately after `mix_u64(interaction_pow)` — the
     /// site the lookup elements are drawn from (`n_draws == 0`).
-    pub digest_pre_draw: felt252,
+    pub digest_pre_draw: Hash,
     /// Channel digest immediately after the interaction-trace commit
     /// (`n_draws == 0`) — where the monolithic verifier enters `verify()`.
-    pub digest_post_prologue: felt252,
+    pub digest_post_prologue: Hash,
     /// `poseidon(proof felt stream)` — binds phase B's re-supplied bytes to
     /// the ones phase A checked.
     pub proof_hash: felt252,

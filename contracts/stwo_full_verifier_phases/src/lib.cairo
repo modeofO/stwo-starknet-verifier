@@ -1,7 +1,11 @@
 //! Lane 2: resumable verification of the full Cairo verifier
 //! (poseidon252 configuration). See docs/lane2-design.md.
 
+#[cfg(feature: "poseidon252_verifier")]
 pub mod claim_mix;
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub mod claim_mix_blake;
+pub mod channel_compat;
 pub mod fri_chunks;
 pub mod lookup_chunks;
 pub mod machine;
@@ -221,6 +225,7 @@ mod StwoMachineOods {
 #[starknet::contract]
 mod StwoMachineGroup {
     use stwo_verifier_core::pcs::verifier::QueriedValues;
+    use stwo_verifier_core::Hash;
     use super::{IStwoMachineGroup, deserialize_state, machine, serialize_state};
 
     #[storage]
@@ -237,7 +242,7 @@ mod StwoMachineGroup {
             mut witnesses: Span<felt252>,
         ) -> Array<felt252> {
             let rows: QueriedValues = Serde::deserialize(ref rows).expect('rows');
-            let witnesses: Array<Span<felt252>> = Serde::deserialize(ref witnesses)
+            let witnesses: Array<Span<Hash>> = Serde::deserialize(ref witnesses)
                 .expect('witnesses');
             serialize_state(
                 machine::machine_group(deserialize_state(state), head, sampled, rows, witnesses),

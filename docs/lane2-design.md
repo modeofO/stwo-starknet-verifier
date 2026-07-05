@@ -430,6 +430,43 @@ declare is gateway-gated). Measured this session:
   OODS phase merging (the component evals shrink ~5× in CASM) and
   cheaper transport, not from raw steps.
 
+### The machine ported to the blake channel (2026-07-05)
+
+`stwo_full_verifier_phases` now builds BOTH configurations from the same
+source: default = poseidon (the declared machinery), and
+`--no-default-features --features qm31_opcode,blake_outputs_packing` =
+the pivot build. The port surface turned out small because the machine
+was already written against `Channel`/`ChannelTrait`/`Hash` generically:
+
+- **Checkpoint digest fields retype `felt252` → `Hash`** (identical type
+  under poseidon; 8-u32 `Blake2sHash` with vendored Serde under blake) —
+  machine, oods_chunks, resumable_full. Seam discipline unchanged
+  (checkpoints still sit at `n_draws == 0` sites). Merkle witnesses
+  become `Span<Hash>` in transport. Our OWN binding digests (`d_head`,
+  rolling chunk digests, `d_sampled`, fact sponge, router state hash)
+  stay Starknet-poseidon — they are contract-side bindings, not stwo
+  transcript state, so the fact definition and `stwo_fact_binding`
+  consumer flow are IDENTICAL across the pivot.
+- **`src/channel_compat.cairo`** — the one build-split import
+  (`new_channel`).
+- **`src/claim_mix_blake.cairo`** — the real work: the two chunked
+  claim-mix absorbers rebuilt on a pausable cumulative blake2s
+  (`BlakeAbsorber`: 8 state words + byte count + ≤16 pending words,
+  lazy compression so finalize sees the true last block). Step 2
+  (`mix_felts∘pack_into_qm31s`, digest-prefixed, 4-word groups,
+  zero-padded tail QM31 counted / final-block pad uncounted) and step 4
+  (`hash_small_vals` = plain `hash_u32s` under blake) both stream the
+  same per-entry chunk units as the poseidon build; same API, so
+  machine.cairo call sites are untouched.
+- **`split-witness --blake`** in the bridge (witness synthesis
+  genericized over the Merkle hasher; blake hashes emit as 8 LE u32
+  words matching the vendored Serde). Full-set self-check passes on the
+  blake fixture: synthesized == the proof's own witnesses, 4 trees.
+- Tests: `tests/lib.cairo` gates the suites by build;
+  `test_machine_blake.cairo` drives the full machine sequence over the
+  real blake proof with serde round-trips at every boundary and seam
+  equality against `phase_a`'s checkpoints.
+
 ## The router (built 2026-07-05, `src/router.cairo`)
 
 `StwoVerifierRouter` (6,103 Sierra felts) is the production contract that
