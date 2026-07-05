@@ -160,10 +160,22 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   them further. **These two now carry the qm31-opcode dependency**; all
   other machinery is declare-ready. See "Declare pre-flight" in
   [`docs/lane2-design.md`](./docs/lane2-design.md).
+- **The qm31 gate located precisely (2026-07-05)** —
+  [`tools/qm31-gate-probe`](./tools/qm31-gate-probe): a qm31 contract
+  declares/deploys/EXECUTES on starknet-devnet 0.9.0 and fee-estimates
+  on Sepolia RPC nodes, but the **Sepolia gateway (0.14.3) rejects the
+  real declare** ("Contract failed to compile in starknet") — the
+  enforcement point `audited.json` mirrors. Devnet and estimation are
+  not deployability oracles. Post-opcode shape measured: qm31-build
+  monolithic verifier = 3.0M Sierra / 405k CASM (still needs the
+  machine split + router, but ~5× less total CASM, no mul_252 blowup,
+  and the client reverts to the fast blake2s prover). The probe README
+  is the 30-second re-test.
 - **Next:** fri-section staging + the one-time constants store (the two
-  calldata-cap items), qm31-opcode watch for the last two classes,
-  Sepolia campaign under the registry's governed route list; confirm
-  the Controller envelope with a live Sepolia session transaction.
+  calldata-cap items), the qm31 gate-probe re-test on Starknet version
+  bumps (pivot plan documented), Sepolia campaign under the registry's
+  governed route list; confirm the Controller envelope with a live
+  Sepolia session transaction.
 
 ## Layout
 

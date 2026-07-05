@@ -1,0 +1,11 @@
+[package]
+name = "qm31_gate_probe"
+version = "0.1.0"
+edition = "2024_07"
+experimental-features = ["qm31_utils"]
+
+[dependencies]
+starknet = "2.18.0"
+
+[[target.starknet-contract]]
+sierra = true

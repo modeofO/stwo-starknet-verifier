@@ -346,6 +346,37 @@ opcode lands in `audited.json`). Until then the fixture flow cannot run
 end-to-end on a public network; everything else (49-family OODS,
 router, transport) is declare-ready.
 
+### The qm31 gate, measured (2026-07-05)
+
+The opcode's status was tested empirically at every layer
+(`tools/qm31-gate-probe/`, a minimal qm31-arithmetic contract):
+
+- The Cairo VM / S-two AIR support the opcode (extension 3,
+  `QM31Operation`) and scarb 2.18's corelib ships `core::qm31` — the
+  PROVING stack is ready.
+- **starknet-devnet 0.9.0 declares, deploys and executes it** (100
+  rounds of qm31 mul/add/sub verified), and Sepolia RPC nodes
+  fee-estimate the declare successfully — neither is a valid
+  deployability oracle.
+- **The Sepolia gateway (Starknet 0.14.3) rejects the real declare:**
+  `Contract failed to compile in starknet`. The enforcement point is
+  the gateway's declare-time class compilation, which is what
+  `audited.json` mirrors. The rejection costs nothing; the probe README
+  has the 30-second re-test.
+
+**The post-opcode shape is also measured**: the monolithic vendored
+verifier built with `feature = qm31_opcode` is 2,996,065 Sierra felts /
+**405,569 CASM felts** — still ~5× the CASM cap, so the machine/OODS
+splitting and the router survive the pivot; but total CASM drops ~5×
+vs the poseidon build (≈1.9M across today's 37 classes), the
+mul_252/karatsuba blowup that blocks mul_opcode and cube_252-half-A
+disappears, the 34.2M-step budget should collapse comparably (re-probe
+on pivot), and the client reverts from the poseidon-Merkle prover
+(257 s / 11.3 GB) to the fast blake2s path. Pivot work when the gate
+opens: port the checkpoint channel poseidon → blake2s (lane 1 has the
+pattern), re-prove fixtures with blake params, re-run the generator +
+measurement pyramid.
+
 With merging of small neighbours the eventual OODS phase is ~10–12
 group txs; today's fine-grained shape is 32 (begin + 30 groups +
 finalize).
