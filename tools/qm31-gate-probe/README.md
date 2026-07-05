@@ -21,6 +21,23 @@ Where the gate actually lives, established empirically:
 Devnet and RPC estimation are NOT valid deployability oracles for new
 libfuncs; only a real gateway declare is.
 
+**Re-tested 2026-07-05 (same day, later): still rejected** — identical
+gateway error, gate unchanged.
+
+## snforge executes qm31 (measured 2026-07-05)
+
+`snforge test` in this package runs two probes
+(`tests/test_qm31_execution.cairo`), both PASS on snforge 0.61.0 /
+scarb 2.18.0:
+
+- 100 rounds of qm31 mul/add/sub directly in the test runner's VM;
+- the same chain through a **declared + deployed contract call**
+  (`declare("Qm31Probe")` → `deploy` → `mul_qm31(100)`).
+
+So the lane-2 qm31 pivot can be developed and equivalence-tested
+entirely locally in snforge — the gateway gate blocks only the public
+declare, not the local pyramid.
+
 ## Re-test (free on rejection; ~0.7 STRK if it lands)
 
 ```sh

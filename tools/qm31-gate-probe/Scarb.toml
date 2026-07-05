@@ -7,5 +7,15 @@ experimental-features = ["qm31_utils"]
 [dependencies]
 starknet = "2.18.0"
 
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
+
 [[target.starknet-contract]]
 sierra = true
