@@ -265,11 +265,24 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   1.21e9 invoke cap** (7-query groups or the constants store are the
   levers before the real messagezk-sized circuit). Both suites green
   (blake 5/5, poseidon 30/30); 21 deployable classes, all under the caps.
-- **Next:** the qm31 gate-probe re-test on Starknet version bumps,
-  devnet declare pre-flight of the 36 blake classes + a devnet router
-  drive with real gas numbers, Sepolia campaign under the registry's
-  governed route list; confirm the Controller envelope with a live
-  Sepolia session transaction.
+- **The fused-group margin closed (2026-07-05)** — the constants store
+  is dead by arithmetic (the ~2.9k-slot derived section costs ~350M/tx
+  to load at the measured ~120k/slot processing, vs the ≲97M recompute
+  it would remove — processing dominance kills derived-data stores the
+  same way it killed staged fri), so the lane took **7-query groups**:
+  devnet round 3 ran **46 txs, 21.85e9 L2 gas, fact registered**, with
+  the 10 fused group txs at 1,059–1,066M = **88.1% of the invoke cap at
+  worst** (target ≤~90%; the 91M/query marginal model predicted 1,066M).
+  Per-tx record: [`docs/devnet-drive-g7-2026-07-05.json`](./docs/devnet-drive-g7-2026-07-05.json).
+  Blake 5/5, poseidon 30/30; the poseidon suite deliberately keeps 16/5
+  groups (group-size flexibility is tested). qm31 gate re-probed a third
+  time the same day: still rejected.
+- **Next:** the qm31 gate-probe re-test on Starknet version bumps (the
+  only blocker for the public network), the messagezk-circuit sizing
+  pass (re-run `prove-blake` + the devnet drive on the real circuit;
+  drop to 6-query groups if the margin thins), Sepolia campaign under
+  the registry's governed route list once the gate opens; confirm the
+  Controller envelope with a live Sepolia session transaction.
 
 ## Layout
 

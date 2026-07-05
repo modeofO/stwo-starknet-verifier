@@ -13,8 +13,9 @@ Usage:
 
 The calldata dir is the output of
   privacy_prove_cairo_bridge emit-calldata \
-      fixtures/poseidon_chain_n100.blake_extended_proof.json <dir> --blake
-(group size 8 — the default).
+      fixtures/poseidon_chain_n100.blake_extended_proof.json <dir> 540 7 --blake
+(group size 7 — the production shape; 8-query groups measured 95.7% of
+the 1.21e9 invoke cap. --group-size overrides the manifest check.)
 
 Declares run `sncast declare`, which rebuilds via scarb with DEFAULT
 features — so this script temporarily flips the phases package's default
@@ -168,10 +169,13 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("devnet_drive_results.json"))
     ap.add_argument("--skip-declare", type=Path,
                     help="JSON file of class hashes from a previous run")
+    ap.add_argument("--group-size", type=int, default=7,
+                    help="expected manifest group_size (production: 7)")
     args = ap.parse_args()
 
     manifest = json.load(open(args.calldata_dir / "manifest.json"))
-    assert manifest["group_size"] == 8, "expected 8-query groups"
+    assert manifest["group_size"] == args.group_size, (
+        f"manifest group_size {manifest['group_size']} != expected {args.group_size}")
 
     # --- declares ---------------------------------------------------------
     if args.skip_declare:

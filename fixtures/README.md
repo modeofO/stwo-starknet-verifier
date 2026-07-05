@@ -31,15 +31,16 @@
       --extended fixtures/poseidon_chain_n100.blake_extended_proof.json
   ```
 
-  The committed blake witness-group test fixtures
+  The blake witness-group test fixtures
   (`contracts/stwo_full_verifier_phases/tests/data/blake/`) are the
-  **8-query** split (the production group size — see "The staged-section
-  store" in docs/lane2-design.md), regenerated from the extended proof:
+  **7-query** split (the production group size — 8-query groups measured
+  95.7% of the 1.21e9 invoke cap on devnet; see the fused-group margin
+  section in docs/lane2-design.md), regenerated from the extended proof:
 
   ```sh
   .prover/proving-utils/target/release/privacy_prove_cairo_bridge split-witness \
       fixtures/poseidon_chain_n100.blake_extended_proof.json \
-      contracts/stwo_full_verifier_phases/tests/data/blake 8 --blake
+      contracts/stwo_full_verifier_phases/tests/data/blake 7 --blake
   ```
 
   (The poseidon set `tests/data/witness_group_*.txt` remains the 16-query

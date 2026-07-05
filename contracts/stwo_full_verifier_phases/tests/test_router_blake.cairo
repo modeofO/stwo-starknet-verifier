@@ -3,7 +3,7 @@
 //! shape of the sovereign lane (FRI transport v3): 2 sampled staging txs +
 //! begin + 5 claim chunks + claim finalize + 5 lookup chunks + lookup
 //! finalize + oods begin + 15 merged OODS group classes + oods finalize +
-//! fri commit (FriHead calldata) + 9 fused 8-query group txs + N fri
+//! fri commit (FriHead calldata) + 10 fused 7-query group txs + N fri
 //! layer-chunk txs + finalize. The fri section is NEVER stored: its bulk
 //! is self-authenticating against the layer commitments and arrives
 //! layer-batched as calldata; the OODS txs supply the sampled section as
@@ -48,9 +48,10 @@ use stwo_verifier_utils::{MemorySection, construct_f252};
 
 const N_VALUES: u32 = 381_079;
 const CHUNK_ENTRIES: u32 = 540;
-/// Fused group transactions: 70 queries at 8 per group (production size —
-/// see the staged-section-store arithmetic in docs/lane2-design.md).
-const N_GROUPS: u32 = 9;
+/// Fused group transactions: 70 queries at 7 per group (production size —
+/// 8-query groups measured 95.7% of the 1.21e9 invoke cap on devnet; see
+/// the fused-group margin section in docs/lane2-design.md).
+const N_GROUPS: u32 = 10;
 const FELTS_PER_ENTRY: u32 = 9;
 const PROOF_ID: felt252 = 'poseidon_chain_n100_blake';
 /// Usable felts per invoke transaction (5,000 minus the account-call
@@ -114,7 +115,7 @@ fn build_streams(values: Span<felt252>) -> Streams {
     }
 }
 
-/// Loads one bridge witness-group fixture (split-witness --blake, size 8).
+/// Loads one bridge witness-group fixture (split-witness --blake, size 7).
 fn read_group(group: u32) -> (Array<Span<Hash>>, Array<Span<M31>>) {
     let file = FileTrait::new(format!("tests/data/blake/witness_group_{}.txt", group));
     let mut span = read_txt(@file).span();
@@ -336,7 +337,7 @@ fn test_router_blake_full_drive_registers_fact() {
     let (program_hash, output_hash) = router
         .finalize(PROOF_ID, state.span(), head_p, head_n, fri_head_p, fri_head_n);
     txs += 1;
-    assert!(txs == 43 + n_layer_chunks, "total transactions");
+    assert!(txs == 44 + n_layer_chunks, "total transactions");
 
     // Same fact definition as the poseidon build: the vendored poseidon
     // section hashes (contract-side binding, not stwo transcript state).

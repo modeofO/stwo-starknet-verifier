@@ -22,7 +22,8 @@ Devnet and RPC estimation are NOT valid deployability oracles for new
 libfuncs; only a real gateway declare is.
 
 **Re-tested 2026-07-05 (same day, later): still rejected** — identical
-gateway error, gate unchanged.
+gateway error, gate unchanged. **Third probe 2026-07-05 (later still):
+rejected again**, same error.
 
 ## snforge executes qm31 (measured 2026-07-05)
 

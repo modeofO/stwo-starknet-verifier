@@ -1,0 +1,422 @@
+{
+ "router": "0x04bf3e4daaaea80eddd77973748e329103b1744b9c895a1a886f2be731970974",
+ "registry": "0x0717a93a1c8fda461c2f8b825392a032ce4bf9196dcc8bd6d22bdd4e067586b5",
+ "program_hash": "0x69e5ab3f5d8612fadb1b3e2e8a8bd8becbba9fb2ec292d8c8af5a698f05e908",
+ "output_hash": "0x78d83b0ea34bebf74965aebe2aa550981d53a7719c0e4cc5cb62f8144092f98",
+ "txs": [
+  {
+   "label": "stage sampled@0",
+   "function": "stage",
+   "calldata_felts": 1904,
+   "l2_gas": 942845200,
+   "l1_gas": 0,
+   "l1_data_gas": 121344,
+   "actual_fee_fri": 943027120000000000
+  },
+  {
+   "label": "stage sampled@1900",
+   "function": "stage",
+   "calldata_felts": 721,
+   "l2_gas": 355426240,
+   "l1_gas": 0,
+   "l1_data_gas": 45760,
+   "actual_fee_fri": 355494784000000000
+  },
+  {
+   "label": "begin",
+   "function": "begin",
+   "calldata_felts": 73,
+   "l2_gas": 23969440,
+   "l1_gas": 0,
+   "l1_data_gas": 320,
+   "actual_fee_fri": 23969824000000000
+  },
+  {
+   "label": "claim_chunk chunk_00.txt",
+   "function": "claim_chunk",
+   "calldata_felts": 792,
+   "l2_gas": 380166720,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 380166976000000000
+  },
+  {
+   "label": "claim_chunk chunk_01.txt",
+   "function": "claim_chunk",
+   "calldata_felts": 799,
+   "l2_gas": 379882560,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 379882816000000000
+  },
+  {
+   "label": "claim_chunk chunk_02.txt",
+   "function": "claim_chunk",
+   "calldata_felts": 815,
+   "l2_gas": 381564480,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 381564736000000000
+  },
+  {
+   "label": "claim_chunk chunk_03.txt",
+   "function": "claim_chunk",
+   "calldata_felts": 855,
+   "l2_gas": 383889280,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 383889536000000000
+  },
+  {
+   "label": "claim_chunk chunk_04.txt",
+   "function": "claim_chunk",
+   "calldata_felts": 675,
+   "l2_gas": 308847680,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 308847936000000000
+  },
+  {
+   "label": "claim_finalize",
+   "function": "claim_finalize",
+   "calldata_felts": 140,
+   "l2_gas": 22588480,
+   "l1_gas": 0,
+   "l1_data_gas": 320,
+   "actual_fee_fri": 22588800000000000
+  },
+  {
+   "label": "lookup_chunk chunk_00.txt",
+   "function": "lookup_chunk",
+   "calldata_felts": 761,
+   "l2_gas": 162208000,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 162208256000000000
+  },
+  {
+   "label": "lookup_chunk chunk_01.txt",
+   "function": "lookup_chunk",
+   "calldata_felts": 756,
+   "l2_gas": 161822400,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 161822656000000000
+  },
+  {
+   "label": "lookup_chunk chunk_02.txt",
+   "function": "lookup_chunk",
+   "calldata_felts": 776,
+   "l2_gas": 163444800,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 163445056000000000
+  },
+  {
+   "label": "lookup_chunk chunk_03.txt",
+   "function": "lookup_chunk",
+   "calldata_felts": 804,
+   "l2_gas": 165668160,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 165668416000000000
+  },
+  {
+   "label": "lookup_chunk chunk_04.txt",
+   "function": "lookup_chunk",
+   "calldata_felts": 628,
+   "l2_gas": 132127040,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 132127296000000000
+  },
+  {
+   "label": "lookup_finalize",
+   "function": "lookup_finalize",
+   "calldata_felts": 92,
+   "l2_gas": 24062720,
+   "l1_gas": 0,
+   "l1_data_gas": 320,
+   "actual_fee_fri": 24063040000000000
+  },
+  {
+   "label": "oods_begin",
+   "function": "oods_begin",
+   "calldata_felts": 2710,
+   "l2_gas": 319266880,
+   "l1_gas": 0,
+   "l1_data_gas": 320,
+   "actual_fee_fri": 319267200000000000
+  },
+  {
+   "label": "oods_group 00",
+   "function": "oods_group",
+   "calldata_felts": 2735,
+   "l2_gas": 322514880,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 322515136000000000
+  },
+  {
+   "label": "oods_group 01",
+   "function": "oods_group",
+   "calldata_felts": 2735,
+   "l2_gas": 328274880,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 328275136000000000
+  },
+  {
+   "label": "oods_group 02",
+   "function": "oods_group",
+   "calldata_felts": 3331,
+   "l2_gas": 329926400,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 329926656000000000
+  },
+  {
+   "label": "oods_group 03",
+   "function": "oods_group",
+   "calldata_felts": 2735,
+   "l2_gas": 321474880,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 321475136000000000
+  },
+  {
+   "label": "oods_group 04",
+   "function": "oods_group",
+   "calldata_felts": 2735,
+   "l2_gas": 326994880,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 326995136000000000
+  },
+  {
+   "label": "oods_group 05",
+   "function": "oods_group",
+   "calldata_felts": 3211,
+   "l2_gas": 331192000,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 331192256000000000
+  },
+  {
+   "label": "oods_group 06",
+   "function": "oods_group",
+   "calldata_felts": 3211,
+   "l2_gas": 334472000,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 334472256000000000
+  },
+  {
+   "label": "oods_group 07",
+   "function": "oods_group",
+   "calldata_felts": 2735,
+   "l2_gas": 327154880,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 327155136000000000
+  },
+  {
+   "label": "oods_group 08",
+   "function": "oods_group",
+   "calldata_felts": 3071,
+   "l2_gas": 328035200,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 328035456000000000
+  },
+  {
+   "label": "oods_group 09",
+   "function": "oods_group",
+   "calldata_felts": 2963,
+   "l2_gas": 324082240,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 324082496000000000
+  },
+  {
+   "label": "oods_group 10",
+   "function": "oods_group",
+   "calldata_felts": 2735,
+   "l2_gas": 321034880,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 321035136000000000
+  },
+  {
+   "label": "oods_group 11",
+   "function": "oods_group",
+   "calldata_felts": 2735,
+   "l2_gas": 328914880,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 328915136000000000
+  },
+  {
+   "label": "oods_group 12",
+   "function": "oods_group",
+   "calldata_felts": 3531,
+   "l2_gas": 333630400,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 333630656000000000
+  },
+  {
+   "label": "oods_group 13",
+   "function": "oods_group",
+   "calldata_felts": 3179,
+   "l2_gas": 342708160,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 342708416000000000
+  },
+  {
+   "label": "oods_group 14",
+   "function": "oods_group",
+   "calldata_felts": 2735,
+   "l2_gas": 373154880,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 373155136000000000
+  },
+  {
+   "label": "oods_finalize",
+   "function": "oods_finalize",
+   "calldata_felts": 2734,
+   "l2_gas": 531989760,
+   "l1_gas": 0,
+   "l1_data_gas": 320,
+   "actual_fee_fri": 531990080000000000
+  },
+  {
+   "label": "fri_commit",
+   "function": "fri_commit",
+   "calldata_felts": 126,
+   "l2_gas": 32956800,
+   "l1_gas": 0,
+   "l1_data_gas": 320,
+   "actual_fee_fri": 32957120000000000
+  },
+  {
+   "label": "group 00",
+   "function": "group",
+   "calldata_felts": 4239,
+   "l2_gas": 1059815360,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1059815616000000000
+  },
+  {
+   "label": "group 01",
+   "function": "group",
+   "calldata_felts": 4233,
+   "l2_gas": 1059064640,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1059064896000000000
+  },
+  {
+   "label": "group 02",
+   "function": "group",
+   "calldata_felts": 4247,
+   "l2_gas": 1060496320,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1060496576000000000
+  },
+  {
+   "label": "group 03",
+   "function": "group",
+   "calldata_felts": 4273,
+   "l2_gas": 1063509440,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1063509696000000000
+  },
+  {
+   "label": "group 04",
+   "function": "group",
+   "calldata_felts": 4255,
+   "l2_gas": 1061177280,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1061177536000000000
+  },
+  {
+   "label": "group 05",
+   "function": "group",
+   "calldata_felts": 4295,
+   "l2_gas": 1065822080,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1065822336000000000
+  },
+  {
+   "label": "group 06",
+   "function": "group",
+   "calldata_felts": 4253,
+   "l2_gas": 1060687040,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1060687296000000000
+  },
+  {
+   "label": "group 07",
+   "function": "group",
+   "calldata_felts": 4267,
+   "l2_gas": 1062198720,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1062198976000000000
+  },
+  {
+   "label": "group 08",
+   "function": "group",
+   "calldata_felts": 4289,
+   "l2_gas": 1064671360,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1064671616000000000
+  },
+  {
+   "label": "group 09",
+   "function": "group",
+   "calldata_felts": 4252,
+   "l2_gas": 1060121920,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 1060122176000000000
+  },
+  {
+   "label": "fri_layers 00",
+   "function": "fri_layers",
+   "calldata_felts": 4100,
+   "l2_gas": 599023680,
+   "l1_gas": 0,
+   "l1_data_gas": 320,
+   "actual_fee_fri": 599024000000000000
+  },
+  {
+   "label": "fri_layers 01",
+   "function": "fri_layers",
+   "calldata_felts": 4478,
+   "l2_gas": 752359040,
+   "l1_gas": 0,
+   "l1_data_gas": 256,
+   "actual_fee_fri": 752359296000000000
+  },
+  {
+   "label": "finalize",
+   "function": "finalize",
+   "calldata_felts": 190,
+   "l2_gas": 33832080,
+   "l1_gas": 0,
+   "l1_data_gas": 448,
+   "actual_fee_fri": 33832560000000000
+  }
+ ]
+}

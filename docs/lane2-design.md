@@ -806,9 +806,9 @@ Findings:
   this fixture — bigger programs (more columns → longer rows, more
   constants) WILL breach it. Known levers, in order of preference:
   7-query groups (70 → 10 group txs, ~1.03e9 each), or resurrecting
-  the one-time constants store to strip the recompute (~184M). This is
-  the top open item for the production sizing pass on the real
-  messagezk circuit.
+  the one-time constants store to strip the recompute (~184M).
+  **Settled the same day — see "The fused-group margin" below: the
+  store is dead by arithmetic, 7-query groups taken and measured.**
 - The staged-vs-calldata A/B (round 1 OODS txs read staged sampled at
   ~330M; round 2 carries it as calldata at ~322M) isolates the read
   syscall at **~3k gas/slot** — section PROCESSING (~120k/slot)
@@ -821,6 +821,61 @@ Findings:
   (~6.4e9 on the dead plan); fri_commit and finalize are now 33M each.
 - Devnet fee at its static 1e9-fri gas price: ~21.4 STRK-equivalent.
   Real Sepolia pricing is dynamic; the gas number is the durable metric.
+
+## The fused-group margin: constants store killed by arithmetic, 7-query groups (2026-07-05)
+
+Round 2 left one open item: the fused 8-query group txs at 95.7% of the
+1.21e9 invoke cap, with two candidate levers. The constants store is
+settled **dead by arithmetic alone** — the same processing-dominance
+logic that killed staged fri, no build needed:
+
+- The recompute the store would eliminate is bounded by round 2's own
+  record (measured on the qm31 build, where it counts): full 8-query
+  group txs 1,150.0M vs the 6-query tail 967.3M → **~91M marginal per
+  query**, so the per-tx fixed cost ≈ 1,150 − 8×91.3 ≈ **419M**. The
+  sampled load inside it is ~322M (2,617 slots × ~123k, matching the
+  OODS-tx A/B), leaving **≲ 97M** for head deser + tree rebuild +
+  redraw + the stateless constants recompute. (The old 184M figure was
+  the poseidon-era software-qm31 probe; the opcode shrinks the field
+  ops, and 184M would not change the verdict anyway.)
+- The store REPLACES that ≲97M recompute with a **~350M load**: the
+  derived constants are ~2.9k packed slots and per-slot PROCESSING
+  (~120k, unpack+deser — round 2's central finding) is paid regardless
+  of source. A derived section that is BIGGER than the raw section it
+  derives from (2.9k vs 2.6k slots) can never win where processing
+  dominates: loading cached state costs more than recomputing it from
+  data the tx already loads.
+- Dropping the sampled load from group txs instead would require
+  forking the vendored `fri_answers` to inject pre-built
+  `QuotientConstants` (machine.cairo passes `sampled_values` straight
+  in) — the option-(b)-style vendored surgery already rejected — and
+  still nets roughly nothing: store load ~350M vs sampled ~322M +
+  recompute ≲97M, minus ~1.44e9 of one-time staging writes (2.9k ×
+  ~497k) against ~1.30e9 saved by dropping sampled staging.
+
+**7-query groups is the only live lever** (70 queries → 10 group txs,
+predicted worst ≈ 1,157 − 91 ≈ 1,066M ≈ 88% of cap). Taken: blake
+fixtures + emitter regenerated at group size 7 (rows+witnesses ≈ 4.1k
+slots — comfortable calldata headroom; worst group tx 4,296 felts in
+the snforge drive, was 4,872), `N_GROUPS` 9 → 10 in the blake suites,
+`devnet_drive.py` gains `--group-size` (default 7). The poseidon suite
+deliberately stays at 16/5 — group-size flexibility is part of what
+the tests prove.
+
+**Devnet round 3 (2026-07-05, same protocol as round 2): the
+prediction held to 3 digits.** Full drive at 7-query groups: **46
+transactions, 21.85e9 L2 gas total, fact registered**
+([per-tx record](./devnet-drive-g7-2026-07-05.json)). The 10 fused
+group txs measured **1,059.1–1,065.8M** (worst: group 05) =
+**88.1% of the 1.21e9 invoke cap** at the worst — the ≤~90% target
+met, and the marginal-query model (91.3M/query) predicted 1,066M.
+Every non-group phase reproduced round 2's numbers exactly (same
+classes, same calldata); the round-2 → round-3 delta is one extra
+419M fixed prologue minus eight ~91M query migrations, +0.42e9 total.
+The ~12% margin is fixture-relative: the real messagezk circuit's
+sizing pass re-runs this drive and, if needed, drops to 6-query
+groups (12 txs) — the lever stays continuously adjustable down to
+the ~419M fixed floor per group tx.
 
 ## The calldata emitter (built 2026-07-05, bridge `emit-calldata`)
 
