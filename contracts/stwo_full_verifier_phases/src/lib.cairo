@@ -6,7 +6,9 @@ pub mod fri_chunks;
 pub mod lookup_chunks;
 pub mod machine;
 pub mod oods_chunks;
+pub mod pack;
 pub mod resumable_full;
+pub mod router;
 pub mod split;
 pub mod sponge;
 

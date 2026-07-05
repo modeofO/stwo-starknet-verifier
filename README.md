@@ -131,8 +131,16 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   (~66k felts); the mul group was regrouped for it. Largest class:
   63,647 felts / 3.94M bytes (96% of the byte cap). The qm31 opcode
   remains a cost (not deployability) watch item.
-- **Next:** router contract with hash-stored write-once checkpoints
-  per tx, bridge-side per-tx calldata emitter (head surgery + chunks +
+- **Router SHIPPED in snforge (2026-07-05)** —
+  `StwoVerifierRouter` (6.1k felts): caller-keyed
+  `(tag, poseidon(state))` checkpoint slot, library-calls into the 36
+  pinned machine classes, packed-v2 section calldata, tag-typed
+  write-once sequencing. The real fixture proof verified end-to-end
+  through the deployed router in **52 transactions** (~24.3e9 L2 gas
+  total, ~470M/tx average — under the 1.21e9 per-invoke cap), fact
+  registered; proof-id reuse / wrong-tag / tampered-state all rejected.
+  29/29 tests green.
+- **Next:** bridge-side per-tx calldata emitter (head surgery + chunks +
   groups, packed v2), devnet declares + pre-flight, Sepolia campaign
   under the registry's governed route list; confirm the Controller
   envelope with a live Sepolia session transaction.

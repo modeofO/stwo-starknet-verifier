@@ -37,7 +37,6 @@ use stwo_full_verifier_phases::oods_chunks::{
 use stwo_full_verifier_phases::unpack_proof_v2;
 use stwo_verifier_core::fields::m31::M31;
 use stwo_verifier_core::fields::qm31::{QM31, QM31Serde, qm31_const};
-use stwo_verifier_core::fri::FriProof;
 use stwo_verifier_core::pcs::PcsConfig;
 use stwo_verifier_core::vcs::MerkleHasher;
 use stwo_verifier_core::vcs::verifier::MerkleDecommitment;

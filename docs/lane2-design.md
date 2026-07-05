@@ -319,6 +319,44 @@ With merging of small neighbours the eventual OODS phase is ~10–12
 group txs; today's fine-grained shape is 32 (begin + 30 groups +
 finalize).
 
+## The router (built 2026-07-05, `src/router.cairo`)
+
+`StwoVerifierRouter` (6,103 Sierra felts) is the production contract that
+drives the machine across transactions. The 36 machine classes stay
+stateless library classes; the router owns the only storage — one
+checkpoint slot per (caller, proof_id) holding `(tag, poseidon(state))`
+(~2 storage felts per in-flight proof, total). Every transaction:
+
+1. the caller echoes the previous serialized state as calldata;
+2. the router checks `poseidon(state)` against the slot AND that the
+   slot's tag matches the state type the entrypoint consumes
+   (`CLAIM/LOOKUP/OODS/OODS_EVAL/FRI_COMMIT/GROUP` — one tag per machine
+   state struct, preventing cross-phase type confusion);
+3. it library-calls the fixed class for that step (constructor-pinned
+   class hashes; `oods_group(i)` selects among the 30 group classes, the
+   in-state family counter enforces their order);
+4. it stores the new tagged hash, emits `Step`, and returns the new
+   state for the next echo.
+
+Write-once sequencing falls out of the tag chain: `begin` requires an
+empty slot ('router: proof id in use'), and every step overwrites the
+slot, so a phase can never re-run against a stale state. Big sections
+arrive packed (v2; `unpack_proof_v2` in the router; `src/pack.cairo` is
+the in-Cairo packer used by tests). `finalize` stores
+`poseidon(program_hash, output_hash)` in a local fact map — a
+placeholder for the shared `StwoFactRegistry` route.
+
+`tests/test_router.cairo`: the REAL fixture proof driven through the
+deployed router end-to-end — **52 transactions** (begin + 5 claim chunks
++ claim finalize + 5 lookup chunks + lookup finalize + oods begin + 30
+OODS groups + oods finalize + fri commit + 5 fused group txs + finalize),
+all sections packed-v2, ~24.3e9 total L2 gas ≈ **~470M gas/tx average**
+(well under the 1.21e9 per-invoke cap; the devnet pre-flight measures
+the real per-tx spread). The registered fact's hashes equal the vendored
+`encode_and_hash_memory_section` of the claim's program/output sections.
+Rejections: proof-id reuse, wrong-tag state, tampered state echo — all
+against one deployment, honest step still lands afterwards.
+
 ## Client side
 
 `prove-poseidon` in the bridge is the client reference path (bootloader →
