@@ -1,0 +1,28 @@
+[package]
+name = "messagezk_store"
+version = "0.1.0"
+edition = "2024_07"
+
+# MessageStore v3 — the messagezk consumer contract for the lane-1 route
+# (docs/superpowers/specs/2026-07-05-zkmsg-lane1-port-design.md): the
+# pluggable IStwoVerifier of messagezk v2 is replaced by a PINNED
+# (registry, program_hash, inner_root) lane-1 fact check; no owner, no
+# setters. The Merkle tree / root-history machinery is ported verbatim.
+
+[dependencies]
+starknet = "2.18.0"
+stwo_fact_binding = { path = "../stwo_fact_binding" }
+
+[[target.starknet-contract]]
+sierra = true
+allowed-libfuncs-list.name = "audited"
+
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
