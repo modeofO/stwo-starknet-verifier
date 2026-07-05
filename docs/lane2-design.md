@@ -467,6 +467,40 @@ was already written against `Channel`/`ChannelTrait`/`Hash` generically:
   real blake proof with serde round-trips at every boundary and seam
   equality against `phase_a`'s checkpoints.
 
+### The blake OODS split + class sizing: ALL 36 deployable classes fit (2026-07-05)
+
+Two blake-specific findings and their fixes, then the measured verdict:
+
+- **161 preprocessed columns.** The canonical (with-pedersen) trace
+  overflows the split's u128 used-column bitmask (poseidon's
+  without-pedersen trace has 105). `pp_used_mask` is now a 2-limb
+  [`PpMask`] (≤ 256 columns); the monolithic path never cared.
+- **The builtins family exploded to 807k Sierra / 102k CASM.** The blake
+  build's `BuiltinComponents` carries 8 builtins (the poseidon build's
+  3): add_mod (2.5k lines), mul_mod (7.1k), ec_op (2.3k) and pedersen
+  join bitwise/poseidon/rc96/rc128 — statically linked even though the
+  fixture never enables them. Fix: under blake the builtins sub-air runs
+  as **8 per-component families** (indices 29..36, `FAMILY_SHIFT = 7`
+  for everything after; N_FAMILIES 49 → 56), where the four builtins
+  outside the supported program envelope are **loud `is_none` stubs** —
+  a None `try_new` consumes neither claimed sums nor mask columns, so a
+  stub is stream-exact while keeping the unused component code out of
+  the class entirely. A program that needs mul_mod/ec_op/pedersen/
+  add_mod later gets a real eval class and a router class-hash swap; the
+  pedersen CONTEXT (aggregator windows, 5k+ lines) is likewise fenced by
+  is_none asserts. The 56-family chunked OODS == `machine_oods_mix` on
+  the real blake proof.
+- **Class sizes (qm31 build, measured `scripts/size_classes.sh --blake`):
+  all 36 deployable classes fit all three caps.** The two poseidon-lane
+  killers collapse exactly as the qm31 thesis predicted: mul_opcode
+  (F05A) 172,130 → **53,744 CASM**, cube_252-A (F16A) 179,655 →
+  **58,860 CASM**. Split builtins (F12) = 41,053 Sierra / 49,811 CASM.
+  Extremes: F02A 61,879 Sierra / 3.82M bytes (93% of the byte cap),
+  F18 62,645 CASM (76% of the CASM cap). Only the two never-declared
+  monolithic measurement classes (StwoFullPhaseB, StwoMachineOods)
+  exceed caps. **The blake machinery is declare-shape-complete**; what
+  blocks the public network remains only the gateway's qm31 gate.
+
 ## The router (built 2026-07-05, `src/router.cairo`)
 
 `StwoVerifierRouter` (6,103 Sierra felts) is the production contract that

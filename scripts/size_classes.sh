@@ -17,13 +17,16 @@ else
 fi
 
 scarb build "${FEATURES[@]}" >/dev/null
+# The package is a root-workspace member: artifacts land in the root target.
+cd ../../target/dev
 
 SIERRA_CAP=81920
 BYTE_CAP=4089446
 CASM_CAP=81920
 
 printf "%-28s %10s %10s %10s  %s\n" class sierra bytes casm verdict
-for f in target/dev/stwo_full_verifier_phases_*.contract_class.json; do
+for f in stwo_full_verifier_phases_*.contract_class.json; do
+    case "$f" in *integrationtest*|*unittest*) continue;; esac
     name=$(basename "$f" .contract_class.json | sed 's/^stwo_full_verifier_phases_//')
     sierra=$(jq '.sierra_program|length' "$f")
     # Byte cap applies to the class JSON without debug info (as declared).

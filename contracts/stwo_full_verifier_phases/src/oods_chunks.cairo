@@ -27,8 +27,9 @@
 //!   preprocessed column must be used by some component — otherwise the
 //!   prover could add junk FRI-quotient terms. Usage is per-column and
 //!   spans transactions, so each group transaction ORs its used-column
-//!   bitmask into the checkpoint (u128; column count asserted ≤ 128 —
-//!   the fixture has 105) and finalize compares against the columns that
+//!   bitmask into the checkpoint (2×u128 [`PpMask`]; column count asserted
+//!   ≤ 256 — the poseidon build's trace has 105 columns, the blake build's
+//!   canonical trace 161) and finalize compares against the columns that
 //!   actually carry a sample. Trace/interaction full consumption is
 //!   checked via the counters, mirroring the `is_empty` asserts.
 //!
@@ -83,6 +84,7 @@ use core::nullable::{FromNullableResult, match_nullable};
 use core::box::BoxImpl;
 use core::num::traits::Zero;
 use core::poseidon::poseidon_hash_span;
+#[cfg(feature: "poseidon252_verifier")]
 use stwo_cairo_air::builtins::BuiltinComponentsImpl;
 use stwo_cairo_air::components;
 use stwo_cairo_air::components::memory_id_to_big::LARGE_MEMORY_VALUE_ID_BASE;
@@ -110,7 +112,23 @@ use crate::split;
 
 /// Number of component families in the vendored eval sequence (40 sub-airs
 /// with the four oversized evals split into 2–4 part-families each).
+#[cfg(feature: "poseidon252_verifier")]
 pub const N_FAMILIES: u32 = 49;
+/// The blake (qm31-pivot) build's builtins sub-air fans out to 8
+/// per-component families (indices 29..36; the poseidon build's single
+/// `builtins` family 29): add_mod, bitwise, mul_mod, pedersen, poseidon,
+/// range_check_96, range_check_128, ec_op — the four outside the supported
+/// program envelope are loud `is_none` stubs (no component code in the
+/// class). Every later family shifts +7.
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub const N_FAMILIES: u32 = 56;
+
+/// Family-index shift for every family AFTER the builtins position (29):
+/// 0 under poseidon (one builtins family), 7 under blake (8 families).
+#[cfg(feature: "poseidon252_verifier")]
+pub const FAMILY_SHIFT: u32 = 0;
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub const FAMILY_SHIFT: u32 = 7;
 
 /// Checkpoint state between OODS group transactions.
 #[derive(Drop, Serde)]
@@ -129,7 +147,7 @@ pub struct OodsEvalState {
     pub sums_done: u32,
     pub trace_done: u32,
     pub interaction_done: u32,
-    pub pp_used_mask: u128,
+    pub pp_used_mask: PpMask,
     /// Seam carry of a two-half component eval: filled by a half-A family,
     /// consumed by the immediately following half-B family (enforced by
     /// the family order), empty at every other boundary.
@@ -165,6 +183,31 @@ fn u128_bit(index: u32) -> u128 {
     bit
 }
 
+/// 256-bit preprocessed-column usage mask: the canonical (with-pedersen)
+/// trace of the blake build has 161 preprocessed columns; the poseidon
+/// build's without-pedersen trace has 105.
+#[derive(Drop, Serde, Copy, PartialEq)]
+pub struct PpMask {
+    pub lo: u128,
+    pub hi: u128,
+}
+
+fn pp_mask_zero() -> PpMask {
+    PpMask { lo: 0, hi: 0 }
+}
+
+fn pp_mask_bit(index: u32) -> PpMask {
+    if index < 128 {
+        PpMask { lo: u128_bit(index), hi: 0 }
+    } else {
+        PpMask { lo: 0, hi: u128_bit(index - 128) }
+    }
+}
+
+fn pp_mask_or(a: PpMask, b: PpMask) -> PpMask {
+    PpMask { lo: a.lo | b.lo, hi: a.hi | b.hi }
+}
+
 fn split_masks(
     mut sampled_felts: Span<felt252>,
 ) -> (Span<Span<QM31>>, Span<Span<QM31>>, Span<Span<QM31>>) {
@@ -178,12 +221,12 @@ fn split_masks(
 
 /// Bit per preprocessed column that carries a sample — what the union of
 /// all groups' usage must equal (the split form of `validate_usage`).
-fn expected_pp_mask(mut pp: Span<Span<QM31>>) -> u128 {
-    let mut mask: u128 = 0;
+fn expected_pp_mask(mut pp: Span<Span<QM31>>) -> PpMask {
+    let mut mask = pp_mask_zero();
     let mut index: u32 = 0;
     for column in pp {
         if !SpanTrait::is_empty(*column) {
-            mask = mask | u128_bit(index);
+            mask = pp_mask_or(mask, pp_mask_bit(index));
         }
         index += 1;
     }
@@ -204,10 +247,10 @@ pub fn oods_begin(
         h.claim.partial_ec_mul_generic.is_none(), "Partial EC Mul Generic is not supported.",
     );
 
-    // Establish the sampled-section digest; the u128 usage mask must cover
-    // every preprocessed column.
+    // Establish the sampled-section digest; the 2-limb usage mask must
+    // cover every preprocessed column.
     let (pp, _trace, _interaction) = split_masks(sampled_felts);
-    assert!(SpanTrait::len(pp) <= 128, "more than 128 preprocessed columns");
+    assert!(SpanTrait::len(pp) <= 256, "more than 256 preprocessed columns");
 
     let mut channel = new_channel(digest_post_prologue);
     let random_coeff = channel.draw_secure_felt();
@@ -229,7 +272,7 @@ pub fn oods_begin(
         sums_done: 0,
         trace_done: 0,
         interaction_done: 0,
-        pp_used_mask: 0,
+        pp_used_mask: pp_mask_zero(),
         carry: array![],
         program_fact_hash,
     }
@@ -338,7 +381,7 @@ pub fn oods_group_epilogue(
 
     // This transaction's preprocessed-column usage bits.
     let PreprocessedMaskValues { values } = pp;
-    let mut used_mask: u128 = 0;
+    let mut used_mask = pp_mask_zero();
     for entry in values.squash().into_entries() {
         let (index, _first, last) = entry;
         match match_nullable(last) {
@@ -346,7 +389,7 @@ pub fn oods_group_epilogue(
             FromNullableResult::NotNull(boxed) => {
                 let (_value, used): (QM31, bool) = boxed.unbox();
                 if used {
-                    used_mask = used_mask | u128_bit(index.try_into().unwrap());
+                    used_mask = pp_mask_or(used_mask, pp_mask_bit(index.try_into().unwrap()));
                 }
             },
         }
@@ -382,7 +425,7 @@ pub fn oods_group_epilogue(
         sums_done: sums_total - SpanTrait::len(claimed_sums),
         trace_done: trace_total - SpanTrait::len(trace),
         interaction_done: interaction_total - SpanTrait::len(interaction),
-        pp_used_mask: pp_used_mask | used_mask,
+        pp_used_mask: pp_mask_or(pp_used_mask, used_mask),
         carry,
         program_fact_hash,
     }
@@ -413,6 +456,7 @@ pub fn family_verify_instruction(ref ctx: OodsGroupCtx) {
 }
 
 
+#[cfg(feature: "poseidon252_verifier")]
 pub fn family_builtins(ref ctx: OodsGroupCtx) {
     let OodsGroupCtx {
         head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
@@ -428,6 +472,131 @@ pub fn family_builtins(ref ctx: OodsGroupCtx) {
         head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
         interaction_total, sums_total, carry,
     };
+}
+
+// --- blake (qm31-pivot) build: per-component builtins families, in the
+// vendored `BuiltinComponentsImpl::new` construction/eval order. A stub
+// family asserts its claim is None — a None `try_new` consumes neither
+// claimed sums nor mask columns, so the stub is stream-exact while keeping
+// the (huge) unused component code out of the class.
+
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub fn family_add_mod_builtin(ref ctx: OodsGroupCtx) {
+    assert!(ctx.head.claim.add_mod_builtin.is_none(), "add_mod builtin unsupported");
+}
+
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub fn family_bitwise_builtin(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
+    } = ctx;
+    let component = components::bitwise_builtin::NewComponentImpl::try_new(
+        @head.claim.bitwise_builtin, ref claimed_sums, @elements,
+    );
+    if let Some(component) = component {
+        let public_data = @head.claim.public_data;
+        component
+            .evaluate_constraints_at_point(
+                ref sum, ref pp, ref trace, ref interaction, random_coeff,
+                [*public_data.public_memory.public_segments.bitwise.start_ptr.value].span(),
+            );
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub fn family_mul_mod_builtin(ref ctx: OodsGroupCtx) {
+    assert!(ctx.head.claim.mul_mod_builtin.is_none(), "mul_mod builtin unsupported");
+}
+
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub fn family_pedersen_builtin(ref ctx: OodsGroupCtx) {
+    // Mirrors the vendored `BuiltinComponentsImpl::new` precondition.
+    assert!(
+        ctx.head.claim.pedersen_builtin_narrow_windows.is_none(),
+        "pedersen narrow windows unsupported",
+    );
+    assert!(ctx.head.claim.pedersen_builtin.is_none(), "pedersen builtin unsupported");
+}
+
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub fn family_poseidon_builtin(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
+    } = ctx;
+    let component = components::poseidon_builtin::NewComponentImpl::try_new(
+        @head.claim.poseidon_builtin, ref claimed_sums, @elements,
+    );
+    if let Some(component) = component {
+        let public_data = @head.claim.public_data;
+        component
+            .evaluate_constraints_at_point(
+                ref sum, ref pp, ref trace, ref interaction, random_coeff,
+                [*public_data.public_memory.public_segments.poseidon.start_ptr.value].span(),
+            );
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub fn family_range_check_96_builtin(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
+    } = ctx;
+    let component = components::range_check96_builtin::NewComponentImpl::try_new(
+        @head.claim.range_check96_builtin, ref claimed_sums, @elements,
+    );
+    if let Some(component) = component {
+        let public_data = @head.claim.public_data;
+        component
+            .evaluate_constraints_at_point(
+                ref sum, ref pp, ref trace, ref interaction, random_coeff,
+                [*public_data.public_memory.public_segments.range_check_96.start_ptr.value]
+                    .span(),
+            );
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub fn family_range_check_128_builtin(ref ctx: OodsGroupCtx) {
+    let OodsGroupCtx {
+        head, elements, mut pp, mut trace, mut interaction, mut claimed_sums, mut sum,
+        random_coeff, trace_total, interaction_total, sums_total, carry,
+    } = ctx;
+    let component = components::range_check_builtin::NewComponentImpl::try_new(
+        @head.claim.range_check_builtin, ref claimed_sums, @elements,
+    );
+    if let Some(component) = component {
+        let public_data = @head.claim.public_data;
+        component
+            .evaluate_constraints_at_point(
+                ref sum, ref pp, ref trace, ref interaction, random_coeff,
+                [*public_data.public_memory.public_segments.range_check_128.start_ptr.value]
+                    .span(),
+            );
+    }
+    ctx = OodsGroupCtx {
+        head, elements, pp, trace, interaction, claimed_sums, sum, random_coeff, trace_total,
+        interaction_total, sums_total, carry,
+    };
+}
+
+#[cfg(not(feature: "poseidon252_verifier"))]
+pub fn family_ec_op_builtin(ref ctx: OodsGroupCtx) {
+    assert!(ctx.head.claim.ec_op_builtin.is_none(), "ec_op builtin unsupported");
 }
 
 

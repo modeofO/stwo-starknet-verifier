@@ -716,6 +716,7 @@ mod StwoOodsF11 {
     }
 }
 
+#[cfg(feature: "poseidon252_verifier")]
 #[starknet::contract]
 mod StwoOodsF12 {
     use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
@@ -738,6 +739,39 @@ mod StwoOodsF12 {
     }
 }
 
+// Blake build: the builtins sub-air as 8 per-component families (29..36) in
+// one class — the four unsupported builtins are is_none stubs, so only the
+// bitwise/poseidon/rc96/rc128 eval code is carried.
+#[cfg(not(feature: "poseidon252_verifier"))]
+#[starknet::contract]
+mod StwoOodsF12 {
+    use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
+    #[storage]
+    struct Storage {}
+    #[abi(embed_v0)]
+    impl Impl of IStwoOodsGroup<ContractState> {
+        fn run(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            sampled: Span<felt252>,
+        ) -> Array<felt252> {
+            let (state, mut ctx) = oods_chunks::oods_group_prologue(
+                deserialize_state(state), head, sampled, 29,
+            );
+            oods_chunks::family_add_mod_builtin(ref ctx);
+            oods_chunks::family_bitwise_builtin(ref ctx);
+            oods_chunks::family_mul_mod_builtin(ref ctx);
+            oods_chunks::family_pedersen_builtin(ref ctx);
+            oods_chunks::family_poseidon_builtin(ref ctx);
+            oods_chunks::family_range_check_96_builtin(ref ctx);
+            oods_chunks::family_range_check_128_builtin(ref ctx);
+            oods_chunks::family_ec_op_builtin(ref ctx);
+            serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 8))
+        }
+    }
+}
+
 #[starknet::contract]
 mod StwoOodsF13A1 {
     use super::{IStwoOodsGroup, deserialize_state, oods_chunks, serialize_state};
@@ -752,7 +786,7 @@ mod StwoOodsF13A1 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 30,
+                deserialize_state(state), head, sampled, 30 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_poseidon_aggregator_a1(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -774,7 +808,7 @@ mod StwoOodsF13A2 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 31,
+                deserialize_state(state), head, sampled, 31 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_poseidon_aggregator_a2(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -796,7 +830,7 @@ mod StwoOodsF13A3 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 32,
+                deserialize_state(state), head, sampled, 32 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_poseidon_aggregator_a3(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -818,7 +852,7 @@ mod StwoOodsF13B {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 33,
+                deserialize_state(state), head, sampled, 33 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_poseidon_aggregator_b(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -840,7 +874,7 @@ mod StwoOodsF14 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 34,
+                deserialize_state(state), head, sampled, 34 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_poseidon_3_partial_rounds_chain(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -862,7 +896,7 @@ mod StwoOodsF15 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 35,
+                deserialize_state(state), head, sampled, 35 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_poseidon_full_round_chain(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -884,7 +918,7 @@ mod StwoOodsF16A {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 36,
+                deserialize_state(state), head, sampled, 36 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_cube_252_a(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -906,7 +940,7 @@ mod StwoOodsF16B1 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 37,
+                deserialize_state(state), head, sampled, 37 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_cube_252_b1(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -928,7 +962,7 @@ mod StwoOodsF16B2 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 38,
+                deserialize_state(state), head, sampled, 38 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_cube_252_b2(ref ctx);
             serialize_state(oods_chunks::oods_group_epilogue(state, ctx, 1))
@@ -950,7 +984,7 @@ mod StwoOodsF17 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 39,
+                deserialize_state(state), head, sampled, 39 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_poseidon_round_keys(ref ctx);
             oods_chunks::family_range_check_252_width_27(ref ctx);
@@ -973,7 +1007,7 @@ mod StwoOodsF18 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 41,
+                deserialize_state(state), head, sampled, 41 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_memory_address_to_id(ref ctx);
             oods_chunks::family_memory_id_to_big(ref ctx);
@@ -998,7 +1032,7 @@ mod StwoOodsF19 {
             sampled: Span<felt252>,
         ) -> Array<felt252> {
             let (state, mut ctx) = oods_chunks::oods_group_prologue(
-                deserialize_state(state), head, sampled, 45,
+                deserialize_state(state), head, sampled, 45 + oods_chunks::FAMILY_SHIFT,
             );
             oods_chunks::family_verify_bitwise_xor_4(ref ctx);
             oods_chunks::family_verify_bitwise_xor_7(ref ctx);

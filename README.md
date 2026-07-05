@@ -185,13 +185,24 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   `claim_mix_blake` pausable blake2s absorbers, `split-witness --blake`)
   and the full blake machine sequence == monolithic on the real blake
   proof in snforge; poseidon suite still 30/30.
-- **Next:** re-derive the 49-family OODS split + class sizing on the
-  qm31 build (`scripts/size_classes.sh --blake`), blake transport
-  (emit-calldata + router drive), fri-section staging + constants store
-  decisions from blake measurements, the qm31 gate-probe re-test on
-  Starknet version bumps, Sepolia campaign under the registry's
-  governed route list; confirm the Controller envelope with a live
-  Sepolia session transaction.
+- **Blake OODS split + sizing: ALL 36 deployable classes fit
+  (2026-07-05)** — the canonical trace forced a 2-limb preprocessed
+  bitmask (161 columns) and the blake builtins family (8 components,
+  807k Sierra) is now 8 per-component families with loud `is_none`
+  stubs for the four builtins outside the program envelope (56 families
+  total, `FAMILY_SHIFT`). Measured on the qm31 build: the two
+  poseidon-lane killers collapse (mul 172k → 53.7k CASM, cube_252-A
+  180k → 58.9k CASM) and every deployable class clears all three caps
+  (`scripts/size_classes.sh --blake`). 56-family chunked == monolithic
+  on the real blake proof. **The blake machinery is
+  declare-shape-complete — only the gateway's qm31 gate blocks the
+  public network.**
+- **Next:** blake transport (emit-calldata blake port + a blake router
+  drive), fri-section staging + constants store decisions from blake
+  measurements (blake hashes pack 7:1 — fri staging may be
+  unnecessary), the qm31 gate-probe re-test on Starknet version bumps,
+  Sepolia campaign under the registry's governed route list; confirm
+  the Controller envelope with a live Sepolia session transaction.
 
 ## Layout
 
