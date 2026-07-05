@@ -307,13 +307,44 @@ Sizing findings that shaped the cuts (scarb 2.18.0):
 
 All 30 group classes + OodsBegin (11,880) + OodsFinalize (21,598) +
 StwoMachineClaim/Lookup/Group/Fri (29,251 / 20,731 / 27,335 / 28,386):
-**36 of 36 deployable classes under both caps** — the class-size
-problem is closed without waiting for the qm31 opcode (which remains a
-cost optimization watch item). `tests/test_oods_chunks.cairo`:
-49-family chunked == `machine_oods_mix` on the real proof with a serde
-round-trip between every pair of transactions (carry included), and a
-tampered carry felt between parts is rejected at the OODS equation
-("Invalid OODS eval").
+**36 of 36 deployable classes under both Sierra caps**.
+`tests/test_oods_chunks.cairo`: 49-family chunked ==
+`machine_oods_mix` on the real proof with a serde round-trip between
+every pair of transactions (carry included), and a tampered carry felt
+between parts is rejected at the OODS equation ("Invalid OODS eval").
+
+### Declare pre-flight: the third cap (devnet, 2026-07-05)
+
+There is a THIRD declare cap the scarb warnings don't check: the
+compiled CASM bytecode size (81,920 felts; measured with
+`universal-sierra-compiler` and confirmed by starknet-devnet 0.9.0
+declares — a 75,206-CASM class declares, 172k+ is rejected with
+"Contract class size is too large"). Findings:
+
+- The CASM/Sierra felt ratio is **not uniform: 0.68–2.90 by instruction
+  mix.** Logup/combine-heavy code COMPRESSES (blake_round B 0.68×);
+  252-bit-multiplication code EXPLODES (~2.8×) — the mul_252 /
+  verify_mul_252 / karatsuba subroutine family.
+- Those subroutines compile as **shared Sierra functions** (one copy per
+  class, confirmed via `sierra_program_debug_info.user_func_names`), so
+  seam-fork statement cuts cannot shrink a class below the size of the
+  biggest subroutine it calls — every part calling `mul_252_evaluate`
+  carries all of it.
+- **Devnet declares: 35 of 37 classes declared successfully** (the 34
+  machine/OODS/router classes plus F18 and F05B), including the router
+  and every phase of the fixture flow EXCEPT two: `StwoOodsF05A`
+  (mul_opcode, 63,647 Sierra / 172,130 CASM) and `StwoOodsF16A`
+  (cube_252 half A, 61,908 Sierra / 179,655 CASM) — both dominated by
+  the shared 252-bit-mul subroutines.
+
+The two blocked classes are exactly the shape the **qm31 opcode**
+watch item fixes (the bounded_int lowering of QM31 multiplication is
+what makes those subroutines huge); the alternative — forking the
+subroutine INTERNALS with carry-connected halves — is deliberately not
+pursued (deep surgery, shared across components, superseded the day the
+opcode lands in `audited.json`). Until then the fixture flow cannot run
+end-to-end on a public network; everything else (49-family OODS,
+router, transport) is declare-ready.
 
 With merging of small neighbours the eventual OODS phase is ~10–12
 group txs; today's fine-grained shape is 32 (begin + 30 groups +

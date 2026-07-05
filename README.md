@@ -149,10 +149,21 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   section (8,873 slots → needs lane-1-style write-once staging) and
   16-query group rows (7,983 → needs the settled constants store or
   ~4-query groups) — both already scoped in the design doc.
+- **Devnet declare pre-flight done (2026-07-05): 35 of 37 classes
+  declare** — including the router and every phase class. A third cap
+  surfaced beyond the two Sierra caps: compiled CASM bytecode (81,920
+  felts), with a wildly non-uniform CASM/Sierra ratio (0.68–2.9× by
+  instruction mix). Two classes fail it: mul_opcode (172k CASM) and
+  cube_252 half A (180k CASM), both dominated by the shared
+  mul_252/karatsuba subroutines (252-bit mul under bounded_int
+  emulation) — shared Sierra functions, so seam-fork cuts can't shrink
+  them further. **These two now carry the qm31-opcode dependency**; all
+  other machinery is declare-ready. See "Declare pre-flight" in
+  [`docs/lane2-design.md`](./docs/lane2-design.md).
 - **Next:** fri-section staging + the one-time constants store (the two
-  calldata-cap items), devnet declares + pre-flight, Sepolia campaign
-  under the registry's governed route list; confirm the Controller
-  envelope with a live Sepolia session transaction.
+  calldata-cap items), qm31-opcode watch for the last two classes,
+  Sepolia campaign under the registry's governed route list; confirm
+  the Controller envelope with a live Sepolia session transaction.
 
 ## Layout
 
