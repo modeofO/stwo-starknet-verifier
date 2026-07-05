@@ -796,19 +796,37 @@ fn emit_calldata(
     out_dir: &PathBuf,
     chunk_entries: usize,
     group_size: usize,
+    blake: bool,
 ) -> Result<(), Error> {
-    use stwo_cairo_serialize::CairoSerialize;
-
     eprintln!("reading extended proof from {}", extended_proof_path.display());
     let bytes = std::fs::read(extended_proof_path)?;
-    let proof: PoseidonCairoProof = serde_json::from_slice(&bytes)?;
+    if blake {
+        let proof: BlakeCairoProof = serde_json::from_slice(&bytes)?;
+        emit_calldata_impl(&proof, out_dir, chunk_entries, group_size)
+    } else {
+        let proof: PoseidonCairoProof = serde_json::from_slice(&bytes)?;
+        emit_calldata_impl(&proof, out_dir, chunk_entries, group_size)
+    }
+}
+
+fn emit_calldata_impl<H: stwo::core::vcs_lifted::MerkleHasherLifted>(
+    proof: &CairoProof<H>,
+    out_dir: &PathBuf,
+    chunk_entries: usize,
+    group_size: usize,
+) -> Result<(), Error>
+where
+    H::Hash: stwo_cairo_serialize::CairoSerialize,
+{
+    use stwo_cairo_serialize::CairoSerialize;
+
     let scheme_proof = &proof.extended_stark_proof.proof.0;
     let aux = &proof.extended_stark_proof.aux;
 
     // The reference: the full cairo-serde stream (what pack_proof.py packs
     // into the committed fixture).
     let mut full: Vec<FieldElement252> = Vec::new();
-    CairoSerialize::serialize(&proof, &mut full);
+    CairoSerialize::serialize(proof, &mut full);
     eprintln!("full cairo-serde stream: {} felts", full.len());
 
     // --- per-section streams (must concatenate to `full`) ----------------
@@ -943,7 +961,11 @@ fn emit_calldata(
             let witness =
                 synthesize_witness(&tree_positions, &aux.trace_decommitment[tree_index])?;
             witnesses.push(witness.len().into());
-            witnesses.extend_from_slice(&witness);
+            // Per-hash CairoSerialize: one felt per poseidon hash, 8 LE u32
+            // words per blake hash — the vendored `Serde<Hash>` layout.
+            for hash in &witness {
+                CairoSerialize::serialize(hash, &mut witnesses);
+            }
         }
         groups.push(serde_json::json!({
             "rows": write_packed(out_dir, &format!("group_{group:02}_rows.txt"), &rows)?,
@@ -1129,13 +1151,23 @@ fn main() -> Result<(), Error> {
             split_witness(&extended_in, &out_dir, group_size, blake)?;
         }
         Some("emit-calldata") => {
-            let extended_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;
-            let out_dir = argv.get(2).map(PathBuf::from).ok_or(usage)?;
+            // Optional `--blake` flag, as in split-witness.
+            let mut positional: Vec<String> = Vec::new();
+            let mut blake = false;
+            for arg in argv.iter().skip(1) {
+                if arg == "--blake" {
+                    blake = true;
+                } else {
+                    positional.push(arg.clone());
+                }
+            }
+            let extended_in = positional.first().map(PathBuf::from).ok_or(usage)?;
+            let out_dir = positional.get(1).map(PathBuf::from).ok_or(usage)?;
             let chunk_entries: usize =
-                argv.get(3).map(|s| s.parse()).transpose()?.unwrap_or(540);
+                positional.get(2).map(|s| s.parse()).transpose()?.unwrap_or(540);
             let group_size: usize =
-                argv.get(4).map(|s| s.parse()).transpose()?.unwrap_or(16);
-            emit_calldata(&extended_in, &out_dir, chunk_entries, group_size)?;
+                positional.get(3).map(|s| s.parse()).transpose()?.unwrap_or(16);
+            emit_calldata(&extended_in, &out_dir, chunk_entries, group_size, blake)?;
         }
         Some("wrap-app") => {
             let proof_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;

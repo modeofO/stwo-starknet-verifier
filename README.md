@@ -197,12 +197,19 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   on the real blake proof. **The blake machinery is
   declare-shape-complete — only the gateway's qm31 gate blocks the
   public network.**
-- **Next:** blake transport (emit-calldata blake port + a blake router
-  drive), fri-section staging + constants store decisions from blake
-  measurements (blake hashes pack 7:1 — fri staging may be
-  unnecessary), the qm31 gate-probe re-test on Starknet version bumps,
-  Sepolia campaign under the registry's governed route list; confirm
-  the Controller envelope with a live Sepolia session transaction.
+- **Blake transport measured** — `emit-calldata --blake` (emitter
+  genericized over the Merkle hasher, self-checks pass): head 69 /
+  chunks ≤781 / sampled 2,617 slots as before; the fri section packs
+  7:1 (56,311 u32-word felts) but still lands at **8,045 slots > the
+  ~4,996 cap — fri staging stays**; group rows 8,111 → the constants
+  store / smaller groups stays. Both transport work items survive the
+  pivot unchanged.
+- **Next:** fri-section write-once staging + the one-time constants
+  store (the two calldata-cap items, now confirmed under blake), a
+  blake router drive in snforge, the qm31 gate-probe re-test on
+  Starknet version bumps, Sepolia campaign under the registry's
+  governed route list; confirm the Controller envelope with a live
+  Sepolia session transaction.
 
 ## Layout
 

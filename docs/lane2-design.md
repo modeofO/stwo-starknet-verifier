@@ -500,6 +500,16 @@ Two blake-specific findings and their fixes, then the measured verdict:
   monolithic measurement classes (StwoFullPhaseB, StwoMachineOods)
   exceed caps. **The blake machinery is declare-shape-complete**; what
   blocks the public network remains only the gateway's qm31 gate.
+- **Blake transport measured (`emit-calldata --blake`, all self-checks
+  pass):** head 69 slots, program chunks ≤781, sampled 2,617 — same
+  shape as poseidon. The fri section is 56,311 felts (vs poseidon's
+  10,413) but they're u32 words that pack 7:1 → **8,045 slots — still
+  over the ~4,996 cap, so the "fri staging may be unnecessary under
+  blake" hypothesis is REFUTED**: lane-1-style write-once staging (~2
+  txs) stays on the plan. Group rows at 16 queries: 8,111 slots — the
+  one-time constants store (or ~8-query groups) also carries over.
+  Both transport work items survive the pivot with near-identical
+  numbers.
 
 ## The router (built 2026-07-05, `src/router.cairo`)
 
