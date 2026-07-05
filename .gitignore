@@ -14,4 +14,7 @@ profile*.pb.gz
 
 # Regenerable large fixture (prove-poseidon --extended; deterministic, ~6 MB)
 fixtures/poseidon_chain_n100.extended_proof.json
+# Regenerable blake-channel fixtures (prove-blake; deterministic, ~13 MB)
+fixtures/poseidon_chain_n100.blake_proof_serde.json
+fixtures/poseidon_chain_n100.blake_extended_proof.json
 __pycache__/

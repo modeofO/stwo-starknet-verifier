@@ -35,6 +35,20 @@
 //!       `ExtendedStarkProof.aux`: per-layer Merkle node values + FRI aux) as
 //!       serde JSON — the input to `split-witness`.
 //!
+//!   prove-blake <task> <proof_out.json> <params.json> [program_args.json] [--extended <extended_out.json>]
+//!       LANE 2, qm31 pivot. Same flow as prove-poseidon but with the PLAIN
+//!       blake2s channel (`Blake2sMerkleChannel`): the vendored verifier's
+//!       default build keeps raw blake2s digests (only DRAWS reduce mod M31,
+//!       identically in both Rust variants), so `Blake2sM31MerkleChannel` —
+//!       whose per-hash M31 output reduction exists for the recursion
+//!       circuits — does NOT match it (measured: interaction PoW fails).
+//!       Params: fixtures/prover_params_blake.json — identical PCS shape to
+//!       the poseidon params (70 queries, blowup 1, fold_step 1) so all
+//!       lane-2 section-map assumptions carry over, but preprocessed_trace
+//!       MUST be "canonical" (the default build pins the WITH-pedersen
+//!       root). Emits cairo-serde felts for the qm31-opcode verifier build;
+//!       --extended dumps the aux for split-witness / emit-calldata.
+//!
 //!   split-witness <extended_proof.json> <out_dir> [group_size]
 //!       LANE 2 witness splitter. Synthesizes per-query-group Merkle
 //!       decommitments from `ExtendedStarkProof.aux` (no re-proving: the
@@ -923,6 +937,7 @@ fn main() -> Result<(), Error> {
         privacy_prove_cairo_bridge wrap <cairo_proof.json> <preimage.json> <proof_out.json>\n  \
         privacy_prove_cairo_bridge wrap-app <cairo_proof.json> <proof_out.json>\n  \
         privacy_prove_cairo_bridge prove-poseidon <task> <proof_out.json> <params.json> [program_args.json] [--extended <extended_out.json>]\n  \
+        privacy_prove_cairo_bridge prove-blake <task> <proof_out.json> <params.json> [program_args.json] [--extended <extended_out.json>]\n  \
         privacy_prove_cairo_bridge split-witness <extended_proof.json> <out_dir> [group_size]\n  \
         privacy_prove_cairo_bridge emit-calldata <extended_proof.json> <out_dir> [chunk_entries] [group_size]\n  \
         privacy_prove_cairo_bridge [full] <task.pie.zip|task.executable.json> <proof_out.json> [preimage_out.json] [program_args.json]";
@@ -990,6 +1005,56 @@ fn main() -> Result<(), Error> {
             );
             let cairo_proof =
                 prove_cairo::<Poseidon252MerkleChannel>(prover_input, proof_params)?;
+            serialize_proof_to_file(&cairo_proof, &proof_out, ProofFormat::CairoSerde)?;
+            eprintln!("wrote cairo-serde proof to {}", proof_out.display());
+            if let Some(extended_path) = extended_out {
+                let json = serde_json::to_vec(&cairo_proof)?;
+                std::fs::write(&extended_path, &json)?;
+                eprintln!(
+                    "wrote extended proof with aux ({:.1} MB) to {}",
+                    json.len() as f64 / 1e6,
+                    extended_path.display()
+                );
+            }
+            eprintln!(
+                "output preimage: {:?}",
+                output_preimage.iter().map(|f| format!("0x{f:x}")).collect::<Vec<_>>()
+            );
+        }
+        Some("prove-blake") => {
+            // Identical flow to prove-poseidon, plain blake2s channel (the
+            // vendored verifier's default build; see the doc comment above —
+            // Blake2sM31 does NOT match it).
+            let mut positional: Vec<String> = Vec::new();
+            let mut extended_out: Option<PathBuf> = None;
+            let mut iter = argv.iter().skip(1);
+            while let Some(arg) = iter.next() {
+                if arg == "--extended" {
+                    extended_out =
+                        Some(PathBuf::from(iter.next().ok_or("--extended needs a path")?));
+                } else {
+                    positional.push(arg.clone());
+                }
+            }
+            let task = positional.first().map(PathBuf::from).ok_or(usage)?;
+            let proof_out = positional.get(1).map(PathBuf::from).ok_or(usage)?;
+            let params = positional.get(2).map(PathBuf::from).ok_or(usage)?;
+            let args_file = positional.get(3).map(PathBuf::from);
+
+            let proof_params: ProverParameters =
+                serde_json::from_str(&std::fs::read_to_string(&params)?)?;
+            let ChannelHash::Blake2s = proof_params.channel_hash else {
+                return Err("prove-blake expects blake2s channel params".into());
+            };
+            let (prover_input, output_preimage) = bootloader_stage(&task, args_file)?;
+            eprintln!(
+                "[prove 2/2] stwo-proving with params {} (cairo-serde output)",
+                params.display()
+            );
+            let started = std::time::Instant::now();
+            let cairo_proof =
+                prove_cairo::<Blake2sMerkleChannel>(prover_input, proof_params)?;
+            eprintln!("proved in {:.1} s", started.elapsed().as_secs_f64());
             serialize_proof_to_file(&cairo_proof, &proof_out, ProofFormat::CairoSerde)?;
             eprintln!("wrote cairo-serde proof to {}", proof_out.display());
             if let Some(extended_path) = extended_out {

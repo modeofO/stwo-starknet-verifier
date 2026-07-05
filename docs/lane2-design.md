@@ -381,6 +381,55 @@ With merging of small neighbours the eventual OODS phase is ~10–12
 group txs; today's fine-grained shape is 32 (begin + 30 groups +
 finalize).
 
+### The qm31 pivot, measured end-to-end (2026-07-05)
+
+All of the pivot's prep is local (snforge executes qm31 libfuncs —
+proven by `tools/qm31-gate-probe`'s own test suite — so only the public
+declare is gateway-gated). Measured this session:
+
+- **Blake proof fixture**: `prove-blake` in the bridge (mirrors
+  prove-poseidon; cairo-serde + `--extended`). Two configuration traps,
+  both found empirically: the vendored default build expects the PLAIN
+  `blake2s` channel — `blake2s_m31`'s per-hash M31 output reduction is
+  for the recursion circuits and fails the interaction PoW — and it pins
+  the `canonical` (WITH-pedersen) preprocessed root, not
+  `canonical_without_pedersen`. Params otherwise identical to poseidon
+  (70 queries, blowup 1, fold_step 1): `fixtures/prover_params_blake.json`.
+- **Client proving collapses ~45×: 6 s wall / 14.1 GB peak** (vs 257 s /
+  11.3 GB poseidon). Same output preimage — same statement, new channel.
+  Peak memory RISES slightly (the canonical trace carries the pedersen
+  columns); proof = **376,275 cairo-serde felts** (vs 301,143) but
+  blake hashes are 8×u32 words that pack ~7:1 in packed-v2, where
+  poseidon hashes were unpackable full felts.
+- **Verification: 26,603,848 steps** (2.19M range_check, 16 bitwise) —
+  the full vendored verifier, qm31_opcode build, over the real blake
+  proof (`tools/lane2-probe --features qm31_opcode,blake_outputs_packing`;
+  note the vendored `features_check` REQUIRES qm31_opcode outside the
+  poseidon build, so there is no non-opcode blake baseline). Down 22%
+  from poseidon's 34.2M — NOT the hoped collapse. Where it went, per
+  stage (Δ steps, poseidon → blake+qm31):
+
+  | Block | poseidon | blake+qm31 |
+  |---|---|---|
+  | 0 serde deserialization | 4.96M | 5.88M (bigger stream) |
+  | 1 verify_claim | 0.01M | 0.01M |
+  | 2 FS prologue + lookup_sum | 10.26M | 7.26M |
+  | 3 composition/OODS eval | 1.72M | **0.15M** (pure QM31 → opcode) |
+  | 4 mix + FRI commit | 0.25M | 0.30M |
+  | 5 Merkle decommits | 1.62M | 1.04M |
+  | 6 fri_answers | 12.75M | 9.93M |
+  | 7 FRI folding walk | 2.56M | 2.03M |
+  | **total** | **34.1M** | **26.6M** |
+
+  The opcode annihilates the arithmetic-dominated stage (OODS eval,
+  11×) — and QM31 div/inverse IS opcode-backed — but fri_answers and
+  the prologue are bookkeeping-dominated (span walks, M31 reads,
+  per-query position handling), and deserialization grew with the
+  stream. **Compute budget ≈ 8–9 pure invokes** at 375 gas/step ≈
+  10.0e9 gas (vs 11 poseidon) — the tx-count win must come from the
+  OODS phase merging (the component evals shrink ~5× in CASM) and
+  cheaper transport, not from raw steps.
+
 ## The router (built 2026-07-05, `src/router.cairo`)
 
 `StwoVerifierRouter` (6,103 Sierra felts) is the production contract that

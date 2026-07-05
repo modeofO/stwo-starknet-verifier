@@ -15,3 +15,18 @@
   (verified at 3,814,641 steps).
 - `poseidon_chain_n100.output_preimage.json` — the bootloader output preimage
   `[n_tasks, output_len, program_hash, output]` for that proof.
+- `prover_params_blake.json` — prover parameters for the qm31-pivot (blake2s
+  channel) verifier configuration: identical PCS shape to the poseidon params
+  (70 queries, blowup 1, fold_step 1) but PLAIN `blake2s` channel (NOT
+  `blake2s_m31`; the vendored default build keeps raw blake digests) and
+  `canonical` preprocessed trace (the default build pins the WITH-pedersen
+  root). Regenerate the gitignored blake fixtures (~6 s wall, 14.1 GB peak,
+  deterministic):
+
+  ```sh
+  .prover/proving-utils/target/release/privacy_prove_cairo_bridge prove-blake \
+      fixtures/target/dev/poseidon_chain.executable.json \
+      fixtures/poseidon_chain_n100.blake_proof_serde.json \
+      fixtures/prover_params_blake.json fixtures/poseidon_chain_args_100.json \
+      --extended fixtures/poseidon_chain_n100.blake_extended_proof.json
+  ```
