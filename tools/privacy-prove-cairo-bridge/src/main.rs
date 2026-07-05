@@ -45,6 +45,33 @@
 //!       layout). Self-check: the witness synthesized for the FULL query set
 //!       must equal the proof's own `hash_witness` per tree, byte for byte.
 //!
+//!   emit-calldata <extended_proof.json> <out_dir> [chunk_entries] [group_size]
+//!       LANE 2 per-transaction calldata emitter for the StwoVerifierRouter
+//!       (contracts/stwo_full_verifier_phases/src/router.cairo). Emits, all
+//!       packed v2 (one felt per line, hex):
+//!         head.txt            — head surgery: the claim with its program
+//!                               truncated to the 6-entry prefix verify_claim
+//!                               reads, + interaction pow + interaction claim
+//!                               + pcs config + commitments + queries-PoW
+//!                               nonce + channel salt;
+//!         chunk_NN.txt        — program-entry chunks (serde MemorySection
+//!                               slices; the claim AND lookup phases replay
+//!                               the same files at the same boundaries);
+//!         sampled.txt         — the sampled-values section;
+//!         fri.txt             — the FriProof section;
+//!         group_NN_rows.txt / group_NN_witnesses.txt
+//!                             — per query group: queried-value row slices
+//!                               (Array<Span<M31>> serde) and synthesized
+//!                               per-tree Merkle witnesses
+//!                               (Array<Span<felt252>> serde);
+//!         manifest.json       — file list in call order with the unpacked
+//!                               n_values every router argument needs.
+//!       Self-checks: the per-section serializations must concatenate to
+//!       exactly the proof's full cairo-serde stream, the chunk entry felts
+//!       must reproduce the claim's program section, and the synthesized
+//!       full-set witnesses must equal the proof's own (as in
+//!       split-witness).
+//!
 //!   full <task> <proof_out.json> [preimage_out.json] [program_args.json]
 //!       Legacy one-shot: prove + wrap in memory. Also the default when the
 //!       first argument is not a subcommand (backwards compatible).
@@ -641,6 +668,253 @@ fn split_witness(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Lane-2 per-transaction calldata emitter (router transport).
+
+/// The head's claim carries exactly the program prefix `verify_claim` reads
+/// (mirror of `machine.cairo::HEAD_PROGRAM_ENTRIES`).
+const HEAD_PROGRAM_ENTRIES: usize = 6;
+
+const U32_MAX_LIMB: u64 = 0xFFFF_FFFF;
+const FELT_ESCAPE_LIMB: u64 = 0xFFFF_FFFE;
+
+/// Packing v2 — mirror of `scripts/pack_proof.py --v2` and the contract's
+/// `unpack_proof_v2`: 7 LE u32 limbs per felt252 slot; `0xFFFFFFFF` escapes
+/// a (lo, hi) u64 pair (any value in [0xFFFFFFFE, 2^64)); `0xFFFFFFFE`
+/// escapes a full felt252 as 8 LE u32 limbs.
+fn pack_v2(values: &[FieldElement252]) -> Vec<FieldElement252> {
+    let mut limbs: Vec<u64> = Vec::new();
+    for value in values {
+        let bytes = value.to_bytes_be(); // 32 bytes, big-endian
+        let mut words = [0u64; 4]; // LE u64 words
+        for (i, chunk) in bytes.rchunks(8).enumerate() {
+            let mut w = [0u8; 8];
+            w[8 - chunk.len()..].copy_from_slice(chunk);
+            words[i] = u64::from_be_bytes(w);
+        }
+        if words[1] == 0 && words[2] == 0 && words[3] == 0 {
+            let v = words[0];
+            if v < FELT_ESCAPE_LIMB {
+                limbs.push(v);
+            } else {
+                limbs.push(U32_MAX_LIMB);
+                limbs.push(v & U32_MAX_LIMB);
+                limbs.push(v >> 32);
+            }
+        } else {
+            limbs.push(FELT_ESCAPE_LIMB);
+            for k in 0..8 {
+                limbs.push((words[k / 2] >> (32 * (k % 2))) & U32_MAX_LIMB);
+            }
+        }
+    }
+    limbs
+        .chunks(7)
+        .map(|chunk| {
+            let mut slot = FieldElement252::ZERO;
+            let mut shift = FieldElement252::ONE;
+            let two_pow_32 = FieldElement252::from(1u64 << 32);
+            for limb in chunk {
+                slot += FieldElement252::from(*limb) * shift;
+                shift *= two_pow_32;
+            }
+            slot
+        })
+        .collect()
+}
+
+fn write_packed(
+    out_dir: &PathBuf,
+    name: &str,
+    values: &[FieldElement252],
+) -> Result<serde_json::Value, Error> {
+    let packed = pack_v2(values);
+    let lines: Vec<String> = packed.iter().map(|f| format!("0x{f:x}")).collect();
+    std::fs::write(out_dir.join(name), lines.join("\n") + "\n")?;
+    Ok(serde_json::json!({
+        "file": name,
+        "n_values": values.len(),
+        "packed_slots": packed.len(),
+    }))
+}
+
+fn emit_calldata(
+    extended_proof_path: &PathBuf,
+    out_dir: &PathBuf,
+    chunk_entries: usize,
+    group_size: usize,
+) -> Result<(), Error> {
+    use stwo_cairo_serialize::CairoSerialize;
+
+    eprintln!("reading extended proof from {}", extended_proof_path.display());
+    let bytes = std::fs::read(extended_proof_path)?;
+    let proof: PoseidonCairoProof = serde_json::from_slice(&bytes)?;
+    let scheme_proof = &proof.extended_stark_proof.proof.0;
+    let aux = &proof.extended_stark_proof.aux;
+
+    // The reference: the full cairo-serde stream (what pack_proof.py packs
+    // into the committed fixture).
+    let mut full: Vec<FieldElement252> = Vec::new();
+    CairoSerialize::serialize(&proof, &mut full);
+    eprintln!("full cairo-serde stream: {} felts", full.len());
+
+    // --- per-section streams (must concatenate to `full`) ----------------
+    let ser = |f: &dyn Fn(&mut Vec<FieldElement252>)| {
+        let mut out = Vec::new();
+        f(&mut out);
+        out
+    };
+    let claim_felts = ser(&|out| CairoSerialize::serialize(&proof.claim, out));
+    let mid_felts = ser(&|out| {
+        CairoSerialize::serialize(&proof.interaction_pow, out);
+        CairoSerialize::serialize(&proof.interaction_claim.flatten_interaction_claim(), out);
+        CairoSerialize::serialize(&scheme_proof.config, out);
+        CairoSerialize::serialize(&*scheme_proof.commitments, out);
+    });
+    let sampled_felts = ser(&|out| CairoSerialize::serialize(&*scheme_proof.sampled_values, out));
+    let decommitments_felts =
+        ser(&|out| CairoSerialize::serialize(&*scheme_proof.decommitments, out));
+    let trace_and_interaction_trace_log_sizes = proof.claim.log_sizes();
+    let sorted_queried_values = sort_and_transpose_queried_values(
+        &scheme_proof.queried_values,
+        trace_and_interaction_trace_log_sizes.iter().map(|c| c.as_slice()).collect(),
+    );
+    let queried_felts = ser(&|out| CairoSerialize::serialize(&*sorted_queried_values, out));
+    let nonce_felts = ser(&|out| CairoSerialize::serialize(&scheme_proof.proof_of_work, out));
+    let fri_felts = ser(&|out| CairoSerialize::serialize(&scheme_proof.fri_proof, out));
+    let salt_felts = ser(&|out| CairoSerialize::serialize(&proof.channel_salt, out));
+
+    let concatenated: Vec<FieldElement252> = [
+        claim_felts.as_slice(),
+        mid_felts.as_slice(),
+        sampled_felts.as_slice(),
+        decommitments_felts.as_slice(),
+        queried_felts.as_slice(),
+        nonce_felts.as_slice(),
+        fri_felts.as_slice(),
+        salt_felts.as_slice(),
+    ]
+    .concat();
+    if concatenated != full {
+        return Err("per-section streams do not concatenate to the full proof stream".into());
+    }
+    eprintln!("section self-check passed: per-section streams == full stream");
+
+    // --- head surgery -----------------------------------------------------
+    let mut head_claim = proof.claim.clone();
+    head_claim.public_data.public_memory.program.truncate(HEAD_PROGRAM_ENTRIES);
+    let mut head: Vec<FieldElement252> = Vec::new();
+    CairoSerialize::serialize(&head_claim, &mut head);
+    head.extend_from_slice(&mid_felts);
+    head.extend_from_slice(&nonce_felts);
+    head.extend_from_slice(&salt_felts);
+
+    // --- program-entry chunks ---------------------------------------------
+    let program = &proof.claim.public_data.public_memory.program;
+    let program_len = program.len();
+    // Chunk self-check: the chunk entry felts (minus the per-chunk length
+    // prefixes) must reproduce the claim's program section.
+    let program_felts = ser(&|out| CairoSerialize::serialize(program.as_slice(), out));
+    let mut replayed: Vec<FieldElement252> = vec![program_felts[0]];
+    let mut chunk_streams: Vec<Vec<FieldElement252>> = Vec::new();
+    let mut offset = 0usize;
+    while offset != program_len {
+        let n = usize::min(chunk_entries, program_len - offset);
+        let chunk = ser(&|out| CairoSerialize::serialize(&program[offset..offset + n], out));
+        replayed.extend_from_slice(&chunk[1..]); // drop the chunk length prefix
+        chunk_streams.push(chunk);
+        offset += n;
+    }
+    if replayed != program_felts {
+        return Err("chunk streams do not reproduce the program section".into());
+    }
+
+    // --- query groups (rows + synthesized witnesses, router serde) ---------
+    let positions = sorted_dedup(aux.unsorted_query_locations.clone());
+    let n_queries = positions.len();
+    let heights: Vec<u32> =
+        aux.trace_decommitment.iter().map(|t| t.all_node_values.len() as u32).collect();
+    let lifting_log_size = heights[1];
+    let pp_max_log_size = heights[0];
+    let n_trees = scheme_proof.decommitments.len();
+    for tree_index in 0..n_trees {
+        let tree_positions =
+            tree_query_positions(tree_index, &positions, lifting_log_size, pp_max_log_size);
+        let synthesized =
+            synthesize_witness(&tree_positions, &aux.trace_decommitment[tree_index])?;
+        if &synthesized != &scheme_proof.decommitments[tree_index].hash_witness {
+            return Err(format!("full-set witness mismatch on tree {tree_index}").into());
+        }
+    }
+    let strides: Vec<usize> =
+        scheme_proof.queried_values.iter().map(|tree_cols| tree_cols.len()).collect();
+
+    std::fs::create_dir_all(out_dir)?;
+    let mut manifest = serde_json::Map::new();
+    manifest.insert("program_len".into(), program_len.into());
+    manifest.insert("chunk_entries".into(), chunk_entries.into());
+    manifest.insert("group_size".into(), group_size.into());
+    manifest.insert("head".into(), write_packed(out_dir, "head.txt", &head)?);
+    manifest.insert("sampled".into(), write_packed(out_dir, "sampled.txt", &sampled_felts)?);
+    manifest.insert("fri".into(), write_packed(out_dir, "fri.txt", &fri_felts)?);
+
+    let mut chunks = Vec::new();
+    for (index, chunk) in chunk_streams.iter().enumerate() {
+        chunks.push(write_packed(out_dir, &format!("chunk_{index:02}.txt"), chunk)?);
+    }
+    manifest.insert("chunks".into(), chunks.into());
+
+    let n_groups = n_queries.div_ceil(group_size);
+    let mut groups = Vec::new();
+    for group in 0..n_groups {
+        let start = group * group_size;
+        let end = usize::min(start + group_size, n_queries);
+        let group_positions = &positions[start..end];
+
+        // rows: Array<Span<M31>> serde — n_trees, then per tree len + values.
+        let mut rows: Vec<FieldElement252> = vec![n_trees.into()];
+        for (tree_index, stride) in strides.iter().enumerate() {
+            let tree_rows = &sorted_queried_values[tree_index][start * stride..end * stride];
+            rows.push(tree_rows.len().into());
+            rows.extend(tree_rows.iter().map(|m| FieldElement252::from(m.0)));
+        }
+        // witnesses: Array<Span<felt252>> serde.
+        let mut witnesses: Vec<FieldElement252> = vec![n_trees.into()];
+        for tree_index in 0..n_trees {
+            let tree_positions = tree_query_positions(
+                tree_index,
+                group_positions,
+                lifting_log_size,
+                pp_max_log_size,
+            );
+            let witness =
+                synthesize_witness(&tree_positions, &aux.trace_decommitment[tree_index])?;
+            witnesses.push(witness.len().into());
+            witnesses.extend_from_slice(&witness);
+        }
+        groups.push(serde_json::json!({
+            "rows": write_packed(out_dir, &format!("group_{group:02}_rows.txt"), &rows)?,
+            "witnesses": write_packed(
+                out_dir,
+                &format!("group_{group:02}_witnesses.txt"),
+                &witnesses,
+            )?,
+        }));
+    }
+    manifest.insert("groups".into(), groups.into());
+
+    let manifest_path = out_dir.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    eprintln!(
+        "emitted head + {} chunks + sampled + fri + {} groups to {} (manifest: {})",
+        chunk_streams.len(),
+        n_groups,
+        out_dir.display(),
+        manifest_path.display()
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Error> {
     tracing_subscriber::fmt().init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -650,6 +924,7 @@ fn main() -> Result<(), Error> {
         privacy_prove_cairo_bridge wrap-app <cairo_proof.json> <proof_out.json>\n  \
         privacy_prove_cairo_bridge prove-poseidon <task> <proof_out.json> <params.json> [program_args.json] [--extended <extended_out.json>]\n  \
         privacy_prove_cairo_bridge split-witness <extended_proof.json> <out_dir> [group_size]\n  \
+        privacy_prove_cairo_bridge emit-calldata <extended_proof.json> <out_dir> [chunk_entries] [group_size]\n  \
         privacy_prove_cairo_bridge [full] <task.pie.zip|task.executable.json> <proof_out.json> [preimage_out.json] [program_args.json]";
 
     match argv.first().map(String::as_str) {
@@ -737,6 +1012,15 @@ fn main() -> Result<(), Error> {
             let group_size: usize =
                 argv.get(3).map(|s| s.parse()).transpose()?.unwrap_or(16);
             split_witness(&extended_in, &out_dir, group_size)?;
+        }
+        Some("emit-calldata") => {
+            let extended_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;
+            let out_dir = argv.get(2).map(PathBuf::from).ok_or(usage)?;
+            let chunk_entries: usize =
+                argv.get(3).map(|s| s.parse()).transpose()?.unwrap_or(540);
+            let group_size: usize =
+                argv.get(4).map(|s| s.parse()).transpose()?.unwrap_or(16);
+            emit_calldata(&extended_in, &out_dir, chunk_entries, group_size)?;
         }
         Some("wrap-app") => {
             let proof_in = argv.get(1).map(PathBuf::from).ok_or(usage)?;

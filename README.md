@@ -140,8 +140,17 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   total, ~470M/tx average — under the 1.21e9 per-invoke cap), fact
   registered; proof-id reuse / wrong-tag / tampered-state all rejected.
   29/29 tests green.
-- **Next:** bridge-side per-tx calldata emitter (head surgery + chunks +
-  groups, packed v2), devnet declares + pre-flight, Sepolia campaign
+- **Calldata emitter shipped (2026-07-05)** — `emit-calldata` in the
+  bridge: per-tx packed-v2 router transport (head surgery, program
+  chunks, sampled/fri, per-group rows + synthesized witnesses,
+  manifest), self-checking against the proof's own cairo-serde stream
+  and cross-validated byte-for-byte in snforge (30/30 tests green).
+  Measured vs the ~5k-felt calldata cap: everything fits except the fri
+  section (8,873 slots → needs lane-1-style write-once staging) and
+  16-query group rows (7,983 → needs the settled constants store or
+  ~4-query groups) — both already scoped in the design doc.
+- **Next:** fri-section staging + the one-time constants store (the two
+  calldata-cap items), devnet declares + pre-flight, Sepolia campaign
   under the registry's governed route list; confirm the Controller
   envelope with a live Sepolia session transaction.
 

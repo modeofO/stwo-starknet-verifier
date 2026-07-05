@@ -33,5 +33,6 @@ cairo-program-runner-lib.workspace = true
 indexmap = "2"
 stwo-cairo-common.workspace = true
 stwo-cairo-adapter.workspace = true
+stwo-cairo-serialize.workspace = true
 starknet-types-core.workspace = true
 starknet-ff.workspace = true

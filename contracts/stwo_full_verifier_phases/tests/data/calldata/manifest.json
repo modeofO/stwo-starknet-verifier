@@ -1,0 +1,109 @@
+{
+  "chunk_entries": 540,
+  "chunks": [
+    {
+      "file": "chunk_00.txt",
+      "n_values": 4861,
+      "packed_slots": 738
+    },
+    {
+      "file": "chunk_01.txt",
+      "n_values": 4861,
+      "packed_slots": 733
+    },
+    {
+      "file": "chunk_02.txt",
+      "n_values": 4861,
+      "packed_slots": 753
+    },
+    {
+      "file": "chunk_03.txt",
+      "n_values": 4861,
+      "packed_slots": 781
+    },
+    {
+      "file": "chunk_04.txt",
+      "n_values": 3934,
+      "packed_slots": 605
+    }
+  ],
+  "fri": {
+    "file": "fri.txt",
+    "n_values": 10413,
+    "packed_slots": 8873
+  },
+  "group_size": 16,
+  "groups": [
+    {
+      "rows": {
+        "file": "group_00_rows.txt",
+        "n_values": 55877,
+        "packed_slots": 7983
+      },
+      "witnesses": {
+        "file": "group_00_witnesses.txt",
+        "n_values": 969,
+        "packed_slots": 1241
+      }
+    },
+    {
+      "rows": {
+        "file": "group_01_rows.txt",
+        "n_values": 55877,
+        "packed_slots": 7983
+      },
+      "witnesses": {
+        "file": "group_01_witnesses.txt",
+        "n_values": 969,
+        "packed_slots": 1241
+      }
+    },
+    {
+      "rows": {
+        "file": "group_02_rows.txt",
+        "n_values": 55877,
+        "packed_slots": 7983
+      },
+      "witnesses": {
+        "file": "group_02_witnesses.txt",
+        "n_values": 1017,
+        "packed_slots": 1302
+      }
+    },
+    {
+      "rows": {
+        "file": "group_03_rows.txt",
+        "n_values": 55877,
+        "packed_slots": 7983
+      },
+      "witnesses": {
+        "file": "group_03_witnesses.txt",
+        "n_values": 1053,
+        "packed_slots": 1349
+      }
+    },
+    {
+      "rows": {
+        "file": "group_04_rows.txt",
+        "n_values": 20957,
+        "packed_slots": 2994
+      },
+      "witnesses": {
+        "file": "group_04_witnesses.txt",
+        "n_values": 383,
+        "packed_slots": 487
+      }
+    }
+  ],
+  "head": {
+    "file": "head.txt",
+    "n_values": 446,
+    "packed_slots": 69
+  },
+  "program_len": 2597,
+  "sampled": {
+    "file": "sampled.txt",
+    "n_values": 18261,
+    "packed_slots": 2609
+  }
+}

@@ -357,6 +357,39 @@ the real per-tx spread). The registered fact's hashes equal the vendored
 Rejections: proof-id reuse, wrong-tag state, tampered state echo — all
 against one deployment, honest step still lands afterwards.
 
+## The calldata emitter (built 2026-07-05, bridge `emit-calldata`)
+
+`privacy_prove_cairo_bridge emit-calldata <extended_proof.json> <dir>`
+emits the router's per-transaction transport, all packed v2: `head.txt`
+(head surgery in Rust: the claim with its program truncated to the
+6-entry prefix + pow + interaction claim + config + commitments +
+queries-PoW nonce + salt), `chunk_NN.txt` (serde `MemorySection` slices,
+replayed by both the claim and lookup phases), `sampled.txt`, `fri.txt`,
+`group_NN_{rows,witnesses}.txt` (router serde shapes, witnesses
+synthesized from the aux as in split-witness) and a `manifest.json` with
+every router argument's unpacked `n_values`. Self-checks on every run:
+the per-section Rust serializations must concatenate to exactly the
+proof's full cairo-serde stream, the chunk streams must reproduce the
+claim's program section, and the full-set synthesized witnesses must
+equal the proof's own. Cross-validated in snforge
+(`tests/test_emitter_calldata.cairo`): unpacking every emitted fixture
+file reproduces byte-for-byte the sections the Cairo side carves from
+the committed proof fixture.
+
+**Measured per-tx calldata (packed slots, fixture)** against the ~4,996
+usable felt cap: head 69, program chunks ≤781, sampled 2,609 — the
+claim/lookup/OODS transactions all fit comfortably (worst OODS group tx:
+head + sampled + state echo + carry ≈ 3.6k). Two transport items exceed
+the cap, both already scoped in "Machine plan v2":
+
+- **fri section: 8,873 slots** (10,413 felts, mostly unpackable poseidon
+  hashes) — consumed whole by fri_commit AND finalize; needs lane-1
+  style write-once storage staging (~3 staging txs under the 4,000-entry
+  state-diff cap) before those phases.
+- **group rows at 16 queries/tx: 7,983 slots** — needs the settled
+  one-time packed constants store (drops the 2.6k sampled re-supply from
+  group txs → 8–9 queries/tx) or group size ~4 with stateless recompute.
+
 ## Client side
 
 `prove-poseidon` in the bridge is the client reference path (bootloader →
