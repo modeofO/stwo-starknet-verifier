@@ -70,6 +70,7 @@ impl MerkleTree {
         self.node(TREE_DEPTH, 0)
     }
 
+    #[allow(dead_code)]
     pub fn n_leaves(&self) -> u32 {
         self.next_leaf
     }
