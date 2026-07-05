@@ -75,7 +75,11 @@ use stwo_verifier_core::circle::{ChannelGetRandomCirclePointImpl, CirclePoint};
 use stwo_verifier_core::fields::Invertible;
 use stwo_verifier_core::fields::m31::M31Trait;
 use stwo_verifier_core::fields::qm31::{QM31, QM31Serde, QM31Trait};
-use stwo_verifier_core::fri::{FriProof, FriVerifierTrait};
+use stwo_verifier_core::fri::FriLayerProof;
+use stwo_verifier_core::poly::circle::CircleDomainImpl;
+use crate::fri_transport::{
+    FriHead, Queries, QueriesImpl, fri_head_walk, verify_first_layer, verify_inner_layer,
+};
 use stwo_verifier_core::pcs::quotients::fri_answers;
 use stwo_verifier_core::pcs::verifier::{
     CommitmentSchemeVerifier, CommitmentSchemeVerifierImpl, QueriedValues,
@@ -617,16 +621,20 @@ pub fn machine_oods_mix(
 // Tx m+3: FRI commitment phase + queries PoW + query sampling
 
 pub fn machine_fri_commit(
-    state: FriCommitPhaseState, head: Span<felt252>, fri_felts: Span<felt252>,
+    state: FriCommitPhaseState, head: Span<felt252>, fri_head_felts: Span<felt252>,
 ) -> GroupPhaseState {
     let FriCommitPhaseState {
         d_head, digest_pre_draw: _, digest_pre_fri, d_sampled, ood_x, ood_y, program_fact_hash,
     } = state;
     let h = check_head(head, d_head);
 
-    let mut fri_span = fri_felts;
-    let fri_proof: FriProof = Serde::deserialize(ref fri_span).expect('fri deser');
-    assert(SpanTrait::is_empty(fri_span), 'fri trailing data');
+    // FRI transport v3: only the commitment slice ([`FriHead`]) crosses
+    // transactions — Fiat-Shamir authenticates it (commitments are mixed
+    // before queries are drawn), and `d_fri` pins the exact bytes for the
+    // layer-chunk and finalize transactions.
+    let mut fri_span = fri_head_felts;
+    let fri_head: FriHead = Serde::deserialize(ref fri_span).expect('fri head deser');
+    assert(SpanTrait::is_empty(fri_span), 'fri head trailing data');
 
     let log_blowup_factor = h.pcs_config.fri_config.log_blowup_factor;
     let commitment_scheme = rebuild_all_trees(@h);
@@ -634,8 +642,8 @@ pub fn machine_fri_commit(
 
     let mut channel = new_channel(digest_pre_fri);
     let _random_coeff = channel.draw_secure_felt();
-    let mut fri_verifier = FriVerifierTrait::commit(
-        ref channel, h.pcs_config.fri_config, fri_proof, log_trace_degree_bound,
+    let walk = fri_head_walk(
+        ref channel, h.pcs_config.fri_config, @fri_head, log_trace_degree_bound,
     );
     assert!(
         channel.verify_pow_nonce(h.pcs_config.pow_bits, h.pow_nonce),
@@ -643,13 +651,15 @@ pub fn machine_fri_commit(
         VerificationError::QueriesProofOfWork,
     );
     channel.mix_u64(h.pow_nonce);
-    let queries = fri_verifier.sample_query_positions(ref channel);
+    let queries = QueriesImpl::generate(
+        ref channel, walk.commitment_domain.log_size(), h.pcs_config.fri_config.n_queries,
+    );
 
     GroupPhaseState {
         d_head,
         digest_pre_fri,
         d_sampled,
-        d_fri: poseidon_hash_span(fri_felts),
+        d_fri: poseidon_hash_span(fri_head_felts),
         ood_x,
         ood_y,
         query_positions: queries.positions,
@@ -756,23 +766,201 @@ pub fn machine_group(
 }
 
 // ---------------------------------------------------------------------------
-// Tx p+1: FRI decommit (folding walk) + fact material
+// Tx p+1..q: FRI decommit layer-chunk transactions (transport v3) — the
+// layer proofs are self-authenticating against the FriHead commitments,
+// so they arrive as calldata in the transaction that consumes them; the
+// loop-carried (layer_queries, layer_query_evals) pair rides the
+// checkpoint, M31 components packed 7:1 like the group answers.
 
-pub fn machine_finalize(
-    state: GroupPhaseState, head: Span<felt252>, fri_felts: Span<felt252>,
-) -> FullVerificationOutput {
+/// Between FRI layer-chunk transactions.
+#[derive(Drop, Serde)]
+pub struct FriLayersPhaseState {
+    pub d_head: felt252,
+    pub digest_pre_fri: Hash,
+    pub d_fri: felt252,
+    /// The original sampled query positions (finalize's equality belt).
+    pub query_positions: Span<u32>,
+    /// Inner layers verified so far.
+    pub layers_done: u32,
+    pub layer_log_domain_size: u32,
+    pub layer_positions: Span<u32>,
+    /// Current layer query evals as M31 components, packed 7 per felt.
+    pub evals_flat: Array<felt252>,
+    pub evals_n: u32,
+    pub program_fact_hash: felt252,
+}
+
+/// Runs the supplied inner-layer proofs (starting at `layers_done`)
+/// through the forked verify-and-fold walk.
+fn consume_inner_layers(
+    walk: @crate::fri_transport::FriHeadWalk,
+    layers_done: u32,
+    mut proofs: Span<FriLayerProof>,
+    ref layer_queries: Queries,
+    ref layer_evals: Array<QM31>,
+) -> u32 {
+    let n_inner = walk.layers.len();
+    let mut done = layers_done;
+    for proof in proofs {
+        assert!(done < n_inner, "too many fri layers");
+        let (folded_queries, folded_evals) = verify_inner_layer(
+            walk.layers.at(done), proof, layer_queries, layer_evals.span(),
+        );
+        layer_queries = folded_queries;
+        layer_evals = folded_evals;
+        done += 1;
+    }
+    done
+}
+
+fn pack_evals(evals: Span<QM31>) -> (Array<felt252>, u32) {
+    let mut components: Array<felt252> = array![];
+    for eval in evals {
+        let [a, b, c, d] = (*eval).to_fixed_array();
+        components.append(a.into());
+        components.append(b.into());
+        components.append(c.into());
+        components.append(d.into());
+    }
+    let n = components.len();
+    (pack_answers(components.span()), n)
+}
+
+/// First FRI decommit chunk: consumes the accumulated group answers as the
+/// first-layer query evals; `layers_felts` is a serialized
+/// `Array<FriLayerProof>` whose FIRST element is the first-layer proof,
+/// followed by zero or more inner-layer proofs.
+pub fn machine_fri_layers_begin(
+    state: GroupPhaseState,
+    head: Span<felt252>,
+    fri_head_felts: Span<felt252>,
+    layers_felts: Span<felt252>,
+) -> FriLayersPhaseState {
     let GroupPhaseState {
         d_head, digest_pre_fri, d_sampled: _, d_fri, ood_x: _, ood_y: _, query_positions,
         queries_done, answers_flat, answers_n, program_fact_hash,
     } = state;
     assert!(queries_done == SpanTrait::len(query_positions), "query groups incomplete");
     let h = check_head(head, d_head);
-    // The re-supplied fri section must be the bytes fri_commit consumed.
-    assert(poseidon_hash_span(fri_felts) == d_fri, 'fri binding');
+    // The commitment slice must be the bytes fri_commit consumed.
+    assert(poseidon_hash_span(fri_head_felts) == d_fri, 'fri head binding');
 
-    let mut fri_span = fri_felts;
-    let fri_proof: FriProof = Serde::deserialize(ref fri_span).expect('fri deser');
-    assert(SpanTrait::is_empty(fri_span), 'fri trailing data');
+    let mut fri_span = fri_head_felts;
+    let fri_head: FriHead = Serde::deserialize(ref fri_span).expect('fri head deser');
+    assert(SpanTrait::is_empty(fri_span), 'fri head trailing data');
+    let mut layers_span = layers_felts;
+    let layer_proofs: Array<FriLayerProof> = Serde::deserialize(ref layers_span)
+        .expect('fri layers deser');
+    assert(SpanTrait::is_empty(layers_span), 'fri layers trailing data');
+    let mut proofs = layer_proofs.span();
+
+    let log_blowup_factor = h.pcs_config.fri_config.log_blowup_factor;
+    let commitment_scheme = rebuild_all_trees(@h);
+    let log_trace_degree_bound = log_trace_degree_bound_of(@commitment_scheme, log_blowup_factor);
+    let mut channel = new_channel(digest_pre_fri);
+    let _random_coeff = channel.draw_secure_felt();
+    let walk = fri_head_walk(
+        ref channel, h.pcs_config.fri_config, @fri_head, log_trace_degree_bound,
+    );
+
+    let answers = unflatten_answers(unpack_answers(answers_flat.span(), answers_n).span());
+    let queries = Queries {
+        positions: query_positions, log_domain_size: walk.commitment_domain.log_size(),
+    };
+    let first_proof = proofs.pop_front().expect('first layer proof required');
+    let (mut layer_queries, mut layer_evals) = verify_first_layer(
+        @walk, first_proof, queries, answers.span(),
+    );
+    let layers_done = consume_inner_layers(@walk, 0, proofs, ref layer_queries, ref layer_evals);
+
+    let (evals_flat, evals_n) = pack_evals(layer_evals.span());
+    FriLayersPhaseState {
+        d_head,
+        digest_pre_fri,
+        d_fri,
+        query_positions,
+        layers_done,
+        layer_log_domain_size: layer_queries.log_domain_size,
+        layer_positions: layer_queries.positions,
+        evals_flat,
+        evals_n,
+        program_fact_hash,
+    }
+}
+
+/// Continuation FRI decommit chunk: more inner-layer proofs.
+pub fn machine_fri_layers(
+    state: FriLayersPhaseState,
+    head: Span<felt252>,
+    fri_head_felts: Span<felt252>,
+    layers_felts: Span<felt252>,
+) -> FriLayersPhaseState {
+    let FriLayersPhaseState {
+        d_head, digest_pre_fri, d_fri, query_positions, layers_done, layer_log_domain_size,
+        layer_positions, evals_flat, evals_n, program_fact_hash,
+    } = state;
+    let h = check_head(head, d_head);
+    assert(poseidon_hash_span(fri_head_felts) == d_fri, 'fri head binding');
+
+    let mut fri_span = fri_head_felts;
+    let fri_head: FriHead = Serde::deserialize(ref fri_span).expect('fri head deser');
+    assert(SpanTrait::is_empty(fri_span), 'fri head trailing data');
+    let mut layers_span = layers_felts;
+    let layer_proofs: Array<FriLayerProof> = Serde::deserialize(ref layers_span)
+        .expect('fri layers deser');
+    assert(SpanTrait::is_empty(layers_span), 'fri layers trailing data');
+    assert!(!layer_proofs.is_empty(), "empty fri layer chunk");
+
+    let log_blowup_factor = h.pcs_config.fri_config.log_blowup_factor;
+    let commitment_scheme = rebuild_all_trees(@h);
+    let log_trace_degree_bound = log_trace_degree_bound_of(@commitment_scheme, log_blowup_factor);
+    let mut channel = new_channel(digest_pre_fri);
+    let _random_coeff = channel.draw_secure_felt();
+    let walk = fri_head_walk(
+        ref channel, h.pcs_config.fri_config, @fri_head, log_trace_degree_bound,
+    );
+
+    let mut layer_queries = Queries {
+        positions: layer_positions, log_domain_size: layer_log_domain_size,
+    };
+    let mut layer_evals = unflatten_answers(
+        unpack_answers(evals_flat.span(), evals_n).span(),
+    );
+    let layers_done = consume_inner_layers(
+        @walk, layers_done, layer_proofs.span(), ref layer_queries, ref layer_evals,
+    );
+
+    let (evals_flat, evals_n) = pack_evals(layer_evals.span());
+    FriLayersPhaseState {
+        d_head,
+        digest_pre_fri,
+        d_fri,
+        query_positions,
+        layers_done,
+        layer_log_domain_size: layer_queries.log_domain_size,
+        layer_positions: layer_queries.positions,
+        evals_flat,
+        evals_n,
+        program_fact_hash,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tx q+1: last-layer check, query-equality belt + fact material
+
+pub fn machine_finalize(
+    state: FriLayersPhaseState, head: Span<felt252>, fri_head_felts: Span<felt252>,
+) -> FullVerificationOutput {
+    let FriLayersPhaseState {
+        d_head, digest_pre_fri, d_fri, query_positions, layers_done, layer_log_domain_size,
+        layer_positions: _, evals_flat, evals_n, program_fact_hash,
+    } = state;
+    let h = check_head(head, d_head);
+    assert(poseidon_hash_span(fri_head_felts) == d_fri, 'fri head binding');
+
+    let mut fri_span = fri_head_felts;
+    let fri_head: FriHead = Serde::deserialize(ref fri_span).expect('fri head deser');
+    assert(SpanTrait::is_empty(fri_span), 'fri head trailing data');
 
     let log_blowup_factor = h.pcs_config.fri_config.log_blowup_factor;
     let commitment_scheme = rebuild_all_trees(@h);
@@ -780,11 +968,11 @@ pub fn machine_finalize(
 
     // Re-run the FRI commitment transcript from the checkpointed digest;
     // the re-derived query positions must equal the checkpointed ones
-    // (lane-1 query-equality binding for the re-supplied fri section).
+    // (lane-1 query-equality binding for the d_fri-bound commitment slice).
     let mut channel = new_channel(digest_pre_fri);
     let _random_coeff = channel.draw_secure_felt();
-    let mut fri_verifier = FriVerifierTrait::commit(
-        ref channel, h.pcs_config.fri_config, fri_proof, log_trace_degree_bound,
+    let walk = fri_head_walk(
+        ref channel, h.pcs_config.fri_config, @fri_head, log_trace_degree_bound,
     );
     assert!(
         channel.verify_pow_nonce(h.pcs_config.pow_bits, h.pow_nonce),
@@ -792,14 +980,28 @@ pub fn machine_finalize(
         VerificationError::QueriesProofOfWork,
     );
     channel.mix_u64(h.pow_nonce);
-    let queries = fri_verifier.sample_query_positions(ref channel);
+    let queries = QueriesImpl::generate(
+        ref channel, walk.commitment_domain.log_size(), h.pcs_config.fri_config.n_queries,
+    );
     assert(queries.positions == query_positions, 'query binding');
 
-    fri_verifier
-        .decommit(
-            queries,
-            unflatten_answers(unpack_answers(answers_flat.span(), answers_n).span()).span(),
-        );
+    // All inner layers verified, and the folding chain landed on the
+    // last-layer domain.
+    assert!(layers_done == walk.layers.len(), "fri layers incomplete");
+    assert!(
+        layer_log_domain_size == h.pcs_config.fri_config.log_last_layer_degree_bound
+            + log_blowup_factor,
+        "fri fold chain incomplete",
+    );
+
+    // The vendored decommit_last_layer check over the carried evals.
+    let mut coeffs = walk.last_layer_coeffs;
+    assert!(SpanTrait::len(coeffs) == 1, "last layer degree must be zero");
+    let expected = *coeffs.pop_front().unwrap();
+    let final_evals = unflatten_answers(unpack_answers(evals_flat.span(), evals_n).span());
+    for eval in final_evals {
+        assert!(eval == expected, "invalid last layer evaluations");
+    }
 
     let output_hash = construct_f252(
         encode_and_hash_memory_section(h.claim.public_data.public_memory.output),

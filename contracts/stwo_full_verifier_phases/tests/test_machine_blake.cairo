@@ -14,9 +14,10 @@ use stwo_cairo_air::claim::CairoInteractionClaim;
 use stwo_cairo_air::claims::CairoClaim;
 use stwo_full_verifier_phases::machine::{
     HEAD_PROGRAM_ENTRIES, machine_begin, machine_claim_chunk, machine_claim_finalize,
-    machine_fri_commit, machine_finalize, machine_group, machine_lookup_chunk,
-    machine_lookup_finalize, machine_oods_mix,
+    machine_fri_commit, machine_finalize, machine_fri_layers, machine_fri_layers_begin,
+    machine_group, machine_lookup_chunk, machine_lookup_finalize, machine_oods_mix,
 };
+use crate::fri_v3_util::build_fri_transport;
 use stwo_full_verifier_phases::resumable_full::{
     FullCheckpoint, phase_a, verify_full_monolithic,
 };
@@ -164,9 +165,12 @@ fn test_machine_blake_full_sequence_matches_monolithic() {
     // Tx m+2: composition commit + OODS check + sampled mix.
     let fri_state = roundtrip(machine_oods_mix(oods_state, streams.head.span(), streams.sampled));
 
-    // Tx m+3: FRI commitment + queries PoW + query sampling.
+    // Tx m+3: FRI commitment + queries PoW + query sampling — transport
+    // v3: only the FriHead commitment slice is consumed.
+    let fri_transport = build_fri_transport(streams.fri);
+    let fri_head = fri_transport.head_felts.span();
     let mut group_state = roundtrip(
-        machine_fri_commit(fri_state, streams.head.span(), streams.fri),
+        machine_fri_commit(fri_state, streams.head.span(), fri_head),
     );
     assert!(SpanTrait::len(group_state.query_positions) == 70);
 
@@ -183,8 +187,24 @@ fn test_machine_blake_full_sequence_matches_monolithic() {
         group += 1;
     }
 
-    // Tx p+1: FRI decommit + fact material.
-    let output = machine_finalize(group_state, streams.head.span(), streams.fri);
+    // Tx p+1..q: FRI decommit layer chunks (self-authenticating layer
+    // proofs as calldata; the folded (queries, evals) ride the checkpoint).
+    let mut chunks = fri_transport.layer_chunks.span();
+    let first_chunk = chunks.pop_front().unwrap();
+    let mut layers_state = roundtrip(
+        machine_fri_layers_begin(
+            group_state, streams.head.span(), fri_head, first_chunk.span(),
+        ),
+    );
+    for chunk in chunks {
+        layers_state =
+            roundtrip(
+                machine_fri_layers(layers_state, streams.head.span(), fri_head, chunk.span()),
+            );
+    }
+
+    // Tx q+1: last-layer check, query-equality belt + fact material.
+    let output = machine_finalize(layers_state, streams.head.span(), fri_head);
     assert!(output == expected, "machine output must equal monolithic");
 }
 

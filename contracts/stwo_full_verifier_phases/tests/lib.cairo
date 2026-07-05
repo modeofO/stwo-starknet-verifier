@@ -4,6 +4,8 @@
 //! against the blake fixture proof (docs/lane2-design.md, "The qm31 pivot,
 //! measured end-to-end").
 
+mod fri_v3_util;
+
 #[cfg(feature: "poseidon252_verifier")]
 mod test_claim_mix;
 #[cfg(feature: "poseidon252_verifier")]

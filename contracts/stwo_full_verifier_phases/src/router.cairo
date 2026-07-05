@@ -18,28 +18,32 @@
 //! N-family OODS sequence, query groups) is enforced by the machine
 //! states themselves.
 //!
-//! ## The staged-section store
+//! ## The staged-section store (sampled only — FRI transport v3)
 //!
-//! Two proof sections exceed the ~4,996-felt usable calldata cap and are
-//! consumed by MANY transactions, so they arrive once via `stage` (packed
-//! v2, lane-1 `stage_proof` precedent; ≤ ~1,900 slots per staging tx —
-//! the block bouncer's 4,000-felt state-diff budget counts key + value =
-//! TWO felts per storage write, devnet-measured) and are read back:
+//! One proof section exceeds the ~4,996-felt usable calldata cap in the
+//! transactions that have no calldata room left, so it arrives once via
+//! `stage` (packed v2, lane-1 `stage_proof` precedent; ≤ ~1,900 slots per
+//! staging tx — the block bouncer's 4,000-felt state-diff budget counts
+//! key + value = TWO felts per storage write, devnet-measured):
 //!
-//! - `SECTION_SAMPLED` (~2.6k slots, 2 staging txs): read by `oods_begin`,
-//!   every `oods_group`, `oods_finalize` and every fused `group` tx.
-//!   Binding: the machine's `d_sampled` checkpoint digest (saved by
-//!   `oods_begin` from the transcript-bound mix).
-//! - `SECTION_FRI` (~8k slots, 5 staging txs): read by `fri_commit` and
-//!   `finalize`. Binding: `d_fri` rides the checkpoint from `fri_commit`
-//!   to `finalize` (plus the lane-1 query-equality re-derivation).
+//! - `SECTION_SAMPLED` (~2.6k slots, 2 staging txs): read from storage by
+//!   the fused `group` txs (whose rows leave no calldata room). The OODS
+//!   transactions have room and supply it as CALLDATA instead — staged
+//!   reads cost ~122k gas/slot all-in (devnet-measured), so every
+//!   avoidable read is avoided. Binding either way: the machine's
+//!   `d_sampled` checkpoint digest.
 //!
-//! Slots are keyed by (caller, proof_id, section), so staging cannot be
-//! griefed by third parties; a caller overwriting their own staged bytes
-//! after a phase consumed them just fails the digest binding. Everything
-//! else (head, program chunks, per-group rows + witnesses, the state echo)
-//! fits calldata directly — rows and witnesses are self-authenticating
-//! (Merkle-verified on arrival), so storing them would buy nothing.
+//! The FRI section is NEVER stored (v3): its bulk (per-layer evals +
+//! Merkle witnesses) is self-authenticating against the layer commitments
+//! and arrives layer-batched as calldata in the `fri_layers` chunk txs;
+//! only the packed `FriHead` commitment slice (a few hundred felts,
+//! `d_fri`-bound) is re-supplied to each FRI-phase transaction. Slots are
+//! keyed by (caller, proof_id, section), so staging cannot be griefed;
+//! a caller overwriting their own staged bytes after a phase consumed
+//! them just fails the digest binding. Everything else (head, program
+//! chunks, per-group rows + witnesses, the state echo) fits calldata
+//! directly — rows and witnesses are self-authenticating (Merkle-verified
+//! on arrival), so storing them would buy nothing.
 //!
 //! `finalize` registers the fact with the shared `StwoSharedFactRegistry`
 //! (constructor-pinned address; the router must be on the registry's
@@ -55,16 +59,16 @@ pub const TAG_OODS: felt252 = 3;
 pub const TAG_OODS_EVAL: felt252 = 4;
 pub const TAG_FRI_COMMIT: felt252 = 5;
 pub const TAG_GROUP: felt252 = 6;
-pub const TAG_DONE: felt252 = 7;
+pub const TAG_FRI_LAYERS: felt252 = 7;
+pub const TAG_DONE: felt252 = 8;
 
-/// Staged-section ids.
+/// Staged-section ids (v3: only the sampled section is ever stored).
 pub const SECTION_SAMPLED: felt252 = 'sampled';
-pub const SECTION_FRI: felt252 = 'fri';
 
 #[starknet::interface]
 pub trait IStwoVerifierRouter<TContractState> {
     /// Stages `slots` of a packed section at slot `offset` under the
-    /// caller's `proof_id`. Sections: [`SECTION_SAMPLED`], [`SECTION_FRI`].
+    /// caller's `proof_id`. Sections: [`SECTION_SAMPLED`].
     fn stage(
         ref self: TContractState,
         proof_id: felt252,
@@ -113,7 +117,7 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        sampled_slots: u32,
+        sampled_packed: Span<felt252>,
         sampled_n: u32,
     ) -> Array<felt252>;
     fn oods_group(
@@ -123,7 +127,7 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        sampled_slots: u32,
+        sampled_packed: Span<felt252>,
         sampled_n: u32,
     ) -> Array<felt252>;
     fn oods_finalize(
@@ -132,17 +136,32 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        sampled_slots: u32,
+        sampled_packed: Span<felt252>,
         sampled_n: u32,
     ) -> Array<felt252>;
+    /// `fri_packed` is the packed FriHead commitment slice (v3).
     fn fri_commit(
         ref self: TContractState,
         proof_id: felt252,
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        fri_slots: u32,
+        fri_packed: Span<felt252>,
         fri_n: u32,
+    ) -> Array<felt252>;
+    /// FRI decommit layer chunk: the first call (from the GROUP tag)
+    /// consumes the first-layer proof + inner layers, later calls (from
+    /// the FRI_LAYERS tag) continue the inner-layer walk.
+    fn fri_layers(
+        ref self: TContractState,
+        proof_id: felt252,
+        state: Span<felt252>,
+        head_packed: Span<felt252>,
+        head_n: u32,
+        fri_packed: Span<felt252>,
+        fri_n: u32,
+        layers_packed: Span<felt252>,
+        layers_n: u32,
     ) -> Array<felt252>;
     fn group(
         ref self: TContractState,
@@ -163,7 +182,7 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        fri_slots: u32,
+        fri_packed: Span<felt252>,
         fri_n: u32,
     ) -> (felt252, felt252);
     /// The (tag, state_hash) checkpoint for (caller, proof_id).
@@ -195,8 +214,8 @@ pub mod StwoVerifierRouter {
         IStwoOodsGroupLibraryDispatcher, IStwoOodsGroupDispatcherTrait,
     };
     use super::{
-        IStwoVerifierRouter, SECTION_FRI, SECTION_SAMPLED, TAG_CLAIM, TAG_DONE, TAG_FRI_COMMIT,
-        TAG_GROUP, TAG_LOOKUP, TAG_NONE, TAG_OODS, TAG_OODS_EVAL,
+        IStwoVerifierRouter, SECTION_SAMPLED, TAG_CLAIM, TAG_DONE, TAG_FRI_COMMIT,
+        TAG_FRI_LAYERS, TAG_GROUP, TAG_LOOKUP, TAG_NONE, TAG_OODS, TAG_OODS_EVAL,
     };
 
     #[storage]
@@ -309,9 +328,7 @@ pub mod StwoVerifierRouter {
             offset: u32,
             slots: Span<felt252>,
         ) {
-            assert(
-                section == SECTION_SAMPLED || section == SECTION_FRI, 'router: section',
-            );
+            assert(section == SECTION_SAMPLED, 'router: section');
             let caller = get_caller_address();
             let mut i = offset;
             for slot in slots {
@@ -408,12 +425,12 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            sampled_slots: u32,
+            sampled_packed: Span<felt252>,
             sampled_n: u32,
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_OODS, state);
             let head = unpack(head_packed, head_n);
-            let sampled = read_section(@self, proof_id, SECTION_SAMPLED, sampled_slots, sampled_n);
+            let sampled = unpack(sampled_packed, sampled_n);
             let out = IStwoOodsBeginLibraryDispatcher {
                 class_hash: self.oods_begin_class.read(),
             }
@@ -429,13 +446,13 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            sampled_slots: u32,
+            sampled_packed: Span<felt252>,
             sampled_n: u32,
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_OODS_EVAL, state);
             assert(group_index < self.n_oods_groups.read(), 'router: group index');
             let head = unpack(head_packed, head_n);
-            let sampled = read_section(@self, proof_id, SECTION_SAMPLED, sampled_slots, sampled_n);
+            let sampled = unpack(sampled_packed, sampled_n);
             // The family-order counter inside the state enforces that the
             // groups run in sequence, exactly once each.
             let out = IStwoOodsGroupLibraryDispatcher {
@@ -452,12 +469,12 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            sampled_slots: u32,
+            sampled_packed: Span<felt252>,
             sampled_n: u32,
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_OODS_EVAL, state);
             let head = unpack(head_packed, head_n);
-            let sampled = read_section(@self, proof_id, SECTION_SAMPLED, sampled_slots, sampled_n);
+            let sampled = unpack(sampled_packed, sampled_n);
             let out = IStwoOodsFinalizeLibraryDispatcher {
                 class_hash: self.oods_finalize_class.read(),
             }
@@ -472,15 +489,48 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            fri_slots: u32,
+            fri_packed: Span<felt252>,
             fri_n: u32,
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_FRI_COMMIT, state);
             let head = unpack(head_packed, head_n);
-            let fri = read_section(@self, proof_id, SECTION_FRI, fri_slots, fri_n);
+            let fri = unpack(fri_packed, fri_n);
             let out = IStwoMachineFriLibraryDispatcher { class_hash: self.fri_class.read() }
                 .fri_commit(state, head, fri);
             advance(ref self, proof_id, TAG_GROUP, out.span());
+            out
+        }
+
+        fn fri_layers(
+            ref self: ContractState,
+            proof_id: felt252,
+            state: Span<felt252>,
+            head_packed: Span<felt252>,
+            head_n: u32,
+            fri_packed: Span<felt252>,
+            fri_n: u32,
+            layers_packed: Span<felt252>,
+            layers_n: u32,
+        ) -> Array<felt252> {
+            // The first layer chunk transitions from the group phase (all
+            // query groups done — the machine asserts it); later chunks
+            // continue the inner-layer walk. The stored tag selects which.
+            let caller = get_caller_address();
+            let (tag, _) = self.checkpoints.entry((caller, proof_id)).read();
+            let head = unpack(head_packed, head_n);
+            let fri = unpack(fri_packed, fri_n);
+            let layers = unpack(layers_packed, layers_n);
+            let dispatcher = IStwoMachineFriLibraryDispatcher {
+                class_hash: self.fri_class.read(),
+            };
+            let out = if tag == TAG_GROUP {
+                consume(@self, proof_id, TAG_GROUP, state);
+                dispatcher.fri_layers_begin(state, head, fri, layers)
+            } else {
+                consume(@self, proof_id, TAG_FRI_LAYERS, state);
+                dispatcher.fri_layers(state, head, fri, layers)
+            };
+            advance(ref self, proof_id, TAG_FRI_LAYERS, out.span());
             out
         }
 
@@ -516,12 +566,12 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            fri_slots: u32,
+            fri_packed: Span<felt252>,
             fri_n: u32,
         ) -> (felt252, felt252) {
-            consume(@self, proof_id, TAG_GROUP, state);
+            consume(@self, proof_id, TAG_FRI_LAYERS, state);
             let head = unpack(head_packed, head_n);
-            let fri = read_section(@self, proof_id, SECTION_FRI, fri_slots, fri_n);
+            let fri = unpack(fri_packed, fri_n);
             let (program_hash, output_hash) = IStwoMachineFriLibraryDispatcher {
                 class_hash: self.fri_class.read(),
             }

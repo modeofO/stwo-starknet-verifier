@@ -719,6 +719,61 @@ machinery is production-ready as measured; only the fri transport fails.
   the 9 fused group txs keep the staged sampled read (rows leave no
   calldata room) — sampled staging stays.
 
+## FRI transport v3: built and proven (2026-07-05)
+
+The fix designed in the devnet section above, implemented the same
+session. `src/fri_transport.cairo` forks the vendored FRI verifier's
+private layer machinery (provenance documented in the module header:
+`compute_decommitment_positions_and_rebuild_evals`, `SparseEvaluation`
+folds, `build_merkle_verification_inputs` and the tiny `Queries` type are
+verbatim copies — the vendored `queries` module and layer-verifier
+structs are file-private; `fold_coset`, `fri_fold`, `MerkleVerifier` and
+the domain types import):
+
+- **[`FriHead`]** = first/inner layer commitments + last-layer poly —
+  everything `FriVerifierImpl::commit` mixes. On the blake fixture it
+  packs to **24 slots** (poseidon: 27); `fri_commit`, every `fri_layers`
+  chunk and `finalize` take it as calldata, re-run the transcript walk
+  (`fri_head_walk`, which also re-derives every layer's folding alpha,
+  domain and fold step — carrying them would cost more than re-walking),
+  and `d_fri = poseidon(fri_head felts)` pins the bytes across
+  transactions. Soundness of calldata commitments = Fiat-Shamir itself
+  (mixed before queries are drawn), same as the monolithic verifier.
+- **`machine_fri_layers_begin` / `machine_fri_layers`** — the decommit
+  walk chunked at layer boundaries: chunk 0 consumes the accumulated
+  group answers as the first-layer query evals plus the first-layer
+  proof; each chunk verifies + folds as many layers as its calldata
+  carries (serialized `Array<FriLayerProof>`, greedy-cut at ≤4,300
+  packed slots by the emitter and the in-test util identically); the
+  loop-carried `(layer_queries, layer_query_evals)` pair rides the
+  checkpoint (evals as M31 components packed 7:1, like the group
+  answers). The router's `fri_layers` entrypoint branches on the stored
+  tag (GROUP → begin, FRI_LAYERS → continuation).
+- **`machine_finalize`** shrinks to: the lane-1 query-equality belt
+  (re-derive queries from `digest_pre_fri` + the d_fri-bound head),
+  layers-complete + fold-chain-landed asserts, the vendored last-layer
+  equality check over the carried evals, and the fact material.
+- **SECTION_FRI is gone** — no fri staging (5 txs and ~2e9 of
+  write+read gas on the old plan), no `read_section` for fri. The
+  sampled section stays staged for the 9 fused group txs only; the 17
+  OODS transactions now carry it as calldata (2,617 slots fit their
+  budget; `d_sampled` binds either source).
+- **The emitter** emits `fri_head.txt` + `fri_layers_NN.txt` (greedy
+  layer batches) with a new self-check: the per-piece serializations
+  must reassemble the fri section byte-exactly. Blake: head 24 slots +
+  2 chunks (3,865 / 4,180); poseidon: head 27 + 3 chunks (4,286 /
+  4,269 / 319). Committed poseidon calldata fixtures regenerated;
+  `tests/fri_v3_util.cairo` does the same slicing in-Cairo for the
+  suites (cross-validated against the emitted files byte-for-byte in
+  `test_emitter_calldata`).
+
+Measured in snforge: **blake drive 45 txs** (2 sampled staging + 43
+machine, incl. 2 fri layer txs; worst layer tx 4,478 felts, worst group
+tx 4,872 — every tx's calldata asserted), ~28.2e9 snforge-gas (was
+30.3e9); the machine full-sequence == monolithic equivalence holds on
+both builds. Poseidon drive: 42 txs (2 + 37 + 3). The devnet re-drive
+below prices the v3 shape for real.
+
 ## The calldata emitter (built 2026-07-05, bridge `emit-calldata`)
 
 `privacy_prove_cairo_bridge emit-calldata <extended_proof.json> <dir>`

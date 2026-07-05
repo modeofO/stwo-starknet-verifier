@@ -8,6 +8,7 @@ pub mod claim_mix_blake;
 pub mod channel_compat;
 pub mod fact_registry;
 pub mod fri_chunks;
+pub mod fri_transport;
 pub mod lookup_chunks;
 pub mod machine;
 pub mod oods_chunks;
@@ -132,8 +133,24 @@ pub trait IStwoMachineGroup<TContractState> {
 
 #[starknet::interface]
 pub trait IStwoMachineFri<TContractState> {
+    /// `fri` is the packed FriHead (commitment slice) in every entrypoint
+    /// of this class — transport v3, docs/lane2-design.md.
     fn fri_commit(
         self: @TContractState, state: Span<felt252>, head: Span<felt252>, fri: Span<felt252>,
+    ) -> Array<felt252>;
+    fn fri_layers_begin(
+        self: @TContractState,
+        state: Span<felt252>,
+        head: Span<felt252>,
+        fri: Span<felt252>,
+        layers: Span<felt252>,
+    ) -> Array<felt252>;
+    fn fri_layers(
+        self: @TContractState,
+        state: Span<felt252>,
+        head: Span<felt252>,
+        fri: Span<felt252>,
+        layers: Span<felt252>,
     ) -> Array<felt252>;
     fn finalize(
         self: @TContractState, state: Span<felt252>, head: Span<felt252>, fri: Span<felt252>,
@@ -265,6 +282,28 @@ mod StwoMachineFri {
             self: @ContractState, state: Span<felt252>, head: Span<felt252>, fri: Span<felt252>,
         ) -> Array<felt252> {
             serialize_state(machine::machine_fri_commit(deserialize_state(state), head, fri))
+        }
+        fn fri_layers_begin(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            fri: Span<felt252>,
+            layers: Span<felt252>,
+        ) -> Array<felt252> {
+            serialize_state(
+                machine::machine_fri_layers_begin(deserialize_state(state), head, fri, layers),
+            )
+        }
+        fn fri_layers(
+            self: @ContractState,
+            state: Span<felt252>,
+            head: Span<felt252>,
+            fri: Span<felt252>,
+            layers: Span<felt252>,
+        ) -> Array<felt252> {
+            serialize_state(
+                machine::machine_fri_layers(deserialize_state(state), head, fri, layers),
+            )
         }
         fn finalize(
             self: @ContractState, state: Span<felt252>, head: Span<felt252>, fri: Span<felt252>,

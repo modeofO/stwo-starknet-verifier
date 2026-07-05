@@ -27,11 +27,28 @@
       "packed_slots": 605
     }
   ],
-  "fri": {
-    "file": "fri.txt",
-    "n_values": 10413,
-    "packed_slots": 8873
+  "fri_head": {
+    "file": "fri_head.txt",
+    "n_values": 27,
+    "packed_slots": 27
   },
+  "fri_layers": [
+    {
+      "file": "fri_layers_00.txt",
+      "n_values": 4337,
+      "packed_slots": 4286
+    },
+    {
+      "file": "fri_layers_01.txt",
+      "n_values": 5269,
+      "packed_slots": 4269
+    },
+    {
+      "file": "fri_layers_02.txt",
+      "n_values": 803,
+      "packed_slots": 319
+    }
+  ],
   "group_size": 16,
   "groups": [
     {

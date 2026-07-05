@@ -60,7 +60,6 @@ CHUNK_ENTRIES = 540
 # safe production chunk.
 STAGE_CHUNK = 1_900
 SECTION_SAMPLED = hex(int.from_bytes(b"sampled", "big"))
-SECTION_FRI = hex(int.from_bytes(b"fri", "big"))
 PROOF_ID = hex(int.from_bytes(b"devnet_blake_drive", "big"))
 
 
@@ -228,21 +227,21 @@ def main():
     head = read_slots(args.calldata_dir / "head.txt")
     head_n = m["head"]["n_values"]
     sampled = read_slots(args.calldata_dir / "sampled.txt")
-    fri = read_slots(args.calldata_dir / "fri.txt")
+    fri_head = read_slots(args.calldata_dir / "fri_head.txt")
     sampled_slots, sampled_n = len(sampled), m["sampled"]["n_values"]
-    fri_slots, fri_n = len(fri), m["fri"]["n_values"]
+    fri_head_n = m["fri_head"]["n_values"]
     program_len = m["program_len"]
 
     def span(v):
         return [hex(len(v))] + felts(v)
 
+    # v3: only the sampled section is staged (for the fused group txs).
     print("== staging ==")
-    for section, slots in ((SECTION_SAMPLED, sampled), (SECTION_FRI, fri)):
-        for off in range(0, len(slots), STAGE_CHUNK):
-            chunk = slots[off:off + STAGE_CHUNK]
-            d.step(f"stage {('sampled' if section == SECTION_SAMPLED else 'fri')}@{off}",
-                   "stage", [PROOF_ID, section, hex(off)] + span(chunk),
-                   returns_state=False)
+    for off in range(0, len(sampled), STAGE_CHUNK):
+        chunk = sampled[off:off + STAGE_CHUNK]
+        d.step(f"stage sampled@{off}", "stage",
+               [PROOF_ID, SECTION_SAMPLED, hex(off)] + span(chunk),
+               returns_state=False)
 
     print("== machine ==")
     state = d.step("begin", "begin",
@@ -256,31 +255,40 @@ def main():
         state = d.step(f"{phase}_finalize", f"{phase}_finalize",
                        [PROOF_ID] + span(state) + span(head) + [hex(head_n)])
 
-    sampled_args = [hex(sampled_slots), hex(sampled_n)]
+    # v3: OODS transactions carry the sampled section as calldata.
+    sampled_cd = span(sampled) + [hex(sampled_n)]
     state = d.step("oods_begin", "oods_begin",
-                   [PROOF_ID] + span(state) + span(head) + [hex(head_n)] + sampled_args)
+                   [PROOF_ID] + span(state) + span(head) + [hex(head_n)] + sampled_cd)
     for g in range(len(GROUP_CLASSES)):
         state = d.step(f"oods_group {g:02d}", "oods_group",
                        [PROOF_ID, hex(g)] + span(state) + span(head)
-                       + [hex(head_n)] + sampled_args)
+                       + [hex(head_n)] + sampled_cd)
     state = d.step("oods_finalize", "oods_finalize",
-                   [PROOF_ID] + span(state) + span(head) + [hex(head_n)] + sampled_args)
+                   [PROOF_ID] + span(state) + span(head) + [hex(head_n)] + sampled_cd)
 
+    fri_head_cd = span(fri_head) + [hex(fri_head_n)]
     state = d.step("fri_commit", "fri_commit",
-                   [PROOF_ID] + span(state) + span(head)
-                   + [hex(head_n), hex(fri_slots), hex(fri_n)])
+                   [PROOF_ID] + span(state) + span(head) + [hex(head_n)] + fri_head_cd)
 
+    # Fused group txs keep the staged sampled read — rows leave no room.
+    sampled_staged = [hex(sampled_slots), hex(sampled_n)]
     for i, g in enumerate(m["groups"]):
         rows = read_slots(args.calldata_dir / g["rows"]["file"])
         wits = read_slots(args.calldata_dir / g["witnesses"]["file"])
         state = d.step(f"group {i:02d}", "group",
                        [PROOF_ID] + span(state) + span(head) + [hex(head_n)]
-                       + sampled_args + span(rows) + [hex(g["rows"]["n_values"])]
+                       + sampled_staged + span(rows) + [hex(g["rows"]["n_values"])]
                        + span(wits) + [hex(g["witnesses"]["n_values"])])
 
+    # FRI decommit layer chunks (self-authenticating calldata).
+    for i, layer in enumerate(m["fri_layers"]):
+        chunk = read_slots(args.calldata_dir / layer["file"])
+        state = d.step(f"fri_layers {i:02d}", "fri_layers",
+                       [PROOF_ID] + span(state) + span(head) + [hex(head_n)]
+                       + fri_head_cd + span(chunk) + [hex(layer["n_values"])])
+
     out = d.step("finalize", "finalize",
-                 [PROOF_ID] + span(state) + span(head)
-                 + [hex(head_n), hex(fri_slots), hex(fri_n)])
+                 [PROOF_ID] + span(state) + span(head) + [hex(head_n)] + fri_head_cd)
     program_hash, output_hash = out[0], out[1]
     print("fact:", program_hash, output_hash)
 

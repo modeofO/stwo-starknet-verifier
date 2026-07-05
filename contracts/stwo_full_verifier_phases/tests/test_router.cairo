@@ -1,9 +1,11 @@
-//! End-to-end router drive over the REAL fixture proof: 44 transactions
-//! (2 sampled staging + 5 fri staging → begin → 5 claim chunks → claim
-//! finalize → 5 lookup chunks → lookup finalize → oods begin → 15 merged
-//! OODS group classes → oods finalize → fri commit → 5 fused group txs →
-//! finalize), the sampled/fri sections staged write-once and read back
-//! from storage, everything else arriving as packed-v2 calldata, every
+//! End-to-end router drive over the REAL fixture proof (FRI transport
+//! v3): 2 sampled staging txs → begin → 5 claim chunks → claim finalize →
+//! 5 lookup chunks → lookup finalize → oods begin → 15 merged OODS group
+//! classes → oods finalize → fri commit (FriHead calldata) → 5 fused
+//! group txs → N fri layer-chunk txs → finalize. Only the sampled section
+//! is staged (for the fused group txs); the OODS txs carry it as
+//! calldata, and the fri section's bulk arrives layer-batched as
+//! calldata, self-authenticating against the layer commitments; every
 //! state echoed against the hash-stored checkpoint — must register into
 //! the shared fact registry the fact whose program/output hashes equal
 //! the vendored `encode_and_hash_memory_section` of the claim's program
@@ -26,9 +28,10 @@ use stwo_full_verifier_phases::machine::HEAD_PROGRAM_ENTRIES;
 use stwo_full_verifier_phases::pack::pack_v2;
 use stwo_full_verifier_phases::router::{
     IStwoVerifierRouterDispatcher, IStwoVerifierRouterDispatcherTrait,
-    IStwoVerifierRouterSafeDispatcher, IStwoVerifierRouterSafeDispatcherTrait, SECTION_FRI,
-    SECTION_SAMPLED, TAG_DONE,
+    IStwoVerifierRouterSafeDispatcher, IStwoVerifierRouterSafeDispatcherTrait, SECTION_SAMPLED,
+    TAG_DONE,
 };
+use crate::fri_v3_util::build_fri_transport;
 use stwo_full_verifier_phases::unpack_proof_v2;
 use stwo_verifier_core::fields::m31::M31;
 use stwo_verifier_core::fields::qm31::{QM31, QM31Serde};
@@ -201,18 +204,16 @@ fn test_router_full_drive_registers_fact() {
     let (router, registry) = deploy_router();
     let (head_p, head_n) = packed(streams.head.span());
     let (sampled_p, sampled_n) = packed(streams.sampled);
-    let (fri_p, fri_n) = packed(streams.fri);
+    let fri_transport = build_fri_transport(streams.fri);
+    let (fri_head_p, fri_head_n) = packed(fri_transport.head_felts.span());
     let program = streams.program;
     let n_entries = program.len();
 
-    // Write-once staging of the two over-cap sections (2 + 5 txs on this
-    // fixture: sampled 2,609 slots, fri 8,873 slots).
+    // Write-once staging (v3: sampled only — 2,609 slots, 2 txs — for the
+    // fused group txs; the fri section is never stored).
     let sampled_txs = stage_section(router, SECTION_SAMPLED, sampled_p);
-    let fri_txs = stage_section(router, SECTION_FRI, fri_p);
     assert!(sampled_txs == 2, "sampled staging txs");
-    assert!(fri_txs == 5, "fri staging txs");
     let sampled_slots = SpanTrait::len(sampled_p);
-    let fri_slots = SpanTrait::len(fri_p);
 
     let mut state = router.begin(PROOF_ID, head_p, head_n, n_entries);
 
@@ -235,19 +236,19 @@ fn test_router_full_drive_registers_fact() {
     state = router.lookup_finalize(PROOF_ID, state.span(), head_p, head_n);
 
     state = router
-        .oods_begin(PROOF_ID, state.span(), head_p, head_n, sampled_slots, sampled_n);
+        .oods_begin(PROOF_ID, state.span(), head_p, head_n, sampled_p, sampled_n);
     let mut group_index = 0_u32;
     while group_index != 15 {
         state = router
             .oods_group(
-                PROOF_ID, group_index, state.span(), head_p, head_n, sampled_slots, sampled_n,
+                PROOF_ID, group_index, state.span(), head_p, head_n, sampled_p, sampled_n,
             );
         group_index += 1;
     }
     state = router
-        .oods_finalize(PROOF_ID, state.span(), head_p, head_n, sampled_slots, sampled_n);
+        .oods_finalize(PROOF_ID, state.span(), head_p, head_n, sampled_p, sampled_n);
 
-    state = router.fri_commit(PROOF_ID, state.span(), head_p, head_n, fri_slots, fri_n);
+    state = router.fri_commit(PROOF_ID, state.span(), head_p, head_n, fri_head_p, fri_head_n);
 
     let mut group = 0_u32;
     while group != N_GROUPS {
@@ -262,8 +263,17 @@ fn test_router_full_drive_registers_fact() {
         group += 1;
     }
 
+    for chunk in fri_transport.layer_chunks.span() {
+        let (chunk_p, chunk_n) = packed(chunk.span());
+        state = router
+            .fri_layers(
+                PROOF_ID, state.span(), head_p, head_n, fri_head_p, fri_head_n, chunk_p,
+                chunk_n,
+            );
+    }
+
     let (program_hash, output_hash) = router
-        .finalize(PROOF_ID, state.span(), head_p, head_n, fri_slots, fri_n);
+        .finalize(PROOF_ID, state.span(), head_p, head_n, fri_head_p, fri_head_n);
 
     // The fact hashes must equal the vendored section hashes (the same
     // values the monolithic verifier outputs — proven in test_machine).

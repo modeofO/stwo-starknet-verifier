@@ -1,14 +1,18 @@
 //! qm31-pivot router drive: the REAL blake2s-channel fixture proof driven
 //! end-to-end through the deployed router — the production transaction
-//! shape of the sovereign lane. 48 transactions: 2 sampled staging + 5 fri
-//! staging + begin + 5 claim chunks + claim finalize + 5 lookup chunks +
-//! lookup finalize + oods begin + 15 merged OODS group classes + oods
-//! finalize + fri commit + 9 fused 8-query group txs + finalize. Every tx's
-//! calldata is COUNTED and asserted under the ~4,996-felt usable cap and
-//! every staging tx under the block state-diff budget (4,000 felts, at
-//! TWO felts per storage write — measured on devnet, where a 2,617-write
-//! tx weighed state_diff_size 5,214) — this test is
-//! the measured "everything fits" claim for the pivot, executed.
+//! shape of the sovereign lane (FRI transport v3): 2 sampled staging txs +
+//! begin + 5 claim chunks + claim finalize + 5 lookup chunks + lookup
+//! finalize + oods begin + 15 merged OODS group classes + oods finalize +
+//! fri commit (FriHead calldata) + 9 fused 8-query group txs + N fri
+//! layer-chunk txs + finalize. The fri section is NEVER stored: its bulk
+//! is self-authenticating against the layer commitments and arrives
+//! layer-batched as calldata; the OODS txs supply the sampled section as
+//! calldata too (staged reads cost ~122k gas/slot, devnet-measured) while
+//! the fused group txs read the staged copy (their rows leave no room).
+//! Every tx's calldata is COUNTED and asserted under the ~4,996-felt
+//! usable cap and every staging tx under the block state-diff budget
+//! (4,000 felts at TWO felts per storage write, devnet-measured) — this
+//! test is the measured "everything fits" claim for the pivot, executed.
 //!
 //! The fact must land in the shared registry with program/output hashes
 //! equal to the vendored `encode_and_hash_memory_section` of the claim's
@@ -28,9 +32,9 @@ use stwo_full_verifier_phases::fact_registry::{
 use stwo_full_verifier_phases::machine::HEAD_PROGRAM_ENTRIES;
 use stwo_full_verifier_phases::pack::pack_v2;
 use stwo_full_verifier_phases::router::{
-    IStwoVerifierRouterDispatcher, IStwoVerifierRouterDispatcherTrait, SECTION_FRI,
-    SECTION_SAMPLED, TAG_DONE,
+    IStwoVerifierRouterDispatcher, IStwoVerifierRouterDispatcherTrait, SECTION_SAMPLED, TAG_DONE,
 };
+use crate::fri_v3_util::build_fri_transport;
 use stwo_full_verifier_phases::unpack_proof_v2;
 use stwo_verifier_core::fields::m31::M31;
 use stwo_verifier_core::fields::qm31::{QM31, QM31Serde};
@@ -224,17 +228,16 @@ fn test_router_blake_full_drive_registers_fact() {
     let (router, registry) = deploy_router();
     let (head_p, head_n) = packed(streams.head.span());
     let (sampled_p, sampled_n) = packed(streams.sampled);
-    let (fri_p, fri_n) = packed(streams.fri);
+    let fri_transport = build_fri_transport(streams.fri);
+    let (fri_head_p, fri_head_n) = packed(fri_transport.head_felts.span());
     let program = streams.program;
     let n_entries = program.len();
     let mut txs = 0_u32;
 
-    // Write-once staging: sampled 2,6xx slots -> 2 txs; fri 8,0xx -> 5 txs.
+    // Write-once staging (v3: sampled only, for the fused group txs).
     txs += stage_section(router, SECTION_SAMPLED, sampled_p);
-    txs += stage_section(router, SECTION_FRI, fri_p);
-    assert!(txs == 7, "staging txs");
+    assert!(txs == 2, "staging txs");
     let sampled_slots = SpanTrait::len(sampled_p);
-    let fri_slots = SpanTrait::len(fri_p);
 
     assert_fits("begin", tx_calldata(3, [head_p].span()));
     let mut state = router.begin(PROOF_ID, head_p, head_n, n_entries);
@@ -266,27 +269,28 @@ fn test_router_blake_full_drive_registers_fact() {
     state = router.lookup_finalize(PROOF_ID, state.span(), head_p, head_n);
     txs += 1;
 
-    assert_fits("oods_begin", tx_calldata(5, [state.span(), head_p].span()));
+    // OODS transactions carry the sampled section as CALLDATA (v3).
+    assert_fits("oods_begin", tx_calldata(3, [state.span(), head_p, sampled_p].span()));
     state = router
-        .oods_begin(PROOF_ID, state.span(), head_p, head_n, sampled_slots, sampled_n);
+        .oods_begin(PROOF_ID, state.span(), head_p, head_n, sampled_p, sampled_n);
     txs += 1;
     let mut group_index = 0_u32;
     while group_index != 15 {
-        assert_fits("oods_group", tx_calldata(6, [state.span(), head_p].span()));
+        assert_fits("oods_group", tx_calldata(4, [state.span(), head_p, sampled_p].span()));
         state = router
             .oods_group(
-                PROOF_ID, group_index, state.span(), head_p, head_n, sampled_slots, sampled_n,
+                PROOF_ID, group_index, state.span(), head_p, head_n, sampled_p, sampled_n,
             );
         txs += 1;
         group_index += 1;
     }
-    assert_fits("oods_finalize", tx_calldata(5, [state.span(), head_p].span()));
+    assert_fits("oods_finalize", tx_calldata(3, [state.span(), head_p, sampled_p].span()));
     state = router
-        .oods_finalize(PROOF_ID, state.span(), head_p, head_n, sampled_slots, sampled_n);
+        .oods_finalize(PROOF_ID, state.span(), head_p, head_n, sampled_p, sampled_n);
     txs += 1;
 
-    assert_fits("fri_commit", tx_calldata(5, [state.span(), head_p].span()));
-    state = router.fri_commit(PROOF_ID, state.span(), head_p, head_n, fri_slots, fri_n);
+    assert_fits("fri_commit", tx_calldata(3, [state.span(), head_p, fri_head_p].span()));
+    state = router.fri_commit(PROOF_ID, state.span(), head_p, head_n, fri_head_p, fri_head_n);
     txs += 1;
 
     let mut group = 0_u32;
@@ -306,16 +310,33 @@ fn test_router_blake_full_drive_registers_fact() {
         txs += 1;
         group += 1;
     }
+    // FRI decommit layer chunks: self-authenticating layer proofs as
+    // calldata, folded (queries, evals) riding the checkpoint.
+    let n_layer_chunks = fri_transport.layer_chunks.len();
+    let mut worst_layer_tx = 0_u32;
+    for chunk in fri_transport.layer_chunks.span() {
+        let (chunk_p, chunk_n) = packed(chunk.span());
+        let felts = tx_calldata(4, [state.span(), head_p, fri_head_p, chunk_p].span());
+        assert_fits("fri_layers", felts);
+        worst_layer_tx = core::cmp::max(worst_layer_tx, felts);
+        state = router
+            .fri_layers(
+                PROOF_ID, state.span(), head_p, head_n, fri_head_p, fri_head_n, chunk_p,
+                chunk_n,
+            );
+        txs += 1;
+    }
     println!(
-        "blake router drive: sampled {} slots, fri {} slots, worst group tx {} felts",
-        sampled_slots, fri_slots, worst_group_tx,
+        "blake router drive: sampled {} slots, fri head {} slots, {} layer chunks (worst {} felts), worst group tx {} felts",
+        sampled_slots, SpanTrait::len(fri_head_p), n_layer_chunks, worst_layer_tx,
+        worst_group_tx,
     );
 
-    assert_fits("finalize", tx_calldata(5, [state.span(), head_p].span()));
+    assert_fits("finalize", tx_calldata(3, [state.span(), head_p, fri_head_p].span()));
     let (program_hash, output_hash) = router
-        .finalize(PROOF_ID, state.span(), head_p, head_n, fri_slots, fri_n);
+        .finalize(PROOF_ID, state.span(), head_p, head_n, fri_head_p, fri_head_n);
     txs += 1;
-    assert!(txs == 48, "total transactions");
+    assert!(txs == 43 + n_layer_chunks, "total transactions");
 
     // Same fact definition as the poseidon build: the vendored poseidon
     // section hashes (contract-side binding, not stwo transcript state).

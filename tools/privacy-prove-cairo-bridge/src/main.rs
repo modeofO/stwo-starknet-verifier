@@ -75,7 +75,13 @@
 //!                               slices; the claim AND lookup phases replay
 //!                               the same files at the same boundaries);
 //!         sampled.txt         — the sampled-values section;
-//!         fri.txt             — the FriProof section;
+//!         fri_head.txt        — the FriHead commitment slice (transport
+//!                               v3: first/inner commitments + last-layer
+//!                               poly — all fri_commit/fri_layers/finalize
+//!                               consume as calldata);
+//!         fri_layers_NN.txt   — greedy layer-batched Array<FriLayerProof>
+//!                               chunks (chunk 0 led by the first-layer
+//!                               proof), each ≤ 4,300 packed slots;
 //!         group_NN_rows.txt / group_NN_witnesses.txt
 //!                             — per query group: queried-value row slices
 //!                               (Array<Span<M31>> serde) and synthesized
@@ -930,7 +936,59 @@ where
     manifest.insert("group_size".into(), group_size.into());
     manifest.insert("head".into(), write_packed(out_dir, "head.txt", &head)?);
     manifest.insert("sampled".into(), write_packed(out_dir, "sampled.txt", &sampled_felts)?);
-    manifest.insert("fri".into(), write_packed(out_dir, "fri.txt", &fri_felts)?);
+
+    // --- FRI transport v3: FriHead commitment slice + layer chunks --------
+    // (docs/lane2-design.md, "Devnet drive: the gas oracle falsifies the
+    // staged-fri design"). The fri section is never stored on-chain: the
+    // head (first/inner commitments + last-layer poly, the transcript-
+    // relevant slice) goes to fri_commit / every fri_layers chunk /
+    // finalize as calldata, and the layer proofs go layer-batched as
+    // calldata chunks (serialized Array<FriLayerProof>, chunk 0 led by the
+    // first-layer proof), greedily cut under the packed-slot budget.
+    const MAX_LAYER_CHUNK_SLOTS: usize = 4_300;
+    let fri = &scheme_proof.fri_proof;
+    let fri_head = ser(&|out| {
+        CairoSerialize::serialize(&fri.first_layer.commitment, out);
+        let inner_commitments: Vec<_> =
+            fri.inner_layers.iter().map(|layer| layer.commitment.clone()).collect();
+        CairoSerialize::serialize(&*inner_commitments, out);
+        CairoSerialize::serialize(&fri.last_layer_poly, out);
+    });
+    // Self-check: the per-piece serializations must reassemble the fri
+    // section exactly (FriProof serde = first_layer + inner_layers array +
+    // last_layer_poly).
+    let reassembled = ser(&|out| {
+        CairoSerialize::serialize(&fri.first_layer, out);
+        CairoSerialize::serialize(&*fri.inner_layers, out);
+        CairoSerialize::serialize(&fri.last_layer_poly, out);
+    });
+    if reassembled != fri_felts {
+        return Err("fri layer slices do not reassemble the fri section".into());
+    }
+    manifest.insert("fri_head".into(), write_packed(out_dir, "fri_head.txt", &fri_head)?);
+
+    let all_layers: Vec<_> = std::iter::once(fri.first_layer.clone())
+        .chain(fri.inner_layers.iter().cloned())
+        .collect();
+    let mut layer_chunks: Vec<Vec<FieldElement252>> = Vec::new();
+    let mut current: Vec<_> = vec![all_layers[0].clone()];
+    for layer in &all_layers[1..] {
+        let mut candidate = current.clone();
+        candidate.push(layer.clone());
+        let felts = ser(&|out| CairoSerialize::serialize(&*candidate, out));
+        if pack_v2(&felts).len() <= MAX_LAYER_CHUNK_SLOTS {
+            current = candidate;
+        } else {
+            layer_chunks.push(ser(&|out| CairoSerialize::serialize(&*current, out)));
+            current = vec![layer.clone()];
+        }
+    }
+    layer_chunks.push(ser(&|out| CairoSerialize::serialize(&*current, out)));
+    let mut fri_layers = Vec::new();
+    for (index, chunk) in layer_chunks.iter().enumerate() {
+        fri_layers.push(write_packed(out_dir, &format!("fri_layers_{index:02}.txt"), chunk)?);
+    }
+    manifest.insert("fri_layers".into(), fri_layers.into());
 
     let mut chunks = Vec::new();
     for (index, chunk) in chunk_streams.iter().enumerate() {
@@ -984,8 +1042,9 @@ where
     let manifest_path = out_dir.join("manifest.json");
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
     eprintln!(
-        "emitted head + {} chunks + sampled + fri + {} groups to {} (manifest: {})",
+        "emitted head + {} chunks + sampled + fri head + {} fri layer chunks + {} groups to {} (manifest: {})",
         chunk_streams.len(),
+        layer_chunks.len(),
         n_groups,
         out_dir.display(),
         manifest_path.display()

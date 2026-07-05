@@ -13,6 +13,7 @@ use stwo_cairo_air::claim::CairoInteractionClaim;
 use stwo_cairo_air::claims::CairoClaim;
 use stwo_full_verifier_phases::machine::HEAD_PROGRAM_ENTRIES;
 use stwo_full_verifier_phases::unpack_proof_v2;
+use crate::fri_v3_util::build_fri_transport;
 use stwo_verifier_core::fields::m31::M31;
 use stwo_verifier_core::fields::qm31::{QM31, QM31Serde};
 use stwo_verifier_core::fri::FriProof;
@@ -28,7 +29,9 @@ const FELTS_PER_ENTRY: u32 = 9;
 // Unpacked section lengths (tests/data/calldata/manifest.json).
 const HEAD_N: u32 = 446;
 const SAMPLED_N: u32 = 18_261;
-const FRI_N: u32 = 10_413;
+// FRI transport v3: the FriHead commitment slice + 3 layer chunks.
+const FRI_HEAD_N: u32 = 27;
+const FRI_LAYERS_N: [u32; 3] = [4_337, 5_269, 803];
 const CHUNK_N: [u32; 5] = [4_861, 4_861, 4_861, 4_861, 3_934];
 const ROWS_N: [u32; 5] = [55_877, 55_877, 55_877, 55_877, 20_957];
 const WITNESSES_N: [u32; 5] = [969, 969, 1_017, 1_053, 383];
@@ -109,7 +112,29 @@ fn test_emitted_calldata_matches_streams() {
     assert_section_eq(
         read_calldata("sampled.txt", SAMPLED_N).span(), streams.sampled, "sampled",
     );
-    assert_section_eq(read_calldata("fri.txt", FRI_N).span(), streams.fri, "fri");
+    // FRI transport v3: the emitted head + layer chunks must equal the
+    // in-Cairo slicing of the carved fri section (fri_v3_util's greedy
+    // cut under the same 4,300-packed-slot budget).
+    let fri_transport = build_fri_transport(streams.fri);
+    assert_section_eq(
+        read_calldata("fri_head.txt", FRI_HEAD_N).span(),
+        fri_transport.head_felts.span(),
+        "fri head",
+    );
+    assert!(fri_transport.layer_chunks.len() == 3, "fri layer chunk count");
+    let mut layer_chunk = 0_u32;
+    for chunk in fri_transport.layer_chunks.span() {
+        assert_section_eq(
+            read_calldata(
+                format!("fri_layers_0{}.txt", layer_chunk),
+                *FRI_LAYERS_N.span()[layer_chunk],
+            )
+                .span(),
+            chunk.span(),
+            format!("fri layers {}", layer_chunk),
+        );
+        layer_chunk += 1;
+    }
 
     // Program-entry chunks: each file is the serde of the exact
     // MemorySection slice the claim/lookup phases consume.
