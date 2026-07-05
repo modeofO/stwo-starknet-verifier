@@ -2,5 +2,13 @@
 version = 1
 
 [[package]]
+name = "messagezk_scan"
+version = "0.1.0"
+
+[[package]]
 name = "poseidon_chain"
+version = "0.1.0"
+
+[[package]]
+name = "zkmsg_vectors"
 version = "0.1.0"
