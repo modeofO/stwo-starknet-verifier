@@ -15,12 +15,19 @@ StwoFactRegistry  ◄── lane 1: recursion route (shipped first)
                   ◄── lane 2: sovereign route (the desired end state)
 ```
 
-A **fact** is `poseidon(output_hash words)` where `output_hash` binds — via a
-blake2s hash chain — the application program's hash and its public outputs
-(for messagezk: `(commitment, ephemeral_pubkey, merkle_root)`). Both lanes
-prove the *same statement*, so consumers are lane-agnostic. The set of
-verifier routes that may write facts must be owner-gated and eventually
-frozen — a swappable verifier is a rug vector.
+A **fact** binds the application program's hash and its public outputs
+(for messagezk: `(commitment, ephemeral_pubkey, merkle_root)`). Lane 1
+registers `poseidon(output_hash words)` where `output_hash` reaches the
+program via a blake2s hash chain through the recursion circuits
+(`stwo_fact_binding` recomputes it from application data); lane 2
+registers `poseidon(program_hash, output_hash)` from the vendored
+poseidon section hashes directly. Both lanes prove the *same statement*.
+The set of verifier routes that may write facts must be owner-gated and
+eventually frozen — a swappable verifier is a rug vector. This is now a
+contract: `StwoSharedFactRegistry`
+(`contracts/stwo_full_verifier_phases/src/fact_registry.cairo`) with an
+owner-governed route list and a one-way `freeze_routes()`; consumers
+should check `routes_frozen()` before trusting a deployment.
 
 ## Lane 1 — recursion route (built; this repo)
 
@@ -49,34 +56,36 @@ StwoFactRegistry.verify_and_register    (~3.8M steps ≈ 38% of one tx)
   two payloads per proof; the upstream `recursive_tree` tooling suggests
   deeper batching later.
 
-## Lane 2 — sovereign route (the end state; not yet built)
+## Lane 2 — sovereign route (built in snforge; gateway-gated on qm31)
 
 The client and the chain, nothing else:
 
 ```
-browser: prove app program (poseidon channel config)
-   │ 65k+ felt proof
+client: prove app program (~6 s blake2s channel / 257 s poseidon)
+   │ 301–376k-felt proof, packed ~7:1
    ▼
-stage_proof × 13–45                     (user's own wallet)
-resumable full Cairo verifier           (10–16M steps split across N txs,
-   │                                     channel/FRI state checkpointed in storage)
+StwoVerifierRouter.stage × 4            (sampled + fri sections, write-once)
+56 machine transactions                 (26.6–34.2M steps; 36 stateless library
+   │                                     classes driven by the router's tagged
+   │                                     (caller, proof_id) checkpoint slot)
    ▼
-same FactRegistry, same fact format
+StwoSharedFactRegistry                  (governed, freezable route list;
+                                         fact = poseidon(program_hash, output_hash))
 ```
 
 Slow and gas-expensive by choice — its value is that **no third party exists
-in the flow, not even a censorship-only one** (metadata privacy). Known
-engineering walls, all measured in Spikes 1–2:
+in the flow, not even a censorship-only one** (metadata privacy). The
+engineering walls from Spikes 1–2 are all closed (docs/lane2-design.md):
+class splitting (36 deployable classes, all under the three declare caps on
+the qm31 build), the resumable machine (proven == monolithic on real
+proofs, both channels), and transport (every one of the 60 transactions'
+calldata asserted under the ~4,996-felt cap in `test_router_blake`).
 
-- the full verifier is ~450k Sierra felts → split across ~6+ classes wired
-  by library calls;
-- verification is 10–16M steps → resumable state machine (Integrity-style);
-- the contract-legal (poseidon) configuration has no `ec_op`/`pedersen`
-  builtins → messagezk's EC math must be pure field arithmetic;
-- browser proofs must be bootloader-shaped (all-11-builtin public segments).
-
-Watch item: if the qm31 opcode ever enters `audited.json`, most of the size
-and step cost collapses and lane 2 gets dramatically cheaper.
+What remains is not engineering: the Sepolia **gateway rejects qm31
+declares** (`tools/qm31-gate-probe` is the 30-second re-test). The
+poseidon build declares today but its mul_opcode/cube_252-A classes
+exceed the CASM cap; the qm31/blake build fits everything and waits on
+the gate.
 
 ## Build order rationale
 

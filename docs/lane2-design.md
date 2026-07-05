@@ -513,11 +513,12 @@ Two blake-specific findings and their fixes, then the measured verdict:
 
 ## The router (built 2026-07-05, `src/router.cairo`)
 
-`StwoVerifierRouter` (6,103 Sierra felts) is the production contract that
-drives the machine across transactions. The 36 machine classes stay
-stateless library classes; the router owns the only storage — one
-checkpoint slot per (caller, proof_id) holding `(tag, poseidon(state))`
-(~2 storage felts per in-flight proof, total). Every transaction:
+`StwoVerifierRouter` (6,404 Sierra felts with the staged-section store)
+is the production contract that drives the machine across transactions.
+The 36 machine classes stay stateless library classes; the router owns
+the only storage — one checkpoint slot per (caller, proof_id) holding
+`(tag, poseidon(state))` plus the write-once staged sections (see the
+staged-section store section below). Every transaction:
 
 1. the caller echoes the previous serialized state as calldata;
 2. the router checks `poseidon(state)` against the slot AND that the
@@ -534,20 +535,92 @@ Write-once sequencing falls out of the tag chain: `begin` requires an
 empty slot ('router: proof id in use'), and every step overwrites the
 slot, so a phase can never re-run against a stale state. Big sections
 arrive packed (v2; `unpack_proof_v2` in the router; `src/pack.cairo` is
-the in-Cairo packer used by tests). `finalize` stores
-`poseidon(program_hash, output_hash)` in a local fact map — a
-placeholder for the shared `StwoFactRegistry` route.
+the in-Cairo packer used by tests). `finalize` registers
+`poseidon(program_hash, output_hash)` with the shared fact registry (see
+"The staged-section store and the registry route" below).
 
 `tests/test_router.cairo`: the REAL fixture proof driven through the
-deployed router end-to-end — **52 transactions** (begin + 5 claim chunks
-+ claim finalize + 5 lookup chunks + lookup finalize + oods begin + 30
-OODS groups + oods finalize + fri commit + 5 fused group txs + finalize),
-all sections packed-v2, ~24.3e9 total L2 gas ≈ **~470M gas/tx average**
-(well under the 1.21e9 per-invoke cap; the devnet pre-flight measures
-the real per-tx spread). The registered fact's hashes equal the vendored
+deployed router end-to-end — **56 transactions** (1 sampled staging +
+3 fri staging + begin + 5 claim chunks + claim finalize + 5 lookup
+chunks + lookup finalize + oods begin + 30 OODS groups + oods finalize
++ fri commit + 5 fused group txs + finalize; the group txs are 16-query
+on the poseidon fixture — production is 8-query, exercised by the blake
+drive), ~34.2e9 total L2 gas ≈ **~610M gas/tx average** (up from
+24.3e9 / ~470M before the staged store: reading ~2.6k staged slots per
+consuming tx trades calldata-cap compliance for storage-read gas — the
+per-invoke cap is what binds and every tx stays under 1.21e9; the
+devnet pre-flight measures the real per-tx spread). The registered
+fact's hashes equal the vendored
 `encode_and_hash_memory_section` of the claim's program/output sections.
-Rejections: proof-id reuse, wrong-tag state, tampered state echo — all
-against one deployment, honest step still lands afterwards.
+Rejections: proof-id reuse, wrong-tag state, tampered state echo,
+non-route fact registration — all against one deployment, honest step
+still lands afterwards.
+
+## The staged-section store and the registry route (built 2026-07-05)
+
+The two over-cap transport items (fri 8,045 slots, 16-query group rows
+8,111 slots on the blake fixture — both > the ~4,996-felt usable cap)
+are closed by ONE mechanism plus a group-size change, and the fact store
+moved from the router-local placeholder to the shared registry:
+
+- **`stage(proof_id, section, offset, slots)`** — lane-1 `stage_proof`
+  precedent: write-once staging of a packed section under
+  (caller, proof_id, section, slot), ≤ ~3,900 slots per staging tx (the
+  4,000-entry state-diff cap binds before the calldata cap). Caller-keyed,
+  so it cannot be griefed; a caller overwriting their own staged bytes
+  after a phase consumed them just fails the digest binding.
+- **`SECTION_FRI` (~8.0k slots → 3 staging txs)** is read back from
+  storage by `fri_commit` AND `finalize` instead of arriving as calldata.
+  Binding: `machine_fri_commit` now saves `d_fri = poseidon(fri felts)`
+  in the group-phase checkpoint and `machine_finalize` asserts the
+  re-read bytes hash to it — on top of the lane-1 query-equality binding
+  (finalize re-runs the FRI commitment transcript from `digest_pre_fri`
+  anyway, since it needs the `FriVerifier` for the decommit, and asserts
+  the re-derived query positions equal the checkpointed ones).
+- **`SECTION_SAMPLED` (~2.6k slots → 1 staging tx)** is read back by
+  `oods_begin`, all 30 `oods_group` txs, `oods_finalize` and every fused
+  `group` tx — 41 transactions stop re-supplying 2.6k felts each.
+  Binding: the machine's existing `d_sampled` checkpoint digest, saved by
+  the OODS begin from the transcript-bound mix; no machine change needed.
+- **This supersedes the derived-constants store** (the
+  `test_constants_probe` verdict (a)): the OODS phase needs the RAW
+  sampled section anyway, so staging it once serves all 41 consumers with
+  no extra derivation transaction, at equal soundness; the group txs keep
+  the stateless constants recompute (~184e6 gas each — measured
+  affordable). A separate 2.9k-slot constants store would add a second
+  store + a derivation tx to save recompute gas that never binds.
+- **Group size drops 16 → 8 queries** (bridge `split-witness … 8`):
+  16-query rows alone are ~8.1k packed slots; with the sampled re-supply
+  gone, an 8-query group tx is rows (~4,056 slots) + witnesses (~76 —
+  8-u32-word blake hashes pack 7:1) + head (69) + the state echo =
+  **4,872 felts worst case, measured < the cap** and asserted per-tx in
+  the blake drive. 70 queries → 9 fused group txs. The state echo itself
+  had to shrink to get here: the accumulated fri-answer M31 components
+  now ride the checkpoint packed 7-per-felt (`pack_answers` in
+  machine.cairo, with an explicit component count since the padded tail
+  is ambiguous) — unpacked they pushed the worst group tx to 5,007
+  felts, 11 over the cap. The cap-assert in the test caught this;
+  estimates did not.
+- **The shared fact registry** (`src/fact_registry.cairo`,
+  `StwoSharedFactRegistry`): the two-lane convergence point of
+  docs/architecture.md. Owner adds verifier ROUTES (the router), then
+  `freeze_routes()` makes the set immutable forever (a swappable verifier
+  is a rug vector — consumers should check `routes_frozen()`). The
+  router's `finalize` now calls `register_fact` on its constructor-pinned
+  registry address; the fact definition is unchanged
+  (`poseidon(program_hash, output_hash)`, both vendored
+  `encode_and_hash_memory_section` values — identical across the
+  poseidon/blake builds, `stwo_fact_binding` untouched).
+
+`tests/test_router_blake.cairo` (the qm31-pivot suite) is the executed
+"everything fits" claim: the real blake proof driven through the deployed
+router in **60 transactions** (4 staging + 56 machine txs, 8-query
+groups), with EVERY transaction's calldata counted and asserted ≤ 4,996
+felts and every staging tx ≤ 3,900 slots. Measured on the drive: sampled
+2,617 slots, fri 8,045 slots, worst fused group tx **4,872 felts**;
+~35.0e9 L2 gas total (~580M/tx average — group txs pay the staged-read
+plus the stateless constants recompute; the per-tx spread is a devnet
+pre-flight item).
 
 ## The calldata emitter (built 2026-07-05, bridge `emit-calldata`)
 
@@ -572,15 +645,15 @@ the committed proof fixture.
 usable felt cap: head 69, program chunks ≤781, sampled 2,609 — the
 claim/lookup/OODS transactions all fit comfortably (worst OODS group tx:
 head + sampled + state echo + carry ≈ 3.6k). Two transport items exceed
-the cap, both already scoped in "Machine plan v2":
+the cap; **both closed by the staged-section store + 8-query groups**
+(see the section above):
 
 - **fri section: 8,873 slots** (10,413 felts, mostly unpackable poseidon
-  hashes) — consumed whole by fri_commit AND finalize; needs lane-1
-  style write-once storage staging (~3 staging txs under the 4,000-entry
-  state-diff cap) before those phases.
-- **group rows at 16 queries/tx: 7,983 slots** — needs the settled
-  one-time packed constants store (drops the 2.6k sampled re-supply from
-  group txs → 8–9 queries/tx) or group size ~4 with stateless recompute.
+  hashes; 8,045 under blake) — consumed whole by fri_commit AND finalize;
+  now staged write-once (3 staging txs) and read back, `d_fri`-bound.
+- **group rows at 16 queries/tx: 7,983 slots** (8,111 under blake) — now
+  8-query groups with the sampled section staged (its 2.6k re-supply
+  gone from group txs), stateless constants recompute kept.
 
 ## Client side
 
@@ -767,10 +840,21 @@ as lane 1 — see proof-only-wrapping.md).
     exercise today; column-range slicing (b) matches (a)'s tx count only
     by forking the vendored accumulation loop and transposing the row
     binding — not worth the surgery.
+    **Superseded 2026-07-05 by the raw-sampled staged store** ("The
+    staged-section store" above): staging the raw sampled section once
+    serves the OODS phase AND the group txs from one store with no
+    derivation transaction; group txs keep recompute (c). Same tx-count
+    win, fewer moving parts.
 - **Revised tx estimate: ~25–40 per fact** (the 12.8e9-gas compute floor
   said ~11; transport, rebinding and the constants overhead roughly double
   to triple the count at lower per-tx gas). Still storage-free except
   checkpoints. Honest sovereign-lane pricing pending devnet calibration.
+  **Measured 2026-07-05: 60 transactions on the blake fixture** (4
+  staging + 56 machine txs at 8-query groups), every tx's calldata
+  asserted under the cap — see "The staged-section store". The estimate
+  band held; merging small OODS neighbours is the remaining tx-count
+  lever (the component evals shrink ~5× in CASM under qm31, so ~10–12
+  merged group classes look feasible).
 
 ## Open questions
 

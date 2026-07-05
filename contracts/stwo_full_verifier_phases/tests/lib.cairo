@@ -31,3 +31,5 @@ mod test_witness_groups;
 mod test_machine_blake;
 #[cfg(not(feature: "poseidon252_verifier"))]
 mod test_oods_chunks_blake;
+#[cfg(not(feature: "poseidon252_verifier"))]
+mod test_router_blake;

@@ -42,10 +42,13 @@
 //!   transactions' re-supply.
 //! - **queried rows + witnesses**: self-authenticating (Merkle-verified on
 //!   arrival against roots already bound upstream).
-//! - **fri section**: re-supplied at finalize; binding is the lane-1 query
-//!   equality — the finalize transaction re-runs the FRI commitment
+//! - **fri section**: consumed by `machine_fri_commit`, which saves its
+//!   digest `d_fri` in the checkpoint; the finalize transaction's re-supply
+//!   (in production: the router's write-once staged copy) must hash to
+//!   `d_fri`. Belt and braces: finalize also re-runs the FRI commitment
 //!   transcript from the checkpointed digest and requires the re-derived
-//!   query positions to equal the checkpointed ones.
+//!   query positions to equal the checkpointed ones (the lane-1 query
+//!   equality — it needs the `FriVerifier` anyway for the decommit).
 //! - **checkpoint values** (digests, ood point, positions, accumulators,
 //!   fact hash): written by the machine itself, trusted like lane 1's
 //!   checkpoint (write-once per phase in the contract wrapper).
@@ -276,23 +279,61 @@ pub struct GroupPhaseState {
     pub d_head: felt252,
     pub digest_pre_fri: Hash,
     pub d_sampled: felt252,
+    pub d_fri: felt252,
     pub ood_x: QM31,
     pub ood_y: QM31,
     pub query_positions: Span<u32>,
     pub queries_done: u32,
-    /// Accumulated fri answers, flattened to M31 components (4 per QM31).
+    /// Accumulated fri answers as M31 components (4 per QM31), packed 7
+    /// components per felt — the state is echoed as calldata every group
+    /// transaction, and unpacked M31s would out-grow the calldata budget
+    /// (measured: 4 unpacked components/answer pushed the worst 8-query
+    /// group tx to 5,007 felts, 11 over the ~4,996 cap).
     pub answers_flat: Array<felt252>,
+    /// Number of M31 components inside [`Self::answers_flat`] (the packed
+    /// tail is zero-padded, so the count cannot be derived from length).
+    pub answers_n: u32,
     pub program_fact_hash: felt252,
 }
 
-fn flatten_answers(ref flat: Array<felt252>, answers: Span<QM31>) {
-    for answer in answers {
-        let [a, b, c, d] = (*answer).to_fixed_array();
-        flat.append(a.into());
-        flat.append(b.into());
-        flat.append(c.into());
-        flat.append(d.into());
+/// Packs M31 components 7 per felt, little-endian 32-bit limbs (the
+/// transport packer's layout, minus escapes — M31s never need them).
+fn pack_answers(mut components: Span<felt252>) -> Array<felt252> {
+    let mut packed: Array<felt252> = array![];
+    while !components.is_empty() {
+        let mut slot: felt252 = 0;
+        let mut shift: felt252 = 1;
+        let mut k = 0_u32;
+        while k != 7 {
+            match components.pop_front() {
+                Some(c) => slot += *c * shift,
+                None => {},
+            }
+            shift *= 0x100000000;
+            k += 1;
+        }
+        packed.append(slot);
     }
+    packed
+}
+
+fn unpack_answers(packed: Span<felt252>, n: u32) -> Array<felt252> {
+    let nz32: NonZero<u128> = 0x100000000_u128.try_into().unwrap();
+    let mut components: Array<felt252> = array![];
+    for slot in packed {
+        let v: u256 = (*slot).into();
+        let (q, l0) = DivRem::div_rem(v.low, nz32);
+        let (q, l1) = DivRem::div_rem(q, nz32);
+        let (l3, l2) = DivRem::div_rem(q, nz32);
+        let (q, l4) = DivRem::div_rem(v.high, nz32);
+        let (l6, l5) = DivRem::div_rem(q, nz32);
+        for l in [l0, l1, l2, l3, l4, l5, l6].span() {
+            if components.len() != n {
+                components.append((*l).into());
+            }
+        }
+    }
+    components
 }
 
 fn unflatten_answers(mut flat: Span<felt252>) -> Array<QM31> {
@@ -608,11 +649,13 @@ pub fn machine_fri_commit(
         d_head,
         digest_pre_fri,
         d_sampled,
+        d_fri: poseidon_hash_span(fri_felts),
         ood_x,
         ood_y,
         query_positions: queries.positions,
         queries_done: 0,
         answers_flat: array![],
+        answers_n: 0,
         program_fact_hash,
     }
 }
@@ -628,8 +671,8 @@ pub fn machine_group(
     witnesses: Array<Span<Hash>>,
 ) -> GroupPhaseState {
     let GroupPhaseState {
-        d_head, digest_pre_fri, d_sampled, ood_x, ood_y, query_positions, queries_done,
-        mut answers_flat, program_fact_hash,
+        d_head, digest_pre_fri, d_sampled, d_fri, ood_x, ood_y, query_positions, queries_done,
+        answers_flat, answers_n, program_fact_hash,
     } = state;
     let h = check_head(head, d_head);
     assert(poseidon_hash_span(sampled_felts) == d_sampled, 'sampled binding');
@@ -687,17 +730,27 @@ pub fn machine_group(
         rows,
         log_trace_degree_bound,
     );
-    flatten_answers(ref answers_flat, answers);
+    let mut components = unpack_answers(answers_flat.span(), answers_n);
+    for answer in answers {
+        let [a, b, c, d] = (*answer).to_fixed_array();
+        components.append(a.into());
+        components.append(b.into());
+        components.append(c.into());
+        components.append(d.into());
+    }
+    let answers_n = components.len();
 
     GroupPhaseState {
         d_head,
         digest_pre_fri,
         d_sampled,
+        d_fri,
         ood_x,
         ood_y,
         query_positions,
         queries_done: queries_done + n,
-        answers_flat,
+        answers_flat: pack_answers(components.span()),
+        answers_n,
         program_fact_hash,
     }
 }
@@ -709,11 +762,13 @@ pub fn machine_finalize(
     state: GroupPhaseState, head: Span<felt252>, fri_felts: Span<felt252>,
 ) -> FullVerificationOutput {
     let GroupPhaseState {
-        d_head, digest_pre_fri, d_sampled: _, ood_x: _, ood_y: _, query_positions, queries_done,
-        answers_flat, program_fact_hash,
+        d_head, digest_pre_fri, d_sampled: _, d_fri, ood_x: _, ood_y: _, query_positions,
+        queries_done, answers_flat, answers_n, program_fact_hash,
     } = state;
     assert!(queries_done == SpanTrait::len(query_positions), "query groups incomplete");
     let h = check_head(head, d_head);
+    // The re-supplied fri section must be the bytes fri_commit consumed.
+    assert(poseidon_hash_span(fri_felts) == d_fri, 'fri binding');
 
     let mut fri_span = fri_felts;
     let fri_proof: FriProof = Serde::deserialize(ref fri_span).expect('fri deser');
@@ -740,7 +795,11 @@ pub fn machine_finalize(
     let queries = fri_verifier.sample_query_positions(ref channel);
     assert(queries.positions == query_positions, 'query binding');
 
-    fri_verifier.decommit(queries, unflatten_answers(answers_flat.span()).span());
+    fri_verifier
+        .decommit(
+            queries,
+            unflatten_answers(unpack_answers(answers_flat.span(), answers_n).span()).span(),
+        );
 
     let output_hash = construct_f252(
         encode_and_hash_memory_section(h.claim.public_data.public_memory.output),

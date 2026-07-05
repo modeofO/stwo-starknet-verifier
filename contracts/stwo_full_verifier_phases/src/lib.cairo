@@ -6,6 +6,7 @@ pub mod claim_mix;
 #[cfg(not(feature: "poseidon252_verifier"))]
 pub mod claim_mix_blake;
 pub mod channel_compat;
+pub mod fact_registry;
 pub mod fri_chunks;
 pub mod lookup_chunks;
 pub mod machine;

@@ -204,10 +204,30 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   ~4,996 cap — fri staging stays**; group rows 8,111 → the constants
   store / smaller groups stays. Both transport work items survive the
   pivot unchanged.
-- **Next:** fri-section write-once staging + the one-time constants
-  store (the two calldata-cap items, now confirmed under blake), a
-  blake router drive in snforge, the qm31 gate-probe re-test on
-  Starknet version bumps, Sepolia campaign under the registry's
+- **Transport CLOSED + the registry route (2026-07-05)** — the two
+  over-cap calldata items are gone: the router gained a write-once
+  **staged-section store** (lane-1 `stage_proof` precedent; caller-keyed
+  `(proof_id, section, slot)` packed storage). The fri section (8,045
+  slots) stages in 3 txs and is read back by `fri_commit` AND `finalize`,
+  bound by a new `d_fri` checkpoint digest (+ the lane-1 query-equality
+  re-derivation); the sampled section (2,617 slots) stages in 1 tx and
+  serves 41 transactions (OODS begin/30 groups/finalize + all fused
+  group txs) — superseding the derived-constants store: raw sampled
+  serves everyone with no derivation tx. Fused groups drop to **8
+  queries/tx** (worst group tx measured 4,872 felts < the ~4,996 cap;
+  getting there also required packing the checkpoint's accumulated
+  fri-answer M31s 7-per-felt — unpacked they overflowed by 11 felts,
+  caught by the per-tx assert, not by estimation). `finalize` now
+  registers into **`StwoSharedFactRegistry`** — the
+  two-lane convergence contract with an owner-governed, freezable route
+  list (fact definition unchanged). The blake drive
+  (`tests/test_router_blake.cairo`) runs the real proof through the
+  deployed router in **60 transactions with every tx's calldata counted
+  and asserted under the cap** — the "everything fits" claim, executed.
+  Poseidon drive: 56 txs. Both suites green.
+- **Next:** the qm31 gate-probe re-test on Starknet version bumps,
+  devnet declare pre-flight of the 36 blake classes + a devnet router
+  drive with real gas numbers, Sepolia campaign under the registry's
   governed route list; confirm the Controller envelope with a live
   Sepolia session transaction.
 

@@ -3,10 +3,11 @@
 //!
 //! The machine classes are stateless library classes; the router owns the
 //! only storage: one checkpoint slot per (caller, proof_id) holding
-//! `(tag, poseidon(state))`. Every transaction re-supplies the previous
-//! serialized state (calldata, not storage), the router checks its hash
-//! and tag, library-calls the fixed class for that step, stores the new
-//! tagged hash and returns the new state for the caller to echo next.
+//! `(tag, poseidon(state))`, plus the write-once staged-section store.
+//! Every transaction re-supplies the previous serialized state (calldata,
+//! not storage), the router checks its hash and tag, library-calls the
+//! fixed class for that step, stores the new tagged hash and returns the
+//! new state for the caller to echo next.
 //!
 //! Write-once sequencing falls out of the tag chain: `begin` requires an
 //! empty slot, every other step requires the slot to hold exactly the tag
@@ -14,16 +15,36 @@
 //! phase can never be re-run against a stale state (its tag has moved on)
 //! and a state can never be fed to a phase of the wrong type (tag
 //! mismatch). The intra-phase ordering (claim/lookup chunk counts, the
-//! 49-family OODS sequence, query groups) is enforced by the machine
+//! N-family OODS sequence, query groups) is enforced by the machine
 //! states themselves.
 //!
-//! Big sections arrive packed (packing v2, `unpack_proof_v2`); the state
-//! echo rides unpacked (it is dominated by digests, which do not pack).
+//! ## The staged-section store
 //!
-//! The fact store here (`poseidon(program_hash, output_hash)`) is a
-//! placeholder for the shared `StwoFactRegistry` route (governed route
-//! list) — the registry wiring replaces `register_fact` when the router
-//! is added as a route.
+//! Two proof sections exceed the ~4,996-felt usable calldata cap and are
+//! consumed by MANY transactions, so they arrive once via `stage` (packed
+//! v2, lane-1 `stage_proof` precedent; ≤ ~3,990 slots per staging tx under
+//! the 4,000-entry state-diff cap) and are read back from storage:
+//!
+//! - `SECTION_SAMPLED` (~2.6k slots, 1 staging tx): read by `oods_begin`,
+//!   every `oods_group`, `oods_finalize` and every fused `group` tx.
+//!   Binding: the machine's `d_sampled` checkpoint digest (saved by
+//!   `oods_begin` from the transcript-bound mix).
+//! - `SECTION_FRI` (~8k slots, 3 staging txs): read by `fri_commit` and
+//!   `finalize`. Binding: `d_fri` rides the checkpoint from `fri_commit`
+//!   to `finalize` (plus the lane-1 query-equality re-derivation).
+//!
+//! Slots are keyed by (caller, proof_id, section), so staging cannot be
+//! griefed by third parties; a caller overwriting their own staged bytes
+//! after a phase consumed them just fails the digest binding. Everything
+//! else (head, program chunks, per-group rows + witnesses, the state echo)
+//! fits calldata directly — rows and witnesses are self-authenticating
+//! (Merkle-verified on arrival), so storing them would buy nothing.
+//!
+//! `finalize` registers the fact with the shared `StwoSharedFactRegistry`
+//! (constructor-pinned address; the router must be on the registry's
+//! governed route list). The fact is `poseidon(program_hash, output_hash)`.
+
+use starknet::ContractAddress;
 
 /// Checkpoint tags — one per machine state type.
 pub const TAG_NONE: felt252 = 0;
@@ -35,8 +56,21 @@ pub const TAG_FRI_COMMIT: felt252 = 5;
 pub const TAG_GROUP: felt252 = 6;
 pub const TAG_DONE: felt252 = 7;
 
+/// Staged-section ids.
+pub const SECTION_SAMPLED: felt252 = 'sampled';
+pub const SECTION_FRI: felt252 = 'fri';
+
 #[starknet::interface]
 pub trait IStwoVerifierRouter<TContractState> {
+    /// Stages `slots` of a packed section at slot `offset` under the
+    /// caller's `proof_id`. Sections: [`SECTION_SAMPLED`], [`SECTION_FRI`].
+    fn stage(
+        ref self: TContractState,
+        proof_id: felt252,
+        section: felt252,
+        offset: u32,
+        slots: Span<felt252>,
+    );
     fn begin(
         ref self: TContractState,
         proof_id: felt252,
@@ -78,7 +112,7 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        sampled_packed: Span<felt252>,
+        sampled_slots: u32,
         sampled_n: u32,
     ) -> Array<felt252>;
     fn oods_group(
@@ -88,7 +122,7 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        sampled_packed: Span<felt252>,
+        sampled_slots: u32,
         sampled_n: u32,
     ) -> Array<felt252>;
     fn oods_finalize(
@@ -97,7 +131,7 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        sampled_packed: Span<felt252>,
+        sampled_slots: u32,
         sampled_n: u32,
     ) -> Array<felt252>;
     fn fri_commit(
@@ -106,7 +140,7 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        fri_packed: Span<felt252>,
+        fri_slots: u32,
         fri_n: u32,
     ) -> Array<felt252>;
     fn group(
@@ -115,7 +149,7 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        sampled_packed: Span<felt252>,
+        sampled_slots: u32,
         sampled_n: u32,
         rows_packed: Span<felt252>,
         rows_n: u32,
@@ -128,14 +162,15 @@ pub trait IStwoVerifierRouter<TContractState> {
         state: Span<felt252>,
         head_packed: Span<felt252>,
         head_n: u32,
-        fri_packed: Span<felt252>,
+        fri_slots: u32,
         fri_n: u32,
     ) -> (felt252, felt252);
     /// The (tag, state_hash) checkpoint for (caller, proof_id).
     fn checkpoint(
-        self: @TContractState, caller: starknet::ContractAddress, proof_id: felt252,
+        self: @TContractState, caller: ContractAddress, proof_id: felt252,
     ) -> (felt252, felt252);
-    fn is_valid(self: @TContractState, fact: felt252) -> bool;
+    /// The shared fact registry this router registers into.
+    fn registry(self: @TContractState) -> ContractAddress;
 }
 
 #[starknet::contract]
@@ -145,6 +180,9 @@ pub mod StwoVerifierRouter {
         Map, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
     };
     use starknet::{ClassHash, ContractAddress, get_caller_address};
+    use crate::fact_registry::{
+        IStwoSharedFactRegistryDispatcher, IStwoSharedFactRegistryDispatcherTrait,
+    };
     use crate::unpack_proof_v2;
     use crate::{
         IStwoMachineClaimLibraryDispatcher, IStwoMachineClaimDispatcherTrait,
@@ -156,8 +194,8 @@ pub mod StwoVerifierRouter {
         IStwoOodsGroupLibraryDispatcher, IStwoOodsGroupDispatcherTrait,
     };
     use super::{
-        IStwoVerifierRouter, TAG_CLAIM, TAG_DONE, TAG_FRI_COMMIT, TAG_GROUP, TAG_LOOKUP,
-        TAG_NONE, TAG_OODS, TAG_OODS_EVAL,
+        IStwoVerifierRouter, SECTION_FRI, SECTION_SAMPLED, TAG_CLAIM, TAG_DONE, TAG_FRI_COMMIT,
+        TAG_GROUP, TAG_LOOKUP, TAG_NONE, TAG_OODS, TAG_OODS_EVAL,
     };
 
     #[storage]
@@ -170,16 +208,18 @@ pub mod StwoVerifierRouter {
         oods_finalize_class: ClassHash,
         group_class: ClassHash,
         fri_class: ClassHash,
+        /// The shared fact registry (this router must be one of its routes).
+        registry: ContractAddress,
         /// (caller, proof_id) -> (tag, poseidon(state)).
         checkpoints: Map<(ContractAddress, felt252), (felt252, felt252)>,
-        facts: Map<felt252, bool>,
+        /// Staged packed sections: (caller, proof_id, section, slot) -> felt.
+        staged: Map<(ContractAddress, felt252, felt252, u32), felt252>,
     }
 
     #[event]
     #[derive(Drop, starknet::Event)]
     enum Event {
         Step: Step,
-        FactRegistered: FactRegistered,
     }
 
     /// One machine transaction completed; `state_hash` is what the next
@@ -194,14 +234,6 @@ pub mod StwoVerifierRouter {
         state_hash: felt252,
     }
 
-    #[derive(Drop, starknet::Event)]
-    struct FactRegistered {
-        #[key]
-        fact: felt252,
-        program_hash: felt252,
-        output_hash: felt252,
-    }
-
     #[constructor]
     fn constructor(
         ref self: ContractState,
@@ -212,6 +244,7 @@ pub mod StwoVerifierRouter {
         oods_finalize_class: ClassHash,
         group_class: ClassHash,
         fri_class: ClassHash,
+        registry: ContractAddress,
     ) {
         self.claim_class.write(claim_class);
         self.lookup_class.write(lookup_class);
@@ -225,6 +258,7 @@ pub mod StwoVerifierRouter {
         self.oods_finalize_class.write(oods_finalize_class);
         self.group_class.write(group_class);
         self.fri_class.write(fri_class);
+        self.registry.write(registry);
     }
 
     /// Checks the echoed state against the caller's checkpoint slot.
@@ -251,8 +285,40 @@ pub mod StwoVerifierRouter {
         unpack_proof_v2(packed, n).span()
     }
 
+    /// Reads a staged section back (slots 0..n_slots) and unpacks it.
+    fn read_section(
+        self: @ContractState, proof_id: felt252, section: felt252, n_slots: u32, n_values: u32,
+    ) -> Span<felt252> {
+        let caller = get_caller_address();
+        let mut packed: Array<felt252> = array![];
+        let mut i = 0;
+        while i != n_slots {
+            packed.append(self.staged.entry((caller, proof_id, section, i)).read());
+            i += 1;
+        }
+        unpack(packed.span(), n_values)
+    }
+
     #[abi(embed_v0)]
     impl RouterImpl of IStwoVerifierRouter<ContractState> {
+        fn stage(
+            ref self: ContractState,
+            proof_id: felt252,
+            section: felt252,
+            offset: u32,
+            slots: Span<felt252>,
+        ) {
+            assert(
+                section == SECTION_SAMPLED || section == SECTION_FRI, 'router: section',
+            );
+            let caller = get_caller_address();
+            let mut i = offset;
+            for slot in slots {
+                self.staged.entry((caller, proof_id, section, i)).write(*slot);
+                i += 1;
+            }
+        }
+
         fn begin(
             ref self: ContractState,
             proof_id: felt252,
@@ -341,12 +407,12 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            sampled_packed: Span<felt252>,
+            sampled_slots: u32,
             sampled_n: u32,
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_OODS, state);
             let head = unpack(head_packed, head_n);
-            let sampled = unpack(sampled_packed, sampled_n);
+            let sampled = read_section(@self, proof_id, SECTION_SAMPLED, sampled_slots, sampled_n);
             let out = IStwoOodsBeginLibraryDispatcher {
                 class_hash: self.oods_begin_class.read(),
             }
@@ -362,13 +428,13 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            sampled_packed: Span<felt252>,
+            sampled_slots: u32,
             sampled_n: u32,
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_OODS_EVAL, state);
             assert(group_index < self.n_oods_groups.read(), 'router: group index');
             let head = unpack(head_packed, head_n);
-            let sampled = unpack(sampled_packed, sampled_n);
+            let sampled = read_section(@self, proof_id, SECTION_SAMPLED, sampled_slots, sampled_n);
             // The family-order counter inside the state enforces that the
             // groups run in sequence, exactly once each.
             let out = IStwoOodsGroupLibraryDispatcher {
@@ -385,12 +451,12 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            sampled_packed: Span<felt252>,
+            sampled_slots: u32,
             sampled_n: u32,
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_OODS_EVAL, state);
             let head = unpack(head_packed, head_n);
-            let sampled = unpack(sampled_packed, sampled_n);
+            let sampled = read_section(@self, proof_id, SECTION_SAMPLED, sampled_slots, sampled_n);
             let out = IStwoOodsFinalizeLibraryDispatcher {
                 class_hash: self.oods_finalize_class.read(),
             }
@@ -405,12 +471,12 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            fri_packed: Span<felt252>,
+            fri_slots: u32,
             fri_n: u32,
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_FRI_COMMIT, state);
             let head = unpack(head_packed, head_n);
-            let fri = unpack(fri_packed, fri_n);
+            let fri = read_section(@self, proof_id, SECTION_FRI, fri_slots, fri_n);
             let out = IStwoMachineFriLibraryDispatcher { class_hash: self.fri_class.read() }
                 .fri_commit(state, head, fri);
             advance(ref self, proof_id, TAG_GROUP, out.span());
@@ -423,7 +489,7 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            sampled_packed: Span<felt252>,
+            sampled_slots: u32,
             sampled_n: u32,
             rows_packed: Span<felt252>,
             rows_n: u32,
@@ -432,7 +498,7 @@ pub mod StwoVerifierRouter {
         ) -> Array<felt252> {
             consume(@self, proof_id, TAG_GROUP, state);
             let head = unpack(head_packed, head_n);
-            let sampled = unpack(sampled_packed, sampled_n);
+            let sampled = read_section(@self, proof_id, SECTION_SAMPLED, sampled_slots, sampled_n);
             let rows = unpack(rows_packed, rows_n);
             let witnesses = unpack(witnesses_packed, witnesses_n);
             let out = IStwoMachineGroupLibraryDispatcher {
@@ -449,12 +515,12 @@ pub mod StwoVerifierRouter {
             state: Span<felt252>,
             head_packed: Span<felt252>,
             head_n: u32,
-            fri_packed: Span<felt252>,
+            fri_slots: u32,
             fri_n: u32,
         ) -> (felt252, felt252) {
             consume(@self, proof_id, TAG_GROUP, state);
             let head = unpack(head_packed, head_n);
-            let fri = unpack(fri_packed, fri_n);
+            let fri = read_section(@self, proof_id, SECTION_FRI, fri_slots, fri_n);
             let (program_hash, output_hash) = IStwoMachineFriLibraryDispatcher {
                 class_hash: self.fri_class.read(),
             }
@@ -462,8 +528,8 @@ pub mod StwoVerifierRouter {
             advance(ref self, proof_id, TAG_DONE, [program_hash, output_hash].span());
 
             let fact = poseidon_hash_span([program_hash, output_hash].span());
-            self.facts.entry(fact).write(true);
-            self.emit(FactRegistered { fact, program_hash, output_hash });
+            IStwoSharedFactRegistryDispatcher { contract_address: self.registry.read() }
+                .register_fact(fact);
             (program_hash, output_hash)
         }
 
@@ -473,8 +539,8 @@ pub mod StwoVerifierRouter {
             self.checkpoints.entry((caller, proof_id)).read()
         }
 
-        fn is_valid(self: @ContractState, fact: felt252) -> bool {
-            self.facts.entry(fact).read()
+        fn registry(self: @ContractState) -> ContractAddress {
+            self.registry.read()
         }
     }
 }

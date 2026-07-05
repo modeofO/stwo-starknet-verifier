@@ -35,8 +35,11 @@ use stwo_verifier_utils::MemorySection;
 const N_VALUES: u32 = 381_079;
 /// Program entries per claim/lookup chunk transaction.
 const CHUNK_ENTRIES: u32 = 540;
-/// Fused Merkle+fri_answers group files (bridge split-witness --blake).
-const N_GROUPS: u32 = 5;
+/// Fused Merkle+fri_answers group files (bridge split-witness --blake,
+/// group size 8 — the production shape: with the sampled section staged,
+/// an 8-query group's rows + witnesses fit the ~4,996-felt calldata cap;
+/// 16-query rows alone are ~8.1k slots).
+const N_GROUPS: u32 = 9;
 /// Serde felts per program entry.
 const FELTS_PER_ENTRY: u32 = 9;
 
