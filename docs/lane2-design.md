@@ -679,14 +679,18 @@ findings, in increasing severity:
 - **Storage writes bill ~495k gas each all-in**: a 1,900-write staging
   tx = 945.8M L2 gas, 78% of the 1.21e9 invoke cap. Staging is ~10×
   dearer than snforge's model suggested.
-- **Staged-section READS cost ~122k gas per slot all-in** (read syscall
-  + unpack share): every OODS group tx (2,617-slot sampled read + a
-  near-zero qm31 eval) measured 328–381M; `fri_commit`, which loads the
-  8,045-slot fri section, needs **2.22e9 sierra gas — over the ~1e9
-  per-invoke execute budget (0.14 versioned constants) and even the
-  2.0e9 per-BLOCK sierra capacity. The staged-fri design is dead on
-  0.14 pricing**, and `finalize` (same load + the decommit walk) is
-  equally dead.
+- **Loading a packed section costs ~120k gas per SLOT** — round 2's
+  staged-vs-calldata A/B pinned the decomposition: the storage read
+  syscall itself is only ~3k gas/slot; the whale is the per-slot
+  PROCESSING (unpack + deser + digest check), paid by whichever tx
+  loads the section from either source. Every OODS group tx (2,617
+  sampled slots + a near-zero qm31 eval) measured ~330M; `fri_commit`,
+  which processed the 8,045-slot fri section whole, needs **2.22e9
+  sierra gas — over the ~1e9 per-invoke execute budget (0.14 versioned
+  constants) and even the 2.0e9 per-BLOCK sierra capacity. The
+  staged-fri design is dead on 0.14 pricing** (`finalize`, same load +
+  the decommit walk, equally dead) — no single transaction may ever
+  process the whole fri section.
 
 Measured per-tx receipts up to the rejection (l2_gas): staging 222–946M
 (7 txs, 5.3e9 total); begin 24M; claim chunks 309–384M; claim_finalize
@@ -773,6 +777,50 @@ tx 4,872 — every tx's calldata asserted), ~28.2e9 snforge-gas (was
 30.3e9); the machine full-sequence == monolithic equivalence holds on
 both builds. Poseidon drive: 42 txs (2 + 37 + 3). The devnet re-drive
 below prices the v3 shape for real.
+
+## Devnet drive round 2: the v3 lane priced end-to-end (2026-07-05)
+
+The full sovereign lane executed on devnet under blockifier 0.14 rules —
+**45 transactions, 21.43e9 L2 gas total (~476M/tx average), fact
+registered** into the frozen-route registry
+(`docs/devnet-drive-v3-2026-07-05.json` is the digit-exact per-tx
+record; `scripts/devnet_drive.py` reproduces it). The shape:
+
+| phase | txs | l2_gas each |
+|---|---|---|
+| sampled staging (writes ~497k/slot) | 2 | 946M / 355M |
+| begin / claim chunks / claim_finalize | 7 | 24M / 309–384M / 22.6M |
+| lookup chunks / lookup_finalize | 6 | 132–166M / 24.1M |
+| oods_begin / 15 OODS groups / oods_finalize | 17 | 319M / 321–373M / 532M |
+| fri_commit (FriHead calldata) | 1 | **33.0M** (was unincludable) |
+| fused 8-query group txs | 9 | **1,150–1,158M ×8** + 967M |
+| fri layer chunks | 2 | 599M / 752M |
+| finalize | 1 | 33.8M |
+
+Findings:
+
+- **The fused group txs are the new binding constraint: 95.7% of the
+  1.21e9 invoke cap at the worst (group 04, 1,157.5M).** Their cost =
+  sampled processing (~320M) + 4-tree Merkle verification + stateless
+  constants recompute + 8 queries of fri_answers. The margin is ~4% on
+  this fixture — bigger programs (more columns → longer rows, more
+  constants) WILL breach it. Known levers, in order of preference:
+  7-query groups (70 → 10 group txs, ~1.03e9 each), or resurrecting
+  the one-time constants store to strip the recompute (~184M). This is
+  the top open item for the production sizing pass on the real
+  messagezk circuit.
+- The staged-vs-calldata A/B (round 1 OODS txs read staged sampled at
+  ~330M; round 2 carries it as calldata at ~322M) isolates the read
+  syscall at **~3k gas/slot** — section PROCESSING (~120k/slot)
+  dominates regardless of source. Corollary: sampled staging for the
+  group txs is the right design (write 1.3e9 once, reads ~8M/tx), and
+  the OODS calldata switch is a small win, not a large one.
+- The v3 fri phases behave exactly as designed: the fri bulk is
+  processed ONCE across the 2 layer txs (1.35e9 combined, including
+  the layer Merkle verifies and folds) instead of twice-plus-staging
+  (~6.4e9 on the dead plan); fri_commit and finalize are now 33M each.
+- Devnet fee at its static 1e9-fri gas price: ~21.4 STRK-equivalent.
+  Real Sepolia pricing is dynamic; the gas number is the durable metric.
 
 ## The calldata emitter (built 2026-07-05, bridge `emit-calldata`)
 

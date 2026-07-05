@@ -242,15 +242,29 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   per-tx receipts. Three corrections the estimates missed: the state-diff
   cap counts FELTS (2/write → `STAGE_CHUNK` 3,900 → 1,900; staging txs
   4 → 7); storage writes bill ~495k gas each (a staging tx = 946M, 78%
-  of the invoke cap); staged READS cost ~122k gas/slot all-in, so
-  `fri_commit`'s 8,045-slot load needs 2.22e9 sierra gas — **over the
-  ~1e9 per-invoke execute budget: the staged-fri store is dead on 0.14
-  pricing**. Everything else measured production-ready (OODS group txs
+  of the invoke cap); loading a packed section costs ~120k gas/slot
+  (processing — the read syscall itself is ~3k), so `fri_commit`'s
+  8,045-slot load needs 2.22e9 sierra gas — **over the ~1e9 per-invoke
+  execute budget: the staged-fri store is dead on 0.14 pricing**. Everything else measured production-ready (OODS group txs
   328–381M each). Fix designed (fri transport v3): the fri bulk is
   self-authenticating against the layer commitments and `FriProof`
   serializes per layer — commitment slice via calldata in fri_commit,
   layer-batched calldata decommit chunks, fri staging deleted. See the
   devnet section in [`docs/lane2-design.md`](./docs/lane2-design.md).
+- **FRI transport v3 + the sovereign lane priced end-to-end on devnet
+  (2026-07-05)** — the fri section is never stored: `fri_transport.cairo`
+  forks the vendored (private) FRI layer verifiers; the 24-slot
+  `FriHead` commitment slice rides every FRI-phase tx as calldata
+  (d_fri-bound, Fiat-Shamir-authenticated) and the decommit walk chunks
+  at layer boundaries with the folded (queries, evals) in the checkpoint.
+  Devnet round 2 ran the FULL drive: **45 transactions, 21.43e9 L2 gas,
+  fact registered under the frozen route list**
+  ([per-tx record](./docs/devnet-drive-v3-2026-07-05.json)) — fri_commit
+  33M (was unincludable), layer chunks 599M/752M, finalize 33.8M. New
+  binding constraint: the fused 8-query group txs at **95.7% of the
+  1.21e9 invoke cap** (7-query groups or the constants store are the
+  levers before the real messagezk-sized circuit). Both suites green
+  (blake 5/5, poseidon 30/30); 21 deployable classes, all under the caps.
 - **Next:** the qm31 gate-probe re-test on Starknet version bumps,
   devnet declare pre-flight of the 36 blake classes + a devnet router
   drive with real gas numbers, Sepolia campaign under the registry's
