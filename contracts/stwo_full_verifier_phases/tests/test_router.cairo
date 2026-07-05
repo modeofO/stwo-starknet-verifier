@@ -1,7 +1,7 @@
-//! End-to-end router drive over the REAL fixture proof: 56 transactions
+//! End-to-end router drive over the REAL fixture proof: 41 transactions
 //! (1 sampled staging + 3 fri staging → begin → 5 claim chunks → claim
-//! finalize → 5 lookup chunks → lookup finalize → oods begin → 30 OODS
-//! group classes → oods finalize → fri commit → 5 fused group txs →
+//! finalize → 5 lookup chunks → lookup finalize → oods begin → 15 merged
+//! OODS group classes → oods finalize → fri commit → 5 fused group txs →
 //! finalize), the sampled/fri sections staged write-once and read back
 //! from storage, everything else arriving as packed-v2 calldata, every
 //! state echoed against the hash-stored checkpoint — must register into
@@ -127,18 +127,15 @@ fn deploy_registry() -> IStwoSharedFactRegistryDispatcher {
     IStwoSharedFactRegistryDispatcher { contract_address: address }
 }
 
-/// Declares the 36 machine classes and deploys the router over them,
+/// Declares the 21 machine classes and deploys the router over them,
 /// registered as a route of a fresh shared fact registry.
 fn deploy_router() -> (IStwoVerifierRouterDispatcher, IStwoSharedFactRegistryDispatcher) {
     let registry = deploy_registry();
-    // The 30 OODS group classes, in family order (oods_chunks.cairo).
+    // The 15 merged OODS group classes, in family order (lib.cairo map).
     let group_names: Array<ByteArray> = array![
-        "StwoOodsF00", "StwoOodsF01", "StwoOodsF02A", "StwoOodsF02B", "StwoOodsF03",
-        "StwoOodsF04", "StwoOodsF05A", "StwoOodsF05B", "StwoOodsF06", "StwoOodsF07",
-        "StwoOodsF08", "StwoOodsF09A1", "StwoOodsF09A2", "StwoOodsF09A3", "StwoOodsF09B",
-        "StwoOodsF10", "StwoOodsF11", "StwoOodsF12", "StwoOodsF13A1", "StwoOodsF13A2",
-        "StwoOodsF13A3", "StwoOodsF13B", "StwoOodsF14", "StwoOodsF15", "StwoOodsF16A",
-        "StwoOodsF16B1", "StwoOodsF16B2", "StwoOodsF17", "StwoOodsF18", "StwoOodsF19",
+        "StwoOodsG00", "StwoOodsG01", "StwoOodsG02", "StwoOodsG03", "StwoOodsG04",
+        "StwoOodsG05", "StwoOodsG06", "StwoOodsG07", "StwoOodsG08", "StwoOodsG09",
+        "StwoOodsG10", "StwoOodsG11", "StwoOodsG12", "StwoOodsG13", "StwoOodsG14",
     ];
     let mut oods_groups: Array<ClassHash> = array![];
     for name in group_names {
@@ -239,7 +236,7 @@ fn test_router_full_drive_registers_fact() {
     state = router
         .oods_begin(PROOF_ID, state.span(), head_p, head_n, sampled_slots, sampled_n);
     let mut group_index = 0_u32;
-    while group_index != 30 {
+    while group_index != 15 {
         state = router
             .oods_group(
                 PROOF_ID, group_index, state.span(), head_p, head_n, sampled_slots, sampled_n,

@@ -225,6 +225,17 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   deployed router in **60 transactions with every tx's calldata counted
   and asserted under the cap** — the "everything fits" claim, executed.
   Poseidon drive: 56 txs. Both suites green.
+- **OODS group classes merged 30 → 15 — the measured floor (2026-07-05)**
+  — the last tx-count lever: each group class carries a ~11k-Sierra/
+  ~30k-CASM fixed prologue base (head deser + sampled deser + element
+  redraw), so merging neighbours under the caps cut the class count to
+  **21 deployable classes** and the drives to **blake 45 txs / ~30.3e9
+  gas** (was 60 / 35.0e9) and **poseidon 41 txs / ~29.5e9** (was 56 /
+  34.2e9). All 15 merged classes fit all three caps on the qm31 build
+  (worst: 95.2% of the byte cap); every remaining adjacent pair-merge
+  exceeds a cap — the earlier "~10–12" guess missed that the byte cap
+  (~66k Sierra felts), not CASM, binds. Family functions, machine and
+  router unchanged; the qm31 gate re-probe the same day: still rejected.
 - **Next:** the qm31 gate-probe re-test on Starknet version bumps,
   devnet declare pre-flight of the 36 blake classes + a devnet router
   drive with real gas numbers, Sepolia campaign under the registry's

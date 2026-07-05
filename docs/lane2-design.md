@@ -622,6 +622,46 @@ felts and every staging tx ≤ 3,900 slots. Measured on the drive: sampled
 plus the stateless constants recompute; the per-tx spread is a devnet
 pre-flight item).
 
+## The OODS group-class merge: 30 → 15, measured (2026-07-05)
+
+The last tx-count lever, taken. The 30 one-sub-air OODS group classes
+(F00..F19 with their A/B split parts) are merged into **15 classes
+G00..G14** (`lib.cairo` carries the map) — merging happens at the CLASS
+level only: the 49/56 family functions, `N_FAMILIES`, `FAMILY_SHIFT` and
+the seam-fork carry protocol in `oods_chunks.cairo` are untouched; a
+merged class simply runs more consecutive family calls against one
+prologue/epilogue, and a carry between families of the same class flows
+through `ctx` instead of riding the checkpoint.
+
+Measured on the qm31 build (all three caps; `scripts/size_classes.sh
+--blake`):
+
+- Every group class carries a **~11k-Sierra / ~30k-CASM fixed base**
+  (head deser + sampled deser + lookup-element redraw + state serde) —
+  the smallest one-family classes all sit at 14.1–14.6k Sierra / ~33k
+  CASM. That base is the dedup credit each merge earns, and it is why
+  30 classes cost ~15 unnecessary transactions.
+- **All 15 merged classes fit all three caps.** Worst fills: G05
+  (blake_round A2+A3) at 3,893,844 bytes = **95.2% of the byte cap**;
+  G14 (memory + range_checks + xor4/7/8/9) at 72,209 CASM = 88%;
+  everything ≤ 62,955 Sierra felts. The three ~60k solo classes
+  (G01 = blake_compress A, G08 = aggregator A2/hades, G11 = cube_252 A)
+  cannot absorb any neighbour.
+- **15 is the measured floor at this family granularity**: every
+  remaining adjacent pair-merge exceeds a cap (G10+G11 ≈ 81k Sierra,
+  G13+G14 ≈ 86k CASM, ...). The doc's earlier "~10–12 look feasible"
+  guess assumed the qm31 CASM shrink carried to Sierra — it does not,
+  and the 4,089,446-byte cap (≈ 66k Sierra felts) is what binds.
+- Deployable class count: **36 → 21** (6 phase classes + 15 groups);
+  the routers' constructor takes the group span, so the router and
+  machine are unchanged.
+
+Both drives re-measured over the real proofs: **blake 45 txs** (was 60)
+at ~30.3e9 total L2 gas (was ~35.0e9 — fifteen fewer staged-read +
+head-deser + redraw prologues), worst fused group tx still 4,872 felts,
+every tx's calldata still asserted under the cap; **poseidon 41 txs**
+(was 56) at ~29.5e9 (was ~34.2e9). Suites: blake 5/5, poseidon 30/30.
+
 ## The calldata emitter (built 2026-07-05, bridge `emit-calldata`)
 
 `privacy_prove_cairo_bridge emit-calldata <extended_proof.json> <dir>`
@@ -854,7 +894,10 @@ as lane 1 — see proof-only-wrapping.md).
   asserted under the cap — see "The staged-section store". The estimate
   band held; merging small OODS neighbours is the remaining tx-count
   lever (the component evals shrink ~5× in CASM under qm31, so ~10–12
-  merged group classes look feasible).
+  merged group classes look feasible). **Taken 2026-07-05: 30 → 15
+  merged group classes (the measured floor — the byte cap binds, not
+  CASM), blake drive 60 → 45 txs, poseidon 56 → 41; see "The OODS
+  group-class merge".**
 
 ## Open questions
 

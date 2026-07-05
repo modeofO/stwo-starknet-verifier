@@ -50,6 +50,9 @@
 //!       --extended dumps the aux for split-witness / emit-calldata.
 //!
 //!   split-witness <extended_proof.json> <out_dir> [group_size]
+//!       (group_size defaults to 8 in both subcommands — the production
+//!       fused-group size under the staged-section store; the committed
+//!       poseidon 16/5 fixtures pass 16 explicitly.)
 //!       LANE 2 witness splitter. Synthesizes per-query-group Merkle
 //!       decommitments from `ExtendedStarkProof.aux` (no re-proving: the
 //!       aux's `all_node_values` holds every sibling hash a subset walk can
@@ -1147,7 +1150,7 @@ fn main() -> Result<(), Error> {
             let extended_in = positional.first().map(PathBuf::from).ok_or(usage)?;
             let out_dir = positional.get(1).map(PathBuf::from).ok_or(usage)?;
             let group_size: usize =
-                positional.get(2).map(|s| s.parse()).transpose()?.unwrap_or(16);
+                positional.get(2).map(|s| s.parse()).transpose()?.unwrap_or(8);
             split_witness(&extended_in, &out_dir, group_size, blake)?;
         }
         Some("emit-calldata") => {
@@ -1166,7 +1169,7 @@ fn main() -> Result<(), Error> {
             let chunk_entries: usize =
                 positional.get(2).map(|s| s.parse()).transpose()?.unwrap_or(540);
             let group_size: usize =
-                positional.get(3).map(|s| s.parse()).transpose()?.unwrap_or(16);
+                positional.get(3).map(|s| s.parse()).transpose()?.unwrap_or(8);
             emit_calldata(&extended_in, &out_dir, chunk_entries, group_size, blake)?;
         }
         Some("wrap-app") => {
