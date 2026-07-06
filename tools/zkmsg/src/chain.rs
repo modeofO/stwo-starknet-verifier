@@ -174,6 +174,19 @@ impl Chain {
         Ok(arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
     }
 
+    /// Current gas prices in fri from the latest block header:
+    /// (l1_gas_price, l2_gas_price, l1_data_gas_price).
+    pub fn gas_prices(&self) -> Result<(u128, u128, u128)> {
+        let block = self.rpc("starknet_getBlockWithTxHashes", json!(["latest"]))?;
+        let price = |key: &str| -> Result<u128> {
+            let hex = block[key]["price_in_fri"]
+                .as_str()
+                .with_context(|| format!("no {key} in block header"))?;
+            Ok(u128::from_str_radix(hex.trim_start_matches("0x"), 16)?)
+        };
+        Ok((price("l1_gas_price")?, price("l2_gas_price")?, price("l1_data_gas_price")?))
+    }
+
     /// All events for `address` filtered by `key0`, walking continuation
     /// tokens. Returns (keys, data) pairs.
     pub fn events(

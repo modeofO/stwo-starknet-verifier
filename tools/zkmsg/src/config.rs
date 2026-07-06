@@ -13,8 +13,11 @@ use starknet_types_core::felt::Felt;
 /// production address that is NOT ours to change.
 pub const SEPOLIA_REGISTRY: &str =
     "0x0194f44002b4af71e58ba7d30667ed565f1d420d3fb1e7c578de35170309c6aa";
-/// MessageStore v3 — filled at deploy (plan task 9); empty until then.
-pub const SEPOLIA_STORE_DEFAULT: &str = "";
+/// MessageStore v3 — deployed 2026-07-05 (docs/zkmsg-deployment.md),
+/// class 0x04dc67c0…5745, pinned to the live registry + the
+/// messagezk_scan circuit route.
+pub const SEPOLIA_STORE_DEFAULT: &str =
+    "0x02d66a02b2efdddb5282bf7d7931cbb7a724f191478843b1fccbf3b9729e91b7";
 pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.com";
 
 /// The messagezk_scan circuit route, pinned at milestone 1

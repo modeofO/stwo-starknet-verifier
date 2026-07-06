@@ -277,6 +277,21 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   Blake 5/5, poseidon 30/30; the poseidon suite deliberately keeps 16/5
   groups (group-size flexibility is tested). qm31 gate re-probed a third
   time the same day: still rejected.
+- **zkmsg SHIPPED (2026-07-05): the first natively-proven private message
+  on Starknet** — [`docs/zkmsg-deployment.md`](./docs/zkmsg-deployment.md).
+  The FULL messagezk circuit (2×depth-20 Merkle membership + ephemeral
+  ECDH + Poseidon commitment, `ec_op` — provable on lane 1's recursion
+  route, never on lane 2's contract config) ported to a bootloader
+  executable (`fixtures/messagezk_scan`: the public tuple moves from
+  asserted args to OUTPUTS), proven+wrapped natively by a Rust CLI
+  (`tools/zkmsg`: checkpointed resumable sends, two pre-spend gates,
+  trial-ECDH inbox), verified through the LIVE lane-1 registry and
+  published to an immutable `MessageStoreV3`
+  (`0x02d66a02…91b7`, pinned route, replay guard, no `set_verifier`).
+  Fact `0x2dc0a370…4145f`; send cost 47.7 STRK / 1.68e9 gas — flat in
+  circuit size, within 1.5% of the fixture's lane-1 numbers. Recipient
+  decrypts by trial-ECDH; sender's own inbox correctly empty. Suites:
+  store 12/12, zkmsg 27/27, blake 5/5, poseidon 30/30.
 - **Next:** the qm31 gate-probe re-test on Starknet version bumps (the
   only blocker for the public network), the messagezk-circuit sizing
   pass (re-run `prove-blake` + the devnet drive on the real circuit;

@@ -194,7 +194,7 @@ impl<'a> Pipeline<'a> {
             &self.config.registry,
             "stage_proof",
             &calldata,
-            &bounds_for(&StepKind::Stage { offset }),
+            &bounds_for(&StepKind::Stage { offset }, self.chain.gas_prices()?),
         )?;
         self.chain.wait_receipt(&tx, RECEIPT_TIMEOUT)?;
         Ok((Some(tx), Some(format!("staged {} slots at {offset}", chunk.len()))))
@@ -215,7 +215,7 @@ impl<'a> Pipeline<'a> {
             &self.config.registry,
             "verify_phase1",
             &calldata,
-            &bounds_for(&StepKind::Phase1),
+            &bounds_for(&StepKind::Phase1, self.chain.gas_prices()?),
         )?;
         self.chain.wait_receipt(&tx, RECEIPT_TIMEOUT)?;
 
@@ -243,7 +243,7 @@ impl<'a> Pipeline<'a> {
             &self.config.registry,
             "verify_phase2",
             &calldata,
-            &bounds_for(&StepKind::Phase2),
+            &bounds_for(&StepKind::Phase2, self.chain.gas_prices()?),
         )?;
         self.chain.wait_receipt(&tx, RECEIPT_TIMEOUT)?;
 
@@ -266,25 +266,41 @@ impl<'a> Pipeline<'a> {
             &self.config.store,
             "send_message",
             &calldata,
-            &bounds_for(&StepKind::SendMessage),
+            &bounds_for(&StepKind::SendMessage, self.chain.gas_prices()?),
         )?;
         self.chain.wait_receipt(&tx, RECEIPT_TIMEOUT)?;
         Ok((Some(tx), Some("message published".into())))
     }
 }
 
-/// Per-step l2-gas ceilings: measured lane-1 Sepolia values (phase 1
-/// 873.8M, phase 2 815.7M) plus margin; prices are left to estimation
-/// unless the runbook forces overrides at deploy time.
-fn bounds_for(kind: &StepKind) -> GasBounds {
+/// Per-step resource bounds: measured lane-1 Sepolia l2 amounts (phase 1
+/// 873.8M, phase 2 815.7M) plus margin, and CURRENT prices ×1.5 — all six
+/// explicit, because with any left to estimation sncast re-estimates the
+/// amounts too (estimate ×1.5 exceeded the 1.21e9 cap on the first live
+/// run; the runbook's "(+prices)" clause, learned twice now).
+fn bounds_for(kind: &StepKind, prices: (u128, u128, u128)) -> GasBounds {
     let l2_gas = match kind {
         StepKind::Stage { .. } => Some(400_000_000),
         StepKind::Phase1 => Some(1_050_000_000),
         StepKind::Phase2 => Some(1_000_000_000),
-        StepKind::SendMessage => Some(60_000_000),
+        StepKind::SendMessage => Some(80_000_000),
         _ => None,
     };
-    GasBounds { l2_gas, ..Default::default() }
+    if l2_gas.is_none() {
+        return GasBounds::default();
+    }
+    let (l1_price, l2_price, l1_data_price) = prices;
+    GasBounds {
+        l1_gas: Some(100),
+        l1_gas_price: Some(l1_price * 3 / 2),
+        l2_gas,
+        l2_gas_price: Some(l2_price * 3 / 2),
+        // Phase 1 measured 13,248 on Sepolia; generous headroom is ~free
+        // (32k × price ≈ 0.02 STRK) while under-provisioning REVERTS and
+        // burns the whole tx fee.
+        l1_data_gas: Some(32_768),
+        l1_data_gas_price: Some(l1_data_price * 3 / 2),
+    }
 }
 
 fn run_tool(cmd: &mut Command, label: &str) -> Result<String> {
