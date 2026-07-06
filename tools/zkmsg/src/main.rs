@@ -150,14 +150,24 @@ fn cmd_register(home: &Home, handle: &str) -> Result<()> {
 
     let chain = Chain::new(&config.rpc_url, &config.account);
     let handle_felt = short_string_felt(handle)?;
-    let tx = chain.invoke(
-        &config.store,
-        "register",
-        &[felt_hex(&handle_felt), keys.scan_pub.clone()],
-        &Default::default(),
-    )?;
-    println!("register tx {tx}");
-    chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
+    // Idempotent: if the handle already resolves to OUR scan pubkey (e.g. a
+    // prior run died between invoke and local record), just sync state.
+    let already = chain
+        .call(&config.store, "get_user", &[felt_hex(&handle_felt)])
+        .ok()
+        .filter(|u| u.len() == 3 && Felt::from_hex(&u[1]).ok() == keys.scan_pub_felt().ok());
+    if already.is_none() {
+        let tx = chain.invoke(
+            &config.store,
+            "register",
+            &[felt_hex(&handle_felt), keys.scan_pub.clone()],
+            &Default::default(),
+        )?;
+        println!("register tx {tx}");
+        chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
+    } else {
+        println!("handle already registered to this scan key — syncing local state");
+    }
 
     let user = chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)])?;
     ensure!(user.len() == 3, "get_user shape: {user:?}");

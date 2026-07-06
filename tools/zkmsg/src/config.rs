@@ -66,7 +66,6 @@ impl Keys {
         Felt::from_hex(&self.scan_priv).context("keys.json scan_priv")
     }
 
-    #[allow(dead_code)]
     pub fn scan_pub_felt(&self) -> Result<Felt> {
         Felt::from_hex(&self.scan_pub).context("keys.json scan_pub")
     }

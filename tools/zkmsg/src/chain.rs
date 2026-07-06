@@ -115,9 +115,12 @@ impl Chain {
             args.extend_from_slice(calldata);
         }
         let v = self.sncast(&args)?;
-        let response = v["response"]
+        // sncast 0.61: `response` is a pretty-printed string; the felts
+        // live in `response_raw`.
+        let response = v["response_raw"]
             .as_array()
-            .with_context(|| format!("no response array in sncast call output: {v}"))?;
+            .or_else(|| v["response"].as_array())
+            .with_context(|| format!("no response felts in sncast call output: {v}"))?;
         Ok(response.iter().filter_map(|x| x.as_str().map(String::from)).collect())
     }
 
@@ -212,14 +215,23 @@ fn str_vec(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// sncast --json emits one JSON object per line; the result is the last.
+/// sncast --json emits one JSON object per line; the RESULT is the object
+/// with type == "response" (a "links" notification can follow it).
 pub fn parse_sncast_json(stdout: &str) -> Result<Value> {
-    let last = stdout
+    let objects: Vec<Value> = stdout
         .lines()
         .filter(|l| l.trim_start().starts_with('{'))
-        .last()
-        .context("no JSON object in sncast output")?;
-    Ok(serde_json::from_str(last)?)
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if let Some(err) = objects.iter().find(|v| v["type"] == "error") {
+        bail!("sncast error: {}", err["error"]);
+    }
+    objects
+        .iter()
+        .find(|v| v["type"] == "response")
+        .or_else(|| objects.last())
+        .cloned()
+        .context("no JSON object in sncast output")
 }
 
 /// sn_keccak of an ASCII name (event key / entrypoint selector): keccak256
