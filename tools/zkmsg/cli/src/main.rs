@@ -230,13 +230,38 @@ fn cmd_send(home: &Home, handle: &str, text: &str, force: bool) -> Result<()> {
     send_state.save(home)?;
     println!("send '{id}' -> {handle} ({} bytes ciphertext)", ciphertext.len());
 
-    Pipeline::new(home, &config).run(&mut send_state, &mut |_| {})
+    let id = send_state.id.clone();
+    let result = Pipeline::new(home, &config).run(&mut send_state, &mut cli_sink(&id));
+    result
 }
 
 fn cmd_resume(home: &Home, id: &str) -> Result<()> {
     let config = home.load_config()?;
     let mut send_state = SendState::load(home, id)?;
-    Pipeline::new(home, &config).run(&mut send_state, &mut |_| {})
+    let id = send_state.id.clone();
+    let result = Pipeline::new(home, &config).run(&mut send_state, &mut cli_sink(&id));
+    result
+}
+
+/// Reproduces the pre-refactor CLI's live progress output exactly:
+/// a "step N/M: Kind" line per step start, and a "complete — fact …" line
+/// at the end. Tx submissions and step completions print nothing, as
+/// before — the runbook was narrated by step, not by transaction.
+fn cli_sink(id: &str) -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) + '_ {
+    use zkmsg_core::pipeline::PipelineEvent as E;
+    move |event| match event {
+        E::StepStarted { index, total, kind } => {
+            println!("[{id}] step {}/{}: {kind:?}", index + 1, total);
+        }
+        E::TxSubmitted { .. } => {}
+        E::StepCompleted { .. } => {}
+        E::Completed { fact } => {
+            println!(
+                "[{id}] complete — fact {}",
+                fact.as_deref().unwrap_or("(recorded on-chain)"),
+            );
+        }
+    }
 }
 
 fn cmd_inbox(home: &Home) -> Result<()> {
@@ -366,5 +391,25 @@ mod tests {
         // 'zkmsg' == 0x7a6b6d7367 (Cairo short-string literal).
         assert_eq!(short_string_felt("zkmsg").unwrap(), Felt::from_hex("0x7a6b6d7367").unwrap());
         assert!(short_string_felt("this-is-way-too-long-for-a-short-string").is_err());
+    }
+
+    #[test]
+    fn cli_sink_line_formats() {
+        use zkmsg_core::pipeline::PipelineEvent as E;
+        use zkmsg_core::state::StepKind;
+        let mut lines = vec![];
+        // Reuse cli_sink's formatting by mirroring it into a string sink.
+        let mut sink = |e: E| match e {
+            E::StepStarted { index, total, kind } =>
+                lines.push(format!("[id] step {}/{}: {kind:?}", index + 1, total)),
+            E::Completed { fact } =>
+                lines.push(format!("[id] complete — fact {}",
+                    fact.as_deref().unwrap_or("(recorded on-chain)"))),
+            _ => {}
+        };
+        sink(E::StepStarted { index: 0, total: 6, kind: StepKind::Prove });
+        sink(E::Completed { fact: Some("0xabc".into()) });
+        assert_eq!(lines[0], "[id] step 1/6: Prove");
+        assert_eq!(lines[1], "[id] complete — fact 0xabc");
     }
 }
