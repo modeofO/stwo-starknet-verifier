@@ -26,6 +26,9 @@ pub struct StatusReport {
     pub leaf_index: Option<u32>,
     pub n_messages: Option<String>,
     pub balance_strk: Option<u128>,
+    /// Set (and `balance_strk` left `None`) when the balance read fails,
+    /// so callers can reproduce the CLI's "unavailable ({e})" message.
+    pub balance_error: Option<String>,
 }
 
 /// Snapshots config, keys and live chain reads (message count, balance)
@@ -43,7 +46,10 @@ pub fn status(home: &Home) -> Result<StatusReport> {
     } else {
         None
     };
-    let balance_strk = account_balance_strk(&chain, &config).ok();
+    let (balance_strk, balance_error) = match account_balance_strk(&chain, &config) {
+        Ok(strk) => (Some(strk), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
 
     Ok(StatusReport {
         rpc: config.rpc_url.clone(),
@@ -55,6 +61,7 @@ pub fn status(home: &Home) -> Result<StatusReport> {
         leaf_index: keys.as_ref().and_then(|k| k.leaf_index),
         n_messages,
         balance_strk,
+        balance_error,
     })
 }
 
@@ -90,12 +97,23 @@ pub fn init_identity(
     Ok(scan_pub)
 }
 
+/// Which branch `register` took — lets a caller reproduce the CLI's
+/// distinct progress lines for a fresh registration vs. a local-state
+/// sync (both end at the same final "registered at leaf N" outcome).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// The handle already resolved to our scan key; only local state
+    /// (`keys.json`) was updated, no transaction was sent.
+    AlreadyRegistered { leaf_index: u32 },
+    /// A fresh `register` transaction landed.
+    Registered { tx_hash: String, leaf_index: u32 },
+}
+
 /// Registers `handle` on-chain against our scan key and records the
 /// leaf index locally. Idempotent: if the handle already resolves to our
 /// scan key (e.g. a prior run died between invoke and local record), it
-/// just syncs local state instead of re-registering. Returns the leaf
-/// index.
-pub fn register(home: &Home, handle: &str) -> Result<u32> {
+/// just syncs local state instead of re-registering.
+pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let config = home.load_config()?;
     let mut keys = home.load_keys()?;
     ensure!(!config.store.is_empty(), "no store address in config.json");
@@ -109,7 +127,7 @@ pub fn register(home: &Home, handle: &str) -> Result<u32> {
         .call(&config.store, "get_user", &[felt_hex(&handle_felt)])
         .ok()
         .filter(|u| u.len() == 3 && Felt::from_hex(&u[1]).ok() == keys.scan_pub_felt().ok());
-    if already.is_none() {
+    let tx_hash = if already.is_none() {
         let tx = chain.invoke(
             &config.store,
             "register",
@@ -117,7 +135,10 @@ pub fn register(home: &Home, handle: &str) -> Result<u32> {
             &Default::default(),
         )?;
         chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
-    }
+        Some(tx)
+    } else {
+        None
+    };
 
     let user = chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)])?;
     ensure!(user.len() == 3, "get_user shape: {user:?}");
@@ -125,7 +146,11 @@ pub fn register(home: &Home, handle: &str) -> Result<u32> {
     keys.handle = Some(handle.to_string());
     keys.leaf_index = Some(leaf_index);
     home.update_keys(&keys)?;
-    Ok(leaf_index)
+
+    Ok(match tx_hash {
+        Some(tx_hash) => RegisterOutcome::Registered { tx_hash, leaf_index },
+        None => RegisterOutcome::AlreadyRegistered { leaf_index },
+    })
 }
 
 /// Looks up a handle's scan pubkey + leaf index in the store.

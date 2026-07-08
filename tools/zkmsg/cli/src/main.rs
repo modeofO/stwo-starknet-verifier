@@ -114,7 +114,16 @@ fn cmd_init(home: &Home, account: String, store: Option<String>) -> Result<()> {
 }
 
 fn cmd_register(home: &Home, handle: &str) -> Result<()> {
-    let leaf_index = app::register(home, handle)?;
+    let leaf_index = match app::register(home, handle)? {
+        app::RegisterOutcome::Registered { tx_hash, leaf_index } => {
+            println!("register tx {tx_hash}");
+            leaf_index
+        }
+        app::RegisterOutcome::AlreadyRegistered { leaf_index } => {
+            println!("handle already registered to this scan key — syncing local state");
+            leaf_index
+        }
+    };
     println!("registered '{handle}' at leaf {leaf_index}");
     Ok(())
 }
@@ -213,7 +222,10 @@ fn cmd_status(home: &Home) -> Result<()> {
     }
     match report.balance_strk {
         Some(strk) => println!("balance  : ~{strk} STRK (a send costs ~50 at spiky prices)"),
-        None => println!("balance  : unavailable"),
+        None => {
+            let e = report.balance_error.as_deref().unwrap_or("?");
+            println!("balance  : unavailable ({e})");
+        }
     }
     Ok(())
 }
