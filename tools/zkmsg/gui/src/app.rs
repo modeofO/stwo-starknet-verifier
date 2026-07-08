@@ -153,6 +153,12 @@ impl ZkmsgApp {
             }
         });
         if let Some(id) = resume_id {
+            // Drop the banner row the instant Resume is clicked — before the
+            // worker starts — so a second click can't re-enter resume_send
+            // for the same id (which would spawn a second send and could
+            // double-spend on-chain), and so the banner doesn't linger over
+            // the Compose progress view for the send it just launched.
+            self.pending.retain(|(pid, _)| pid != &id);
             self.tab = Tab::Compose;
             self.resume_send(&id, ctx);
         }

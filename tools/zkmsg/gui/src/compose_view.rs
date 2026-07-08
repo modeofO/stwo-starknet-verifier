@@ -238,6 +238,15 @@ impl ZkmsgApp {
     /// button below and the launch-time resume banner (`app.rs`) — both
     /// end up here rather than duplicating the `spawn_send` wiring.
     pub(crate) fn resume_send(&mut self, id: &str, ctx: &egui::Context) {
+        // Belt-and-suspenders on a spend action: never spawn a second send
+        // while one is already in flight (it would orphan the first worker's
+        // channel and could double-spend). poll_send_worker clears send_rx in
+        // both Done arms before a step is observable as Failed, so the
+        // Failed-step Resume path always sees send_rx == None and is unaffected.
+        if self.send_rx.is_some() {
+            self.last_error = Some("a send is already running".to_string());
+            return;
+        }
         let Some(config) = self.config.clone() else {
             self.last_error = Some("no config loaded".to_string());
             return;
