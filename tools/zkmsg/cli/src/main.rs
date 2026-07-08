@@ -7,20 +7,19 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use starknet_types_core::felt::Felt;
 
+use zkmsg_core::app;
 use zkmsg_core::args::{CircuitInputs, args_to_json, build_circuit_args};
-use zkmsg_core::chain::{Chain, felt_hex, felt_to_u64};
-use zkmsg_core::config::{Config, Home, Keys};
-use zkmsg_core::crypto::{ec_mul_gen_x, ecdh_shared_x, encrypt, poseidon2, scan_keygen};
+use zkmsg_core::chain::{Chain, felt_hex};
+use zkmsg_core::config::{Config, Home};
+use zkmsg_core::crypto::ec_mul_gen_x;
 use zkmsg_core::pipeline::Pipeline;
 use zkmsg_core::state::SendState;
 use zkmsg_core::{inbox, tree};
 
-/// STRK token (same address on Sepolia and mainnet).
-const STRK: &str = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 /// Rough per-send ceiling at spiky Sepolia prices (runbook: the fixture
 /// fact cost ~49 STRK; refuse to start below this unless --force).
 const MIN_BALANCE_STRK: u128 = 60;
@@ -102,25 +101,8 @@ fn main() -> Result<()> {
 }
 
 fn cmd_init(home: &Home, account: String, store: Option<String>) -> Result<()> {
-    let (scan_priv, scan_pub) = scan_keygen();
-    home.save_new_keys(&Keys {
-        scan_priv: felt_hex(&scan_priv),
-        scan_pub: felt_hex(&scan_pub),
-        handle: None,
-        leaf_index: None,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&home.dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-
-    let mut config = Config::default_sepolia(&repo_root());
-    config.account = account;
-    if let Some(store) = store {
-        config.store = store;
-    }
-    home.save_config(&config)?;
+    let scan_pub = app::init_identity(home, &account, store, &repo_root())?;
+    let config = home.load_config()?;
 
     println!("zkmsg home: {}", home.dir.display());
     println!("scan pubkey: {}", felt_hex(&scan_pub));
@@ -132,40 +114,7 @@ fn cmd_init(home: &Home, account: String, store: Option<String>) -> Result<()> {
 }
 
 fn cmd_register(home: &Home, handle: &str) -> Result<()> {
-    let config = home.load_config()?;
-    let mut keys = home.load_keys()?;
-    ensure!(!config.store.is_empty(), "no store address in config.json");
-    if let Some(existing) = &keys.handle {
-        bail!("already registered as '{existing}'");
-    }
-
-    let chain = Chain::new(&config.rpc_url, &config.account);
-    let handle_felt = short_string_felt(handle)?;
-    // Idempotent: if the handle already resolves to OUR scan pubkey (e.g. a
-    // prior run died between invoke and local record), just sync state.
-    let already = chain
-        .call(&config.store, "get_user", &[felt_hex(&handle_felt)])
-        .ok()
-        .filter(|u| u.len() == 3 && Felt::from_hex(&u[1]).ok() == keys.scan_pub_felt().ok());
-    if already.is_none() {
-        let tx = chain.invoke(
-            &config.store,
-            "register",
-            &[felt_hex(&handle_felt), keys.scan_pub.clone()],
-            &Default::default(),
-        )?;
-        println!("register tx {tx}");
-        chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
-    } else {
-        println!("handle already registered to this scan key — syncing local state");
-    }
-
-    let user = chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)])?;
-    ensure!(user.len() == 3, "get_user shape: {user:?}");
-    let leaf_index = felt_to_u64(&Felt::from_hex(&user[2])?)? as u32;
-    keys.handle = Some(handle.to_string());
-    keys.leaf_index = Some(leaf_index);
-    home.update_keys(&keys)?;
+    let leaf_index = app::register(home, handle)?;
     println!("registered '{handle}' at leaf {leaf_index}");
     Ok(())
 }
@@ -175,60 +124,15 @@ fn cmd_send(home: &Home, handle: &str, text: &str, force: bool) -> Result<()> {
     let keys = home.load_keys()?;
     ensure!(!config.store.is_empty(), "no store address in config.json");
     let sender_leaf = keys.leaf_index.context("not registered — run `zkmsg register`")?;
-    let chain = Chain::new(&config.rpc_url, &config.account);
 
     if !force {
+        let chain = Chain::new(&config.rpc_url, &config.account);
         check_balance(&chain, &config)?;
     }
 
-    // Resolve the recipient and pull both membership paths + the root.
-    let handle_felt = short_string_felt(handle)?;
-    let user = chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)])?;
-    ensure!(user.len() == 3, "get_user shape: {user:?}");
-    let recipient_pub = Felt::from_hex(&user[1])?;
-    let recipient_leaf = felt_to_u64(&Felt::from_hex(&user[2])?)? as u32;
-
-    let root = Felt::from_hex(
-        chain.call(&config.store, "get_merkle_root", &[])?.first().context("root")?,
-    )?;
-    let sender_path = call_path(&chain, &config, sender_leaf)?;
-    let recipient_path = call_path(&chain, &config, recipient_leaf)?;
-
-    // Fresh ephemeral key; args + the tuple the proof must produce.
-    let (eph_priv, _) = scan_keygen();
-    let (circuit_args, tuple) = build_circuit_args(&CircuitInputs {
-        merkle_root: root,
-        sender_scan_priv: keys.scan_priv_felt()?,
-        recipient_scan_pub: recipient_pub,
-        ephemeral_priv: eph_priv,
-        sender_leaf_index: sender_leaf,
-        recipient_leaf_index: recipient_leaf,
-        sender_path: &sender_path,
-        recipient_path: &recipient_path,
-    })?;
-
-    let shared = ecdh_shared_x(&eph_priv, &recipient_pub)?;
-    let ciphertext = encrypt(&shared, text.as_bytes());
-
-    let id = format!("{:.10}", felt_hex(&tuple.commitment).trim_start_matches("0x"));
-    let proof_id = poseidon2(&tuple.commitment, &short_string_felt("zkmsg")?);
-    let args_hex: Vec<String> =
-        serde_json::from_str(&args_to_json(&circuit_args)).expect("round trip");
-
-    let mut send_state = SendState::new_plan(
-        id.clone(),
-        handle.to_string(),
-        hex::encode(&ciphertext),
-        args_hex,
-        (
-            felt_hex(&tuple.commitment),
-            felt_hex(&tuple.ephemeral_pubkey),
-            felt_hex(&tuple.merkle_root),
-        ),
-        felt_hex(&proof_id),
-    );
-    send_state.save(home)?;
-    println!("send '{id}' -> {handle} ({} bytes ciphertext)", ciphertext.len());
+    let mut send_state = app::prepare_send(home, &config, &keys, sender_leaf, handle, text)?;
+    let ciphertext_len = send_state.ciphertext_hex.len() / 2;
+    println!("send '{}' -> {handle} ({ciphertext_len} bytes ciphertext)", send_state.id);
 
     let id = send_state.id.clone();
     let result = Pipeline::new(home, &config).run(&mut send_state, &mut cli_sink(&id));
@@ -288,32 +192,28 @@ fn cmd_inbox(home: &Home) -> Result<()> {
 }
 
 fn cmd_status(home: &Home) -> Result<()> {
-    let config = home.load_config()?;
-    let keys = home.load_keys().ok();
-    let chain = Chain::new(&config.rpc_url, &config.account);
+    let report = app::status(home)?;
 
-    println!("rpc      : {}", config.rpc_url);
-    println!("account  : {}", config.account);
-    println!("registry : {} (live lane-1)", config.registry);
+    println!("rpc      : {}", report.rpc);
+    println!("account  : {}", report.account);
+    println!("registry : {} (live lane-1)", report.registry);
     println!(
         "store    : {}",
-        if config.store.is_empty() { "(not deployed)" } else { &config.store },
+        if report.store.is_empty() { "(not deployed)" } else { &report.store },
     );
-    if let Some(keys) = &keys {
-        println!("scan pub : {}", keys.scan_pub);
-        match (&keys.handle, keys.leaf_index) {
+    if let Some(scan_pub) = &report.scan_pub {
+        println!("scan pub : {scan_pub}");
+        match (&report.handle, report.leaf_index) {
             (Some(h), Some(i)) => println!("handle   : {h} (leaf {i})"),
             _ => println!("handle   : (not registered)"),
         }
     }
-    if !config.store.is_empty() {
-        if let Ok(n) = chain.call(&config.store, "n_messages", &[]) {
-            println!("messages : {}", n.first().map(String::as_str).unwrap_or("?"));
-        }
+    if let Some(n) = &report.n_messages {
+        println!("messages : {n}");
     }
-    match account_balance_strk(&chain, &config) {
-        Ok(strk) => println!("balance  : ~{strk} STRK (a send costs ~50 at spiky prices)"),
-        Err(e) => println!("balance  : unavailable ({e})"),
+    match report.balance_strk {
+        Some(strk) => println!("balance  : ~{strk} STRK (a send costs ~50 at spiky prices)"),
+        None => println!("balance  : unavailable"),
     }
     Ok(())
 }
@@ -341,33 +241,8 @@ fn cmd_dev_args(out: &Path) -> Result<()> {
 
 // --- helpers ----------------------------------------------------------------
 
-fn short_string_felt(s: &str) -> Result<Felt> {
-    ensure!(s.len() <= 31 && s.is_ascii(), "handle must be ASCII, <= 31 chars");
-    let mut buf = [0u8; 32];
-    buf[32 - s.len()..].copy_from_slice(s.as_bytes());
-    Ok(Felt::from_bytes_be(&buf))
-}
-
-fn call_path(chain: &Chain, config: &Config, leaf_index: u32) -> Result<Vec<Felt>> {
-    let raw = chain.call(&config.store, "get_merkle_path", &[format!("{leaf_index:#x}")])?;
-    // Array<felt252> response: length prefix + 20 siblings.
-    ensure!(raw.len() == 21, "get_merkle_path shape: {} felts", raw.len());
-    raw[1..].iter().map(|s| Felt::from_hex(s).context("path felt")).collect()
-}
-
-/// The account's STRK balance in whole tokens (floor).
-fn account_balance_strk(chain: &Chain, config: &Config) -> Result<u128> {
-    let address = account_address(&config.account)?;
-    let out = chain.call(STRK, "balance_of", &[address])?;
-    let low = u128::from_str_radix(
-        out.first().context("balance_of shape")?.trim_start_matches("0x"),
-        16,
-    )?;
-    Ok(low / 1_000_000_000_000_000_000)
-}
-
 fn check_balance(chain: &Chain, config: &Config) -> Result<()> {
-    let strk = account_balance_strk(chain, config)
+    let strk = zkmsg_core::app::account_balance_strk(chain, config)
         .context("balance check failed (use --force to skip)")?;
     ensure!(
         strk >= MIN_BALANCE_STRK,
@@ -376,27 +251,9 @@ fn check_balance(chain: &Chain, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// The account's address from sncast's OZ accounts file.
-fn account_address(account: &str) -> Result<String> {
-    let path = PathBuf::from(std::env::var("HOME")?)
-        .join(".starknet_accounts/starknet_open_zeppelin_accounts.json");
-    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    let address = raw["alpha-sepolia"][account]["address"]
-        .as_str()
-        .with_context(|| format!("account '{account}' not in {}", path.display()))?;
-    Ok(address.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn short_strings_encode_like_cairo() {
-        // 'zkmsg' == 0x7a6b6d7367 (Cairo short-string literal).
-        assert_eq!(short_string_felt("zkmsg").unwrap(), Felt::from_hex("0x7a6b6d7367").unwrap());
-        assert!(short_string_felt("this-is-way-too-long-for-a-short-string").is_err());
-    }
 
     #[test]
     fn cli_sink_line_formats() {
