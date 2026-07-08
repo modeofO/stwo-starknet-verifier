@@ -54,15 +54,19 @@ collision aborts with the error shown in place and keys untouched.
 - **Switching and the picker are disabled while paid work is in
   flight** (a send or a wizard run), with a "work in progress" note.
   The existing `send_in_flight()` generalizes to `work_in_flight()`.
-- Empty root → the picker shows only `New profile…`. A `current`
-  naming a missing profile → fall back to the picker, no error dialog.
+- An empty home (no profiles, no legacy state) → the existing Init
+  onboarding renders, not a picker: the wizard needs a funded source
+  profile, so a picker over an empty root would be a dead end. A
+  `current` naming a missing profile → fall back to the picker, no
+  error dialog.
 
 ## App structure: session extraction
 
 Every per-identity field of `ZkmsgApp` (config, keys, status, inbox,
-compose, send flow, resume banner — everything except `repo_root` and
-the tab selection) moves into a new `ProfileSession` struct constructed
-from a `Home`. The app owns `Option<ProfileSession>` plus the profile
+compose, send flow, resume banner, and the tab selection — everything
+except `repo_root`) moves into a new `ProfileSession` struct constructed
+from a `Home`; a fresh session starts on the Status tab, so a switch
+lands where the new identity's state is visible. The app owns `Option<ProfileSession>` plus the profile
 list and picker state. A switch = drop the session, construct a new
 one. This makes cross-identity state leakage impossible by
 construction: a field added later is per-profile automatically.
