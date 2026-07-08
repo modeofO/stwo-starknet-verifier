@@ -87,7 +87,8 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let home = Home::new(cli.home_dir());
+    let dir = zkmsg_core::profiles::resolve_cli_home(&cli.home_dir())?;
+    let home = Home::new(dir);
 
     match cli.command {
         Command::Init { account, store } => cmd_init(&home, account, store),
