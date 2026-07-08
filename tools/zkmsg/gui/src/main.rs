@@ -1,6 +1,7 @@
 mod app;
 mod compose_view;
 mod inbox_view;
+mod migrate_view;
 mod send_flow;
 mod session;
 mod worker;
@@ -9,14 +10,21 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
     // Raw launch path + profile override; classification (profile vs.
-    // profile-root) happens inside `ZkmsgApp::new`.
-    let launch_path = parse_home_arg().unwrap_or_else(default_home);
+    // profile-root) happens inside `ZkmsgApp::new`. An explicit `--home`
+    // suppresses the one-time migration screen — only the default home is
+    // scanned for legacy layouts.
+    let (launch_path, is_default_home) = match parse_home_arg() {
+        Some(path) => (path, false),
+        None => (default_home(), true),
+    };
     let profile_override = parse_profile_arg();
     let native = eframe::NativeOptions::default();
     eframe::run_native(
         "zkmsg",
         native,
-        Box::new(move |_cc| Ok(Box::new(app::ZkmsgApp::new(launch_path, profile_override)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(app::ZkmsgApp::new(launch_path, profile_override, is_default_home)))
+        }),
     )
 }
 
