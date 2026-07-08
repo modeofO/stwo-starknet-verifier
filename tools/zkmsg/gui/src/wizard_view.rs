@@ -411,10 +411,11 @@ impl WizardUi {
             return; // never run two setups at once
         }
         if wctx.session_busy {
-            // A send is in flight on the same funding account — refuse
-            // regardless of button state, so the paid-path lock is symmetric
-            // and does not depend on the disabled Confirm alone.
-            self.error = Some("a send is running — wait for it to finish".into());
+            // A send, status refresh, or register is in flight on the active
+            // profile — refuse regardless of button state, so the paid-path
+            // lock is symmetric and does not depend on the disabled Confirm
+            // alone.
+            self.error = Some("another operation is running on the active profile — wait for it to finish".into());
             return;
         }
         let Some(dir) = self.profile_dir.clone() else {
@@ -445,6 +446,12 @@ impl WizardUi {
                 s
             }
         };
+        // Pin the payer from first spawn onward: a wizard born from
+        // `new_profile()` starts with `resume_source = None`, but once the plan
+        // is saved the source_account is fixed. An in-window retry (spawn under
+        // one profile, step fails, switch to another, click Resume) must show
+        // the account that setup.json actually pays from, not the active one.
+        self.resume_source = Some(state.source_account.clone());
         self.error = None;
         self.flow = Some(SetupFlow::from_state(&state));
         self.rx = Some(worker::spawn_setup(
