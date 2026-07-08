@@ -33,6 +33,25 @@ const HEAD_LEN: usize = 4_991;
 const STAGE_CHUNK: usize = 1_900;
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(600);
 
+#[derive(Debug, Clone)]
+pub enum PipelineEvent {
+    StepStarted { index: usize, total: usize, kind: StepKind },
+    TxSubmitted { kind: StepKind, tx_hash: String },
+    StepCompleted { kind: StepKind, tx_hash: Option<String>, note: Option<String> },
+    Completed { fact: Option<String> },
+}
+
+/// Emits a StepStarted for each still-pending step without executing —
+/// lets a UI render the plan and lets tests assert event shape offline.
+pub fn emit_plan_events(state: &SendState, sink: &mut dyn FnMut(PipelineEvent)) {
+    let total = state.steps.len();
+    for (index, step) in state.steps.iter().enumerate() {
+        if !step.done {
+            sink(PipelineEvent::StepStarted { index, total, kind: step.kind.clone() });
+        }
+    }
+}
+
 pub struct Pipeline<'a> {
     pub home: &'a Home,
     pub config: &'a Config,
@@ -60,21 +79,26 @@ impl<'a> Pipeline<'a> {
             .collect()
     }
 
-    /// Runs every remaining step; prints progress per step.
-    pub fn run(&self, state: &mut SendState) -> Result<()> {
+    /// Runs every remaining step; emits progress events per step via `sink`.
+    pub fn run(
+        &self,
+        state: &mut SendState,
+        sink: &mut dyn FnMut(PipelineEvent),
+    ) -> Result<()> {
         fs::create_dir_all(self.workdir(state))?;
         while let Some(index) = state.next_pending() {
             let kind = state.steps[index].kind.clone();
-            println!("[{}] step {}/{}: {:?}", state.id, index + 1, state.steps.len(), kind);
+            let total = state.steps.len();
+            sink(PipelineEvent::StepStarted { index, total, kind: kind.clone() });
             let (tx, note) = self.execute(state, &kind)?;
-            state.mark_done(index, tx, note);
+            if let Some(h) = &tx {
+                sink(PipelineEvent::TxSubmitted { kind: kind.clone(), tx_hash: h.clone() });
+            }
+            state.mark_done(index, tx.clone(), note.clone());
             state.save(self.home)?;
+            sink(PipelineEvent::StepCompleted { kind, tx_hash: tx, note });
         }
-        println!(
-            "[{}] complete — fact {}",
-            state.id,
-            state.fact.as_deref().unwrap_or("(recorded on-chain)"),
-        );
+        sink(PipelineEvent::Completed { fact: state.fact.clone() });
         Ok(())
     }
 
@@ -347,6 +371,25 @@ pub fn parse_inner_root(wrap_output: &str) -> Option<[u32; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_events_are_ordered_and_counted() {
+        let mut s = crate::state::SendState::new_plan(
+            "t".into(), "bob".into(), "00".into(), vec!["0x1".into()],
+            ("0xa".into(), "0xb".into(), "0xc".into()), "0xd".into(),
+        );
+        s.set_stage_offsets(&[0]);
+        let mut seen = vec![];
+        emit_plan_events(&s, &mut |e| seen.push(e));
+        // 7 pending steps: Prove, Wrap, Pack, Stage{0}, Phase1, Phase2, Send
+        assert_eq!(seen.len(), 7);
+        match &seen[0] {
+            PipelineEvent::StepStarted { index, total, .. } => {
+                assert_eq!((*index, *total), (0, 7));
+            }
+            _ => panic!("first event must be StepStarted"),
+        }
+    }
 
     /// The exact line the milestone-1 wrap printed; must decode to the
     /// pinned INNER_ROOT.

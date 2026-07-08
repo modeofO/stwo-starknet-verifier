@@ -230,13 +230,13 @@ fn cmd_send(home: &Home, handle: &str, text: &str, force: bool) -> Result<()> {
     send_state.save(home)?;
     println!("send '{id}' -> {handle} ({} bytes ciphertext)", ciphertext.len());
 
-    Pipeline::new(home, &config).run(&mut send_state)
+    Pipeline::new(home, &config).run(&mut send_state, &mut |_| {})
 }
 
 fn cmd_resume(home: &Home, id: &str) -> Result<()> {
     let config = home.load_config()?;
     let mut send_state = SendState::load(home, id)?;
-    Pipeline::new(home, &config).run(&mut send_state)
+    Pipeline::new(home, &config).run(&mut send_state, &mut |_| {})
 }
 
 fn cmd_inbox(home: &Home) -> Result<()> {
