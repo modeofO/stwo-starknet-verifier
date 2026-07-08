@@ -1389,9 +1389,20 @@ dependencies = [
 name = "zkmsg"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "clap",
+ "hex",
+ "serde_json",
+ "starknet-types-core",
+ "zkmsg-core",
+]
+
+[[package]]
+name = "zkmsg-core"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
  "hex",
  "hkdf",
  "rand 0.8.6",
@@ -1403,6 +1414,13 @@ dependencies = [
  "starknet-curve",
  "starknet-types-core",
  "ureq",
+]
+
+[[package]]
+name = "zkmsg-gui"
+version = "0.1.0"
+dependencies = [
+ "zkmsg-core",
 ]
 
 [[package]]

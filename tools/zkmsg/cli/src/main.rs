@@ -5,28 +5,19 @@
 //!
 //! Spec: docs/superpowers/specs/2026-07-05-zkmsg-lane1-port-design.md.
 
-mod args;
-mod chain;
-mod config;
-mod crypto;
-mod inbox;
-mod pack;
-mod pipeline;
-mod state;
-mod tree;
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use starknet_types_core::felt::Felt;
 
-use crate::args::{CircuitInputs, args_to_json, build_circuit_args};
-use crate::chain::{Chain, felt_hex, felt_to_u64};
-use crate::config::{Config, Home, Keys};
-use crate::crypto::{ec_mul_gen_x, ecdh_shared_x, encrypt, poseidon2, scan_keygen};
-use crate::pipeline::Pipeline;
-use crate::state::SendState;
+use zkmsg_core::args::{CircuitInputs, args_to_json, build_circuit_args};
+use zkmsg_core::chain::{Chain, felt_hex, felt_to_u64};
+use zkmsg_core::config::{Config, Home, Keys};
+use zkmsg_core::crypto::{ec_mul_gen_x, ecdh_shared_x, encrypt, poseidon2, scan_keygen};
+use zkmsg_core::pipeline::Pipeline;
+use zkmsg_core::state::SendState;
+use zkmsg_core::{inbox, tree};
 
 /// STRK token (same address on Sepolia and mainnet).
 const STRK: &str = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
@@ -41,8 +32,8 @@ fn default_home() -> PathBuf {
 
 /// The repo this binary was built from — bridge + circuit artifact paths.
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap_or_else(|_| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
     })
 }
 

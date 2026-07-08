@@ -1,0 +1,16 @@
+[package]
+name = "zkmsg"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zkmsg"
+path = "src/main.rs"
+
+[dependencies]
+zkmsg-core = { path = "../core" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+starknet-types-core.workspace = true

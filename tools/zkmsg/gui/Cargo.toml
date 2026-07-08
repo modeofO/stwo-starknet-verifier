@@ -1,0 +1,11 @@
+[package]
+name = "zkmsg-gui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zkmsg-gui"
+path = "src/main.rs"
+
+[dependencies]
+zkmsg-core = { path = "../core" }

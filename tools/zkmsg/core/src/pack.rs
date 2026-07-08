@@ -65,9 +65,9 @@ mod tests {
 
     #[test]
     fn golden_against_shipped_fixture() {
-        let proof_path = fixture("../../fixtures/poseidon_chain_n100.multiverifier_proof.json");
+        let proof_path = fixture("../../../fixtures/poseidon_chain_n100.multiverifier_proof.json");
         let packed_path = fixture(
-            "../../contracts/stwo_fact_registry/tests/data/poseidon_chain_n100_proof_packed.txt",
+            "../../../contracts/stwo_fact_registry/tests/data/poseidon_chain_n100_proof_packed.txt",
         );
 
         let values = load_proof_json(&proof_path).expect("load proof json");
