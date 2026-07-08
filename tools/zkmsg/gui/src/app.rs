@@ -254,6 +254,10 @@ impl ZkmsgApp {
             return;
         };
         let repo_root = self.repo_root.clone();
+        // A send in flight on the funding account blocks the wizard's own
+        // spend — the mirror of the `locked` flag that blocks the send button
+        // while the wizard runs.
+        let session_busy = self.session.as_ref().is_some_and(|s| s.work_in_flight());
         let Some(mut wizard) = self.wizard.take() else { return };
         let outcome = wizard.update(&WizardCtx {
             egui_ctx: ctx,
@@ -261,12 +265,19 @@ impl ZkmsgApp {
             repo_root: &repo_root,
             rpc_url: &rpc_url,
             source_account: &source_account,
+            session_busy,
         });
         match outcome {
             WizardOutcome::None => self.wizard = Some(wizard),
             WizardOutcome::Cancelled => {}
             WizardOutcome::Completed { name, dir } => {
-                let _ = write_current(&root, &name);
+                // Surface a failed `current` write the same way the switch path
+                // does (picker_error), rather than swallowing it — the profile
+                // is fully built, so still open it; only the next-launch default
+                // is what didn't persist.
+                if let Err(e) = write_current(&root, &name) {
+                    self.picker_error = Some(format!("failed to set current profile: {e:#}"));
+                }
                 self.profiles = list_profiles(&root).unwrap_or_default();
                 self.open_session(ctx, name, Home::new(dir));
             }
@@ -397,15 +408,18 @@ impl eframe::App for ZkmsgApp {
             },
         }
 
+        // The app-level spend lock: a wizard actively spending. Suppresses
+        // the pending-send banner's Resume and disables the Compose spend
+        // buttons, so no paid pipeline races the wizard's funding transfer.
+        let locked = self.wizard.as_ref().is_some_and(|w| w.running());
         if let Some(session) = &mut self.session {
-            session.pending_banner(ctx);
+            session.pending_banner(ctx, locked);
         }
 
         // Which profile the picker (no-session branch) wants opened —
         // collected inside the closure and acted on after it, since
         // `open_session` needs `&mut self` while the closure borrows fields.
         let mut open_request = None;
-        let locked = self.wizard.as_ref().is_some_and(|w| w.running());
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.session {
             Some(session) => session.render(ui, ctx, &self.repo_root, locked),
             None => {

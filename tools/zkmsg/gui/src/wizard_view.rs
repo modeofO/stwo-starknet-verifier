@@ -31,6 +31,11 @@ pub struct WizardCtx<'a> {
     pub repo_root: &'a Path,
     pub rpc_url: &'a str,
     pub source_account: &'a str,
+    /// The active session has a send being prepared/run. The wizard's Fund
+    /// draws on that same account, so its spend actions (Create / Confirm /
+    /// Resume) must be blocked while a send is in flight — symmetric with the
+    /// Compose side, where the wizard's run blocks the send button.
+    pub session_busy: bool,
 }
 
 /// What the app should do after a frame's wizard render.
@@ -201,7 +206,7 @@ impl WizardUi {
         let val_err = self.validation_error(wctx.root);
         ui.separator();
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(val_err.is_none(), |ui| {
+            ui.add_enabled_ui(val_err.is_none() && !wctx.session_busy, |ui| {
                 if ui.button("Create…").clicked() {
                     // Compute the dir but do NOT create it — that happens
                     // only on Confirm, so a cancel leaves no trace.
@@ -217,6 +222,8 @@ impl WizardUi {
         });
         if let Some(e) = &val_err {
             ui.colored_label(ui.visuals().weak_text_color(), e.as_str());
+        } else if wctx.session_busy {
+            ui.label("a send is running — profile setup is paused until it finishes");
         }
         outcome
     }
@@ -273,10 +280,14 @@ impl WizardUi {
                     if ui.button("Cancel").clicked() {
                         self.confirm_open = false;
                     }
-                    if ui.button("Confirm").clicked() {
-                        self.confirm_open = false;
-                        self.spawn(wctx);
-                    }
+                    // Disabled while a send is running; `spawn` also refuses
+                    // in that case, so the gate never rests on button state.
+                    ui.add_enabled_ui(!wctx.session_busy, |ui| {
+                        if ui.button("Confirm").clicked() {
+                            self.confirm_open = false;
+                            self.spawn(wctx);
+                        }
+                    });
                 });
             });
         if !open {
@@ -327,7 +338,7 @@ impl WizardUi {
         // Not running and not complete → offer a resume. `request_resume`
         // routes through the confirm dialog whenever Fund is still pending,
         // so no spend ever starts without it.
-        let can_resume = !flow.completed;
+        let can_resume = !flow.completed && !wctx.session_busy;
         ui.horizontal(|ui| {
             if can_resume && ui.button("Resume").clicked() {
                 self.request_resume(wctx);
@@ -338,6 +349,9 @@ impl WizardUi {
                 outcome = WizardOutcome::Cancelled;
             }
         });
+        if !flow.completed && wctx.session_busy {
+            ui.label("a send is running — resume is paused until it finishes");
+        }
         outcome
     }
 
@@ -367,6 +381,13 @@ impl WizardUi {
     fn spawn(&mut self, wctx: &WizardCtx) {
         if self.rx.is_some() {
             return; // never run two setups at once
+        }
+        if wctx.session_busy {
+            // A send is in flight on the same funding account — refuse
+            // regardless of button state, so the paid-path lock is symmetric
+            // and does not depend on the disabled Confirm alone.
+            self.error = Some("a send is running — wait for it to finish".into());
+            return;
         }
         let Some(dir) = self.profile_dir.clone() else {
             self.error = Some("no profile directory set".into());

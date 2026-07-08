@@ -195,11 +195,17 @@ impl ProfileSession {
     /// pending. Resume routes through the Compose tab's resume path
     /// (switch to it, then `resume_send`); Dismiss only drops the entry
     /// from this in-memory list — the checkpoint file is left untouched.
-    pub(crate) fn pending_banner(&mut self, ctx: &egui::Context) {
+    /// `locked` is the app-level "a wizard is spending right now" flag: the
+    /// banner's Resume is another paid pipeline drawing on the same funding
+    /// account, so it must be suppressed while a wizard runs too, not only
+    /// while this session's own send is in flight.
+    pub(crate) fn pending_banner(&mut self, ctx: &egui::Context, locked: bool) {
         // Never offer Resume while a send is being prepared or run — a
         // second paid pipeline started here would race the active one
-        // (double-spend). The banner returns once that send completes.
-        if self.work_in_flight() {
+        // (double-spend). Also suppress it while a wizard is spending
+        // (same funding account, nonce collision). The banner returns once
+        // both complete.
+        if self.work_in_flight() || locked {
             return;
         }
         if self.pending.is_empty() {
