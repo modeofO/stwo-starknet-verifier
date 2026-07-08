@@ -20,6 +20,11 @@ pub const SEPOLIA_STORE_DEFAULT: &str =
     "0x02d66a02b2efdddb5282bf7d7931cbb7a724f191478843b1fccbf3b9729e91b7";
 pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.com";
 
+/// STRK token (same address on Sepolia and mainnet) — the fee/transfer
+/// token used by the setup wizard's fund step and the status balance read.
+pub const STRK_TOKEN: &str =
+    "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
+
 /// The messagezk_scan circuit route, pinned at milestone 1
 /// (docs/superpowers/specs/2026-07-05-zkmsg-milestone1-addendum.md).
 pub const PROGRAM_HASH: &str =

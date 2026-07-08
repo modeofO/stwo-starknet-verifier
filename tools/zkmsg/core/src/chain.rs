@@ -76,6 +76,42 @@ impl Chain {
         parse_sncast_json(&stdout)
     }
 
+    // --- sncast account subcommands ---------------------------------------
+    //
+    // These take `--name` (not `--account`), so they build their own
+    // Command rather than reusing `sncast()`.
+
+    /// `sncast account create` — generates a keypair straight into the OZ
+    /// accounts file (no manual key handling) and returns the precomputed
+    /// address. Deployment happens separately, after funding.
+    pub fn account_create(&self, name: &str) -> Result<String> {
+        let v = Self::sncast_account(&["create", "--name", name], &self.rpc_url)?;
+        Ok(v["address"].as_str().with_context(|| format!("no address in: {v}"))?.to_string())
+    }
+
+    /// `sncast account deploy` — the DEPLOY_ACCOUNT tx, fees paid by the
+    /// (pre-funded) new account itself.
+    pub fn account_deploy(&self, name: &str) -> Result<String> {
+        let v = Self::sncast_account(&["deploy", "--name", name], &self.rpc_url)?;
+        Ok(v["transaction_hash"].as_str().with_context(|| format!("no tx in: {v}"))?.to_string())
+    }
+
+    fn sncast_account(args: &[&str], url: &str) -> Result<Value> {
+        let mut cmd = Command::new("sncast");
+        cmd.arg("--json").arg("account").args(args).arg("--url").arg(url);
+        let out = cmd.output().context("running sncast account")?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() {
+            bail!(
+                "sncast account {} failed:\n{}\n{}",
+                args.first().unwrap_or(&""),
+                stdout,
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+        parse_sncast_json(&stdout)
+    }
+
     pub fn invoke(
         &self,
         contract: &str,
@@ -220,6 +256,17 @@ impl Chain {
             }
         }
     }
+}
+
+/// An account's address from sncast's OZ accounts file (Sepolia).
+pub fn account_address(account: &str) -> Result<String> {
+    let path = std::path::Path::new(&std::env::var("HOME")?)
+        .join(".starknet_accounts/starknet_open_zeppelin_accounts.json");
+    let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let address = raw["alpha-sepolia"][account]["address"]
+        .as_str()
+        .with_context(|| format!("account '{account}' not in {}", path.display()))?;
+    Ok(address.to_string())
 }
 
 fn str_vec(v: &Value) -> Vec<String> {

@@ -8,13 +8,10 @@ use anyhow::{Context, Result, bail, ensure};
 use starknet_types_core::felt::Felt;
 
 use crate::args::{CircuitInputs, args_to_json, build_circuit_args};
-use crate::chain::{Chain, felt_hex, felt_to_u64};
-use crate::config::{Config, Home, Keys};
+use crate::chain::{Chain, account_address, felt_hex, felt_to_u64};
+use crate::config::{Config, Home, Keys, STRK_TOKEN};
 use crate::crypto::{ecdh_shared_x, encrypt, poseidon2, scan_keygen};
 use crate::state::{SendState, StepKind};
-
-/// STRK token (same address on Sepolia and mainnet).
-const STRK: &str = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 
 pub struct StatusReport {
     pub rpc: String,
@@ -261,23 +258,12 @@ fn call_path(chain: &Chain, config: &Config, leaf_index: u32) -> Result<Vec<Felt
 /// The account's STRK balance in whole tokens (floor).
 pub fn account_balance_strk(chain: &Chain, config: &Config) -> Result<u128> {
     let address = account_address(&config.account)?;
-    let out = chain.call(STRK, "balance_of", &[address])?;
+    let out = chain.call(STRK_TOKEN, "balance_of", &[address])?;
     let low = u128::from_str_radix(
         out.first().context("balance_of shape")?.trim_start_matches("0x"),
         16,
     )?;
     Ok(low / 1_000_000_000_000_000_000)
-}
-
-/// The account's address from sncast's OZ accounts file.
-fn account_address(account: &str) -> Result<String> {
-    let path = Path::new(&std::env::var("HOME")?)
-        .join(".starknet_accounts/starknet_open_zeppelin_accounts.json");
-    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    let address = raw["alpha-sepolia"][account]["address"]
-        .as_str()
-        .with_context(|| format!("account '{account}' not in {}", path.display()))?;
-    Ok(address.to_string())
 }
 
 #[cfg(test)]
