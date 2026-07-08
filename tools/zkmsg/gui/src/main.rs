@@ -4,6 +4,8 @@ mod inbox_view;
 mod migrate_view;
 mod send_flow;
 mod session;
+mod setup_flow;
+mod wizard_view;
 mod worker;
 
 use std::path::PathBuf;

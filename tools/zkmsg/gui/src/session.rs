@@ -151,10 +151,19 @@ impl ProfileSession {
 
     /// Renders the active tab's central content. `repo_root` is the shell's
     /// (see `init_panel` — `init_identity`'s default config needs it).
-    pub(crate) fn render(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, repo_root: &Path) {
+    /// `locked` is the app-level "a wizard is spending right now" flag — it
+    /// disables the Compose tab's spend actions so a send can't race the
+    /// wizard's funding transfer out of the same account.
+    pub(crate) fn render(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        repo_root: &Path,
+        locked: bool,
+    ) {
         match self.tab {
             Tab::Status => self.status_tab(ui, ctx, repo_root),
-            Tab::Compose => self.compose_tab(ui, ctx),
+            Tab::Compose => self.compose_tab(ui, ctx, locked),
             Tab::Inbox => self.inbox_tab(ui, ctx),
         }
     }

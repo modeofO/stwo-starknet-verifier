@@ -69,16 +69,19 @@ impl ProfileSession {
         }
     }
 
-    pub(crate) fn compose_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// `locked` is the app-level wizard-running flag: while a profile-setup
+    /// wizard is spending, no send (compose or resume) may start, or two
+    /// paid flows would draw on the same account at once.
+    pub(crate) fn compose_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, locked: bool) {
         if self.send_flow.is_some() {
-            self.render_send_progress(ui, ctx);
+            self.render_send_progress(ui, ctx, locked);
         } else {
-            self.render_compose_form(ui, ctx);
+            self.render_compose_form(ui, ctx, locked);
         }
-        self.render_confirm_dialog(ctx);
+        self.render_confirm_dialog(ctx, locked);
     }
 
-    fn render_compose_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn render_compose_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, locked: bool) {
         if let Some(err) = &self.last_error {
             ui.colored_label(egui::Color32::RED, err.as_str());
             ui.separator();
@@ -153,7 +156,8 @@ impl ProfileSession {
 
         let can_send = matches!(self.compose_resolved, Some(Ok(_)))
             && !self.compose_text.trim().is_empty()
-            && !self.compose_preparing;
+            && !self.compose_preparing
+            && !locked;
         ui.add_enabled_ui(can_send, |ui| {
             if ui.button("Send").clicked() {
                 self.compose_show_confirm = true;
@@ -162,9 +166,12 @@ impl ProfileSession {
         if self.compose_preparing {
             ui.label("preparing send (root + merkle paths + encrypt)…");
         }
+        if locked {
+            ui.label("a profile setup is running — sending is paused until it finishes");
+        }
     }
 
-    fn render_confirm_dialog(&mut self, ctx: &egui::Context) {
+    fn render_confirm_dialog(&mut self, ctx: &egui::Context, locked: bool) {
         if !self.compose_show_confirm {
             return;
         }
@@ -195,10 +202,14 @@ impl ProfileSession {
                     if ui.button("Cancel").clicked() {
                         self.compose_show_confirm = false;
                     }
-                    if ui.button("Confirm").clicked() {
-                        self.compose_show_confirm = false;
-                        self.start_prepare(ctx);
-                    }
+                    // Disabled while a wizard is spending — same guard as the
+                    // Send button, in case the dialog was already open.
+                    ui.add_enabled_ui(!locked, |ui| {
+                        if ui.button("Confirm").clicked() {
+                            self.compose_show_confirm = false;
+                            self.start_prepare(ctx);
+                        }
+                    });
                 });
             });
         if !open {
@@ -299,7 +310,7 @@ impl ProfileSession {
         self.send_state_id = None;
     }
 
-    fn render_send_progress(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn render_send_progress(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, locked: bool) {
         // Cloned (not borrowed): the checklist is tiny, and owning a copy
         // here lets the Resume/Compose-another buttons below call `&mut
         // self` methods without fighting an immutable borrow of
@@ -353,7 +364,7 @@ impl ProfileSession {
         let is_done = flow.fact.is_some();
 
         ui.separator();
-        if has_failed && ui.button("Resume").clicked() {
+        if has_failed && !locked && ui.button("Resume").clicked() {
             if let Some(id) = self.send_state_id.clone() {
                 self.resume_send(&id, ctx);
             }

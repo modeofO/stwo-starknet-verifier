@@ -16,11 +16,48 @@ use zkmsg_core::chain::Chain;
 use zkmsg_core::config::{Config, Home};
 use zkmsg_core::inbox::{self, ReceivedMessage};
 use zkmsg_core::pipeline::{Pipeline, PipelineEvent};
+use zkmsg_core::setup::{SetupEvent, SetupRunner, SetupState};
 use zkmsg_core::state::SendState;
 
 pub enum WorkerMsg {
     Progress(PipelineEvent),
     Done(Result<(), String>),
+}
+
+/// Progress stream for the profile-setup wizard — same shape as
+/// `WorkerMsg`, over `SetupEvent`.
+pub enum SetupWorkerMsg {
+    Progress(SetupEvent),
+    Done(Result<(), String>),
+}
+
+/// Runs (or resumes) the identity-setup pipeline on a worker thread; the
+/// returned receiver yields progress until Done. Mirrors `spawn_send`:
+/// blocking chain RPC / subprocess work off the UI thread, one repaint per
+/// message. The `SetupRunner` skips already-done steps, so a resumed
+/// `state` picks up at the first incomplete step.
+pub fn spawn_setup(
+    rpc_url: String,
+    profile_dir: PathBuf,
+    repo_root: PathBuf,
+    mut state: SetupState,
+    ctx: egui::Context,
+) -> Receiver<SetupWorkerMsg> {
+    let (tx, rx): (Sender<SetupWorkerMsg>, Receiver<SetupWorkerMsg>) = channel();
+    thread::spawn(move || {
+        let tx2 = tx.clone();
+        let ctx2 = ctx.clone();
+        let mut sink = move |e: SetupEvent| {
+            let _ = tx2.send(SetupWorkerMsg::Progress(e));
+            ctx2.request_repaint();
+        };
+        let runner =
+            SetupRunner { rpc_url: &rpc_url, profile_dir: &profile_dir, repo_root: &repo_root };
+        let result = runner.run(&mut state, &mut sink);
+        let _ = tx.send(SetupWorkerMsg::Done(result.map_err(|e| format!("{e:#}"))));
+        ctx.request_repaint();
+    });
+    rx
 }
 
 /// Runs (or resumes) a send on a worker thread; the returned receiver

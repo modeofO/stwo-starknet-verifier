@@ -17,6 +17,19 @@ use zkmsg_core::profiles::{
 
 use crate::migrate_view::{self, MigrateAction, MigrationUi};
 use crate::session::{ProfileSession, Tab};
+use crate::wizard_view::{WizardCtx, WizardOutcome, WizardUi};
+
+/// What the profile picker requested this frame.
+enum PickerAction {
+    None,
+    /// Switch the active session to an existing (complete) profile.
+    Switch(String, PathBuf),
+    /// Open the New-profile wizard on a blank form.
+    New,
+    /// Resume an incomplete profile's setup wizard (from its checkpoint dir;
+    /// the name is read back from `setup.json`).
+    Resume(PathBuf),
+}
 
 pub struct ZkmsgApp {
     /// `Some` when the launch path was a profile root — the dir under which
@@ -39,6 +52,11 @@ pub struct ZkmsgApp {
     /// migration screen renders instead of opening `initial`, until the user
     /// migrates or clicks "Not now". Only ever set for the default home.
     migration: Option<MigrationUi>,
+
+    /// The New-profile wizard, when open. Floats over the active session
+    /// (which supplies the funding source account); `running()` folds into
+    /// the app-level in-flight guard.
+    wizard: Option<WizardUi>,
 }
 
 impl ZkmsgApp {
@@ -98,7 +116,16 @@ impl ZkmsgApp {
             picker_error: None,
             initial,
             migration,
+            wizard: None,
         }
+    }
+
+    /// App-level in-flight: a send being prepared/run in the active session,
+    /// OR the setup wizard spending. Disables the profile picker and the
+    /// Compose send button so no two paid flows overlap.
+    fn work_in_flight(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.work_in_flight())
+            || self.wizard.as_ref().is_some_and(|w| w.running())
     }
 
     /// Opens `home` as the active session and retitles the window to name
@@ -122,8 +149,9 @@ impl ZkmsgApp {
         ui: &mut egui::Ui,
         active_name: &str,
         in_flight: bool,
-    ) -> Option<(String, PathBuf)> {
-        let mut request = None;
+        source_available: bool,
+    ) -> PickerAction {
+        let mut action = PickerAction::None;
         ui.add_enabled_ui(!in_flight, |ui| {
             egui::ComboBox::from_id_salt("profile_picker").selected_text(active_name).show_ui(
                 ui,
@@ -132,28 +160,54 @@ impl ZkmsgApp {
                         self.root.as_deref().map(list_profiles).and_then(Result::ok).unwrap_or_default();
                     for entry in &self.profiles {
                         if entry.setup_incomplete {
-                            // The setup wizard is Task 7; until then an
-                            // unfinished profile can't be opened, so show it
-                            // grayed and unselectable rather than hiding it.
-                            ui.add_enabled(
-                                false,
+                            // Selectable-to-resume: clicking reopens the
+                            // wizard on this profile's checkpoint. Resuming
+                            // still needs a funding source (the active
+                            // profile's config) to continue, so gate it the
+                            // same way as New.
+                            let resume = ui.add_enabled(
+                                source_available,
                                 egui::SelectableLabel::new(
                                     false,
                                     format!("{} (setup incomplete)", entry.name),
                                 ),
                             );
+                            if resume.clicked() {
+                                action = PickerAction::Resume(entry.dir.clone());
+                            }
+                            if !source_available {
+                                resume.on_hover_text(
+                                    "open a profile with a funded account first — it funds the resume",
+                                );
+                            }
                             continue;
                         }
                         let selected = entry.name == active_name;
                         if ui.selectable_label(selected, &entry.name).clicked() && !selected {
-                            request = Some((entry.name.clone(), entry.dir.clone()));
+                            action = PickerAction::Switch(entry.name.clone(), entry.dir.clone());
                         }
+                    }
+                    ui.separator();
+                    // New profile needs a funded source account (the active
+                    // profile's) to pay the create/fund/deploy; disabled with
+                    // a tooltip when the active session has no config.
+                    let new = ui.add_enabled(
+                        source_available,
+                        egui::SelectableLabel::new(false, "New profile…"),
+                    );
+                    if new.clicked() {
+                        action = PickerAction::New;
+                    }
+                    if !source_available {
+                        new.on_hover_text(
+                            "open a profile with a funded account first — it funds the new one",
+                        );
                     }
                 },
             );
         });
         if in_flight {
-            ui.label("send in progress");
+            ui.label("busy");
         }
         // A switch that failed to persist `current` leaves the old session
         // active, so surface its error next to the picker rather than in the
@@ -161,7 +215,7 @@ impl ZkmsgApp {
         if let Some(err) = &self.picker_error {
             ui.colored_label(egui::Color32::RED, err.as_str());
         }
-        request
+        action
     }
 
     /// Applies a picker selection: persists `current` BEFORE rebuilding the
@@ -177,6 +231,46 @@ impl ZkmsgApp {
         }
         self.picker_error = None;
         self.open_session(ctx, name, Home::new(dir));
+    }
+
+    /// Drives the New-profile wizard for one frame. Extracts the funding
+    /// source (the active session's account + rpc) so the wizard can borrow
+    /// them without a `self` borrow conflict, then acts on its outcome: on
+    /// completion, persist `current`, rescan, and open the new profile.
+    fn update_wizard(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.root.clone() else {
+            self.wizard = None;
+            return;
+        };
+        let Some((source_account, rpc_url)) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.config.as_ref())
+            .map(|c| (c.account.clone(), c.rpc_url.clone()))
+        else {
+            // No funding source (session gone / unconfigured) — can't run a
+            // setup; drop the wizard rather than spend from nothing.
+            self.wizard = None;
+            return;
+        };
+        let repo_root = self.repo_root.clone();
+        let Some(mut wizard) = self.wizard.take() else { return };
+        let outcome = wizard.update(&WizardCtx {
+            egui_ctx: ctx,
+            root: &root,
+            repo_root: &repo_root,
+            rpc_url: &rpc_url,
+            source_account: &source_account,
+        });
+        match outcome {
+            WizardOutcome::None => self.wizard = Some(wizard),
+            WizardOutcome::Cancelled => {}
+            WizardOutcome::Completed { name, dir } => {
+                let _ = write_current(&root, &name);
+                self.profiles = list_profiles(&root).unwrap_or_default();
+                self.open_session(ctx, name, Home::new(dir));
+            }
+        }
     }
 
     /// Renders the migration screen and dispatches the clicked button.
@@ -253,8 +347,14 @@ impl eframe::App for ZkmsgApp {
         // (the picker mutates `self.profiles` on rescan). A switch selected in
         // the picker is collected here and applied after the panel closes,
         // since `open_session` needs `&mut self`.
-        let session_info = self.session.as_ref().map(|s| (s.name.clone(), s.work_in_flight()));
-        let mut switch_request: Option<(String, PathBuf)> = None;
+        // Snapshotted before the panel closure borrows `self.session`: the
+        // app-level in-flight guard (session send OR wizard run) disables the
+        // picker, and whether the active session has a config decides if
+        // "New profile…" has a funding source.
+        let app_busy = self.work_in_flight();
+        let source_available = self.session.as_ref().is_some_and(|s| s.config.is_some());
+        let active_name = self.session.as_ref().map(|s| s.name.clone());
+        let mut picker_action = PickerAction::None;
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(session) = &mut self.session {
@@ -262,13 +362,18 @@ impl eframe::App for ZkmsgApp {
                     ui.selectable_value(&mut session.tab, Tab::Compose, "Compose");
                     ui.selectable_value(&mut session.tab, Tab::Inbox, "Inbox");
                 }
-                if let Some((active_name, in_flight)) = &session_info {
+                if let Some(active_name) = &active_name {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // A root launch scans children, so it gets the switcher;
                         // a bare-profile launch has no root to scan and keeps the
                         // static label.
                         if self.root.is_some() {
-                            switch_request = self.profile_picker(ui, active_name, *in_flight);
+                            picker_action = self.profile_picker(
+                                ui,
+                                active_name,
+                                app_busy,
+                                source_available,
+                            );
                         } else {
                             ui.label(active_name);
                         }
@@ -276,8 +381,20 @@ impl eframe::App for ZkmsgApp {
                 }
             });
         });
-        if let Some((name, dir)) = switch_request {
-            self.switch_profile(ctx, name, dir);
+        match picker_action {
+            PickerAction::None => {}
+            PickerAction::Switch(name, dir) => self.switch_profile(ctx, name, dir),
+            PickerAction::New => {
+                self.picker_error = None;
+                self.wizard = Some(WizardUi::new_profile());
+            }
+            PickerAction::Resume(dir) => match WizardUi::resume(dir) {
+                Ok(w) => {
+                    self.picker_error = None;
+                    self.wizard = Some(w);
+                }
+                Err(e) => self.picker_error = Some(e),
+            },
         }
 
         if let Some(session) = &mut self.session {
@@ -288,8 +405,9 @@ impl eframe::App for ZkmsgApp {
         // collected inside the closure and acted on after it, since
         // `open_session` needs `&mut self` while the closure borrows fields.
         let mut open_request = None;
+        let locked = self.wizard.as_ref().is_some_and(|w| w.running());
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.session {
-            Some(session) => session.render(ui, ctx, &self.repo_root),
+            Some(session) => session.render(ui, ctx, &self.repo_root, locked),
             None => {
                 ui.vertical_centered(|ui| {
                     ui.label("no profile selected");
@@ -306,6 +424,12 @@ impl eframe::App for ZkmsgApp {
         });
         if let Some((name, home)) = open_request {
             self.open_session(ctx, name, home);
+        }
+
+        // The wizard floats over whatever the session rendered; drive it after
+        // the central panel so its window lands on top.
+        if self.wizard.is_some() {
+            self.update_wizard(ctx);
         }
 
         if let Some(session) = &self.session {
