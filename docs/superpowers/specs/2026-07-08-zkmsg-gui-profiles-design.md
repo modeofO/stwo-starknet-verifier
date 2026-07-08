@@ -24,16 +24,17 @@ burner accounts later.
 
 A **profile** is any `.zkmsg-<name>` child of the root that contains a
 `config.json`. Profile names come from directory names — drawing the
-picker never touches the network (renaming = renaming a dir). The one
-exception is the migration screen's name *suggestion*, below.
+picker never touches the network (renaming = renaming a dir). The
+migration screen's name *suggestions* come from locally cached
+handles in `keys.json`, so migration is offline too.
 
 **Migration is a one-time explicit screen, never silent** — keys are
 irreplaceable. On launch, legacy state is detected: a top-level
 `config.json` in `~/.zkmsg` itself (today's alice) and any sibling
 `~/.zkmsg-*` dirs (today's bob). The screen lists each with an editable
-name — pre-filled from the dir suffix for siblings, and from an
-on-chain handle lookup for the legacy root (fallback: empty field) —
-and one Migrate button. Execution is atomic `rename`s only (entries of
+name — pre-filled from the registered handle cached in that home's
+`keys.json` (alice, bob), falling back to the dir suffix (empty field
+for the legacy root if neither exists) — and one Migrate button. Execution is atomic `rename`s only (entries of
 the legacy root move into the new `.zkmsg-<name>` child; sibling dirs
 move under the root). Nothing is copied, deleted, or overwritten; a
 collision aborts with the error shown in place and keys untouched.
