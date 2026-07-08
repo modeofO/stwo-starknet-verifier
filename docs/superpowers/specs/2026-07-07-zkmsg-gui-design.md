@@ -86,6 +86,16 @@ read-only reload of the state file on completion. Balance/status calls
 run on short-lived background threads with the same channel pattern
 (never block the UI thread on RPC).
 
+## Platform (owner-confirmed 2026-07-07)
+
+**macOS on Apple Silicon only, native builds only** — no cross
+compilation, no CI build matrix, no Windows/Linux targets, no
+bundling/signing. The GUI is `cargo run -p zkmsg-gui` on the dev
+machine, same as the CLI. (The pipeline is macOS-host-bound today
+anyway: the local prover checkout, the ~25 GB wrap leg, sncast paths.)
+Cross-platform becomes a question only if/when the Tauri product shell
+happens.
+
 ## Non-goals (v1)
 
 Multi-profile switching in-app, the double-ratchet layer, burner
