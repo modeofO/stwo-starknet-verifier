@@ -89,7 +89,17 @@ impl ZkmsgApp {
 
         ui.horizontal(|ui| {
             ui.label("to:");
-            ui.text_edit_singleline(&mut self.compose_handle);
+            let handle_response = ui.text_edit_singleline(&mut self.compose_handle);
+            if handle_response.changed() {
+                // The old resolution (and any resolve still in flight) is
+                // now for a DIFFERENT handle than what's displayed —
+                // drop it so Send can't fire against an unverified
+                // recipient, and so a stale in-flight result can't land
+                // and get shown as if it resolved the new text.
+                self.compose_resolved = None;
+                self.compose_resolve_rx = None;
+                self.compose_resolving = false;
+            }
             ui.add_enabled_ui(
                 !self.compose_resolving && !self.compose_handle.trim().is_empty(),
                 |ui| {
@@ -156,6 +166,19 @@ impl ZkmsgApp {
         if !self.compose_show_confirm {
             return;
         }
+        // Send is only enabled while `compose_resolved` matches the
+        // currently-displayed `compose_handle` (any edit clears the old
+        // resolution), so by the time this dialog can be open, the two
+        // are guaranteed to describe the same, freshly-verified recipient.
+        let handle = self.compose_handle.trim().to_string();
+        let leaf = match &self.compose_resolved {
+            Some(Ok((_, leaf))) => Some(*leaf),
+            _ => None,
+        };
+        let recipient = match leaf {
+            Some(leaf) => format!("'{handle}' (leaf {leaf})"),
+            None => format!("'{handle}'"),
+        };
         let mut open = true;
         egui::Window::new("Confirm send")
             .collapsible(false)
@@ -163,8 +186,8 @@ impl ZkmsgApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "Publish this message? This spends ~{ESTIMATED_COST_STRK} STRK on \
-                     Sepolia and cannot be undone."
+                    "Publish this message to {recipient}? This spends \
+                     ~{ESTIMATED_COST_STRK} STRK on Sepolia and cannot be undone."
                 ));
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
