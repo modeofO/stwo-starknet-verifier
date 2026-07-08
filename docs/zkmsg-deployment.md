@@ -56,6 +56,31 @@ Bounds now: amounts pinned per step, prices fetched from the latest block
 Total campaign spend ≈ 90 STRK incl. the declare and the burned revert;
 ~612 STRK remain on `funded-deployer`.
 
+## The first GUI-driven send (2026-07-07, send id `4a1b2e966b`)
+
+The `zkmsg-gui` egui app (workspace split: `zkmsg-core` lib / `zkmsg` CLI
+/ `zkmsg-gui`) drove a complete send end-to-end — compose to `bob`,
+recipient resolved in-app, the ~48-STRK cost confirmed in an explicit
+dialog, the checklist run green through Publish — and bob's GUI inbox
+trial-decrypted it on Refresh. Message #3, 64 bytes of ciphertext.
+
+Both pre-spend gates passed (bootloader preimage tuple + pinned inner
+root); this proof packed to 4,926 head slots with a zero-length tail, so
+no stage tx was needed — a 5-step on-chain plan instead of the first
+send's 6.
+
+| leg | tx | fee |
+|---|---|---|
+| verify_phase1 (849.7M l2_gas) | `0x014aaf82…f81a` | 24.65 STRK |
+| verify_phase2 → fact (773.5M l2_gas) | `0x00bef71b…be60` | 22.43 STRK |
+| send_message | `0x0507d18c…cbd4` | 0.09 STRK |
+
+**fact `0x5b824d25e6a93dcc352e9ab1e14d8f418f7f067bbd65e10f0058708272f6e25`
+— `is_valid == true` on the live registry.** Total 47.2 STRK; ~456 STRK
+remain on `funded-deployer`. The CLI survived the refactor byte-identical
+(hard parity gate); the GUI adds nothing to the trust surface — same
+pipeline, same checkpoints, same pre-spend gates.
+
 ## What this demonstrates
 
 - Lane 1 verifies arbitrary app circuits TODAY — including `ec_op`-using

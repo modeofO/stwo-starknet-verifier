@@ -290,8 +290,12 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   (`0x02d66a02…91b7`, pinned route, replay guard, no `set_verifier`).
   Fact `0x2dc0a370…4145f`; send cost 47.7 STRK / 1.68e9 gas — flat in
   circuit size, within 1.5% of the fixture's lane-1 numbers. Recipient
-  decrypts by trial-ECDH; sender's own inbox correctly empty. Suites:
-  store 12/12, zkmsg 27/27, blake 5/5, poseidon 30/30.
+  decrypts by trial-ECDH; sender's own inbox correctly empty. Now also a
+  native egui GUI (2026-07-07): `tools/zkmsg` split into a core lib +
+  CLI (byte-identical stdout) + `zkmsg-gui` — compose/confirm/live step
+  checklist, trial-decrypt inbox, resume banner; first GUI-driven send
+  fact `0x5b824d25…f6e25`, 47.2 STRK. Suites: store 12/12, zkmsg-core
+  29/29 + gui reducer 2/2, blake 5/5, poseidon 30/30.
 - **Next:** the qm31 gate-probe re-test on Starknet version bumps (the
   only blocker for the public network), the messagezk-circuit sizing
   pass (re-run `prove-blake` + the devnet drive on the real circuit;

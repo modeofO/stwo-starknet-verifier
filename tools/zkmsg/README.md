@@ -42,6 +42,32 @@ transactions. Two pre-spend gates abort BEFORE any money moves if the
 proof doesn't carry exactly the expected public tuple or the wrap's
 inner circuit root drifts from the pinned route.
 
+## GUI
+
+The same product as a native egui app (macOS/Apple Silicon):
+
+```sh
+cargo run --release -p zkmsg-gui -- --home ~/.zkmsg   # same --home as the CLI
+```
+
+Three tabs — **Status** (identity, balances, addresses; doubles as
+init/register onboarding), **Compose** (recipient resolve, byte counter,
+and a send gated behind an explicit confirm dialog stating the STRK
+cost), **Inbox** (trial-decrypt scan with manual Refresh + optional 30 s
+auto-refresh). During a send the compose view becomes a live checklist —
+one row per pipeline step, tx hashes as Voyager links as they land.
+Incomplete sends surface as a resume banner on launch: the GUI face of
+the same checkpoint files the CLI's `resume` uses.
+
+The workspace is three crates: `zkmsg-core` (all logic, emits typed
+`PipelineEvent`s through a sink), `zkmsg` (the CLI, stdout byte-identical
+to the pre-refactor tool), `zkmsg-gui` (egui/eframe; the pipeline runs on
+a worker thread feeding an `mpsc` channel — the UI thread never blocks on
+RPC or subprocesses, and no async runtime is involved).
+
+First GUI-driven send shipped 2026-07-07 (fact `0x5b824d25…f6e25`,
+47.2 STRK): see `docs/zkmsg-deployment.md`.
+
 ## What's public, what's private (v1, honest)
 
 - **Private, cryptographically**: message content (AES-256-GCM under the
