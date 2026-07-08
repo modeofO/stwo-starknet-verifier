@@ -157,18 +157,22 @@ impl<'a> Pipeline<'a> {
     fn step_pack(&self, state: &mut SendState) -> Result<(Option<String>, Option<String>)> {
         let values = load_proof_json(&self.workdir(state).join("proof.json"))?;
         let packed = pack_v1(&values)?;
-        ensure!(packed.len() > HEAD_LEN, "proof unexpectedly small: {} slots", packed.len());
         let lines: Vec<String> = packed.iter().map(felt_hex).collect();
         fs::write(self.packed_path(state), lines.join("\n"))?;
 
-        let tail_len = packed.len() - HEAD_LEN;
+        // HEAD_LEN is a CEILING (maximize phase-1 calldata, minimize
+        // staging), not a floor: packed size varies a few percent per
+        // proof (value-dependent limbs, FRI witness sizes), and a proof
+        // under the head budget simply needs no staging txs at all.
+        let head_len = usize::min(HEAD_LEN, packed.len());
+        let tail_len = packed.len() - head_len;
         let offsets: Vec<u32> =
             (0..tail_len).step_by(STAGE_CHUNK).map(|o| o as u32).collect();
         state.set_stage_offsets(&offsets);
         Ok((
             None,
             Some(format!(
-                "{} slots ({} values); head {HEAD_LEN}, tail {tail_len} in {} stage tx(s)",
+                "{} slots ({} values); head {head_len}, tail {tail_len} in {} stage tx(s)",
                 packed.len(),
                 values.len(),
                 offsets.len(),
@@ -184,7 +188,7 @@ impl<'a> Pipeline<'a> {
         offset: u32,
     ) -> Result<(Option<String>, Option<String>)> {
         let packed = self.load_packed(state)?;
-        let tail = &packed[HEAD_LEN..];
+        let tail = &packed[usize::min(HEAD_LEN, packed.len())..];
         let end = usize::min(offset as usize + STAGE_CHUNK, tail.len());
         let chunk = &tail[offset as usize..end];
 
@@ -203,8 +207,9 @@ impl<'a> Pipeline<'a> {
     fn step_phase1(&self, state: &mut SendState) -> Result<(Option<String>, Option<String>)> {
         let packed = self.load_packed(state)?;
         let values = load_proof_json(&self.workdir(state).join("proof.json"))?;
-        let head = &packed[..HEAD_LEN];
-        let n_tail = packed.len() - HEAD_LEN;
+        let head_len = usize::min(HEAD_LEN, packed.len());
+        let head = &packed[..head_len];
+        let n_tail = packed.len() - head_len;
 
         let mut calldata = vec![state.proof_id.clone()];
         calldata.extend(span_calldata(head));
