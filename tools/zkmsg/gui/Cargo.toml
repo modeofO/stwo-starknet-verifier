@@ -9,3 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 zkmsg-core = { path = "../core" }
+eframe = "0.29"
+anyhow.workspace = true
+starknet-types-core.workspace = true
