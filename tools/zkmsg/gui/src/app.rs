@@ -1,422 +1,151 @@
-//! The eframe app: a Status/Compose/Inbox tab bar, plus the Status tab's
-//! onboarding flow (no keys -> Init, keys but no handle -> Register,
-//! else the live `StatusReport`). Compose and Inbox are placeholders
-//! wired up in later tasks.
+//! The eframe app shell: a tab bar plus a right-aligned active-profile
+//! label, delegating all per-identity rendering to the active
+//! `ProfileSession`. When no profile is open (a profile root with no
+//! `current`) the central panel lists the discovered profiles as buttons.
+//! An interactive profile picker is Task 5; here the label is static.
 
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
 
 use eframe::egui;
-use starknet_types_core::felt::Felt;
 
-use zkmsg_core::app::{RegisterOutcome, StatusReport, pending_sends};
-use zkmsg_core::chain::felt_hex;
-use zkmsg_core::config::{Config, Home, Keys};
-use zkmsg_core::inbox::ReceivedMessage;
-use zkmsg_core::state::StepKind;
+use zkmsg_core::config::Home;
+use zkmsg_core::profiles::{HomeKind, PROFILE_PREFIX, ProfileEntry, classify_home, list_profiles};
 
-use crate::send_flow::SendFlow;
-use crate::worker::{self, InboxWorkerMsg, PrepareWorkerMsg, ResolveWorkerMsg, StatusWorkerMsg, WorkerMsg};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Status,
-    Compose,
-    Inbox,
-}
+use crate::session::{ProfileSession, Tab};
 
 pub struct ZkmsgApp {
-    home: Home,
+    /// `Some` when the launch path was a profile root — the dir under which
+    /// `.zkmsg-<name>` children (and `current`) live. `None` for a legacy
+    /// single-profile home. Read by the interactive picker (Task 5) to
+    /// scope profile creation/switching; recorded here now so this shell
+    /// already carries it.
+    #[allow(dead_code)]
+    root: Option<PathBuf>,
     repo_root: PathBuf,
-    pub(crate) config: Option<Config>,
-    pub(crate) keys: Option<Keys>,
-    tab: Tab,
+    profiles: Vec<ProfileEntry>,
+    session: Option<ProfileSession>,
+    picker_error: Option<String>,
 
-    account_input: String,
-    handle_input: String,
-
-    pub(crate) status: Option<StatusReport>,
-    init_pubkey: Option<String>,
-    register_outcome: Option<RegisterOutcome>,
-    /// Shared across tabs (status + inbox) — each poll routine clears it
-    /// on success and sets it on failure, same as the Status tab always did.
-    pub(crate) last_error: Option<String>,
-
-    /// Guards the status panel's auto-fetch-on-first-render (below) so a
-    /// persistent RPC failure doesn't re-spawn a fetch every frame; once
-    /// set, only the Refresh button fires another one.
-    fetched_once: bool,
-    busy: bool,
-    rx: Option<Receiver<StatusWorkerMsg>>,
-
-    pub(crate) inbox: Vec<ReceivedMessage>,
-    pub(crate) inbox_loading: bool,
-    pub(crate) inbox_rx: Option<Receiver<InboxWorkerMsg>>,
-    pub(crate) inbox_auto_refresh: bool,
-    /// Set on every scan spawn (manual or auto); the auto-refresh check in
-    /// `inbox_tab` reads it to decide if 30s have elapsed.
-    pub(crate) last_refresh: Option<std::time::Instant>,
-
-    pub(crate) compose_handle: String,
-    pub(crate) compose_text: String,
-    pub(crate) compose_resolving: bool,
-    /// `None` before a resolve has run; `Some(Err)` renders "unknown
-    /// handle" rather than silently leaving the field blank.
-    pub(crate) compose_resolved: Option<Result<(Felt, u32), String>>,
-    pub(crate) compose_resolve_rx: Option<Receiver<ResolveWorkerMsg>>,
-    pub(crate) compose_show_confirm: bool,
-    pub(crate) compose_preparing: bool,
-    pub(crate) compose_prepare_rx: Option<Receiver<PrepareWorkerMsg>>,
-    /// `Some` once `prepare_send` has returned a plan — presence of this
-    /// (not `tab`) is what switches the Compose central area to the
-    /// progress checklist.
-    pub(crate) send_flow: Option<SendFlow>,
-    pub(crate) send_rx: Option<Receiver<WorkerMsg>>,
-    /// The in-flight (or last) send's id, for the Resume-on-Failed path.
-    pub(crate) send_state_id: Option<String>,
-
-    /// Incomplete sends under `home` (id + next-pending step kind),
-    /// computed once on launch and refreshed after each send
-    /// completes/fails — drives the resume banner. Never rescanned
-    /// per-frame.
-    pub(crate) pending: Vec<(String, StepKind)>,
+    /// The session to open on the first frame. `new` resolves it but has
+    /// no `egui::Context` to set the window title, so opening is deferred
+    /// to the first `update()` where `open_session` can title the window.
+    initial: Option<(String, Home)>,
 }
 
 impl ZkmsgApp {
-    pub fn new(home: Home) -> Self {
-        let config = home.load_config().ok();
-        let keys = home.load_keys().ok();
-        let pending = pending_sends(&home).unwrap_or_default();
-        Self {
-            home,
-            repo_root: repo_root(),
-            config,
-            keys,
-            tab: Tab::Status,
-            account_input: "funded-deployer".to_string(),
-            handle_input: String::new(),
-            status: None,
-            init_pubkey: None,
-            register_outcome: None,
-            last_error: None,
-            fetched_once: false,
-            busy: false,
-            rx: None,
-            inbox: Vec::new(),
-            inbox_loading: false,
-            inbox_rx: None,
-            inbox_auto_refresh: false,
-            last_refresh: None,
-            compose_handle: String::new(),
-            compose_text: String::new(),
-            compose_resolving: false,
-            compose_resolved: None,
-            compose_resolve_rx: None,
-            compose_show_confirm: false,
-            compose_preparing: false,
-            compose_prepare_rx: None,
-            send_flow: None,
-            send_rx: None,
-            send_state_id: None,
-            pending,
-        }
-    }
-
-    /// Re-scans `~/.zkmsg/sends/*.json` for incomplete sends. Cheap local
-    /// fs reads (same cost class as `reload_local_state`) — called once on
-    /// launch and again after each send finishes, never per-frame.
-    pub(crate) fn refresh_pending(&mut self) {
-        self.pending = pending_sends(&self.home).unwrap_or_default();
-    }
-
-    /// Renders a row per incomplete send above the tab content, if any are
-    /// pending. Resume routes through the Compose tab's resume path
-    /// (switch to it, then `resume_send`); Dismiss only drops the entry
-    /// from this in-memory list — the checkpoint file is left untouched.
-    fn pending_banner(&mut self, ctx: &egui::Context) {
-        // Never offer Resume while a send is being prepared or run — a
-        // second paid pipeline started here would race the active one
-        // (double-spend). The banner returns once that send completes.
-        if self.send_in_flight() {
-            return;
-        }
-        if self.pending.is_empty() {
-            return;
-        }
-        let mut resume_id = None;
-        let mut dismiss_id = None;
-        egui::TopBottomPanel::top("pending_banner").show(ctx, |ui| {
-            for (id, kind) in &self.pending {
-                ui.horizontal(|ui| {
-                    ui.label(format!("send {id} stopped at {kind:?}"));
-                    if ui.button("Resume").clicked() {
-                        resume_id = Some(id.clone());
-                    }
-                    if ui.button("Dismiss").clicked() {
-                        dismiss_id = Some(id.clone());
-                    }
-                });
+    pub fn new(launch_path: PathBuf, profile_override: Option<String>) -> Self {
+        let mut root = None;
+        let mut profiles = Vec::new();
+        let initial = match classify_home(&launch_path) {
+            // A concrete home (or an empty one, where the Init onboarding
+            // renders): open it directly, named by its handle.
+            HomeKind::Profile(p) | HomeKind::Empty(p) => {
+                Some((profile_name(&p), Home::new(p)))
             }
-        });
-        if let Some(id) = resume_id {
-            // Drop the banner row the instant Resume is clicked — before the
-            // worker starts — so a second click can't re-enter resume_send
-            // for the same id (which would spawn a second send and could
-            // double-spend on-chain), and so the banner doesn't linger over
-            // the Compose progress view for the send it just launched.
-            self.pending.retain(|(pid, _)| pid != &id);
-            self.tab = Tab::Compose;
-            self.resume_send(&id, ctx);
-        }
-        if let Some(id) = dismiss_id {
-            self.pending.retain(|(pid, _)| pid != &id);
-        }
-    }
-
-    /// Re-reads `config.json`/`keys.json` after a background call wrote
-    /// them (init, register). Cheap local fs reads — fine on the UI thread.
-    fn reload_local_state(&mut self) {
-        self.config = self.home.load_config().ok();
-        self.keys = self.home.load_keys().ok();
-    }
-
-    /// `Home` has no `Clone`, so worker spawns take the directory and
-    /// build a fresh `Home` on the worker thread (see worker.rs).
-    pub(crate) fn home_dir(&self) -> PathBuf {
-        self.home.dir.clone()
-    }
-
-    fn poll_worker(&mut self) {
-        let Some(rx) = &self.rx else { return };
-        let Ok(msg) = rx.try_recv() else { return };
-        self.busy = false;
-        self.rx = None;
-        match msg {
-            StatusWorkerMsg::Status(Ok(report)) => {
-                self.status = Some(report);
-                self.last_error = None;
+            // A profile root: list the children and open `--profile` (if it
+            // names a real one) else `current`, named by its dir suffix. If
+            // neither resolves, stay unopened — the picker list renders.
+            HomeKind::Root { root: r, current } => {
+                profiles = list_profiles(&r).unwrap_or_default();
+                let chosen = profile_override
+                    .as_ref()
+                    .map(|n| r.join(format!("{PROFILE_PREFIX}{n}")))
+                    .filter(|p| p.join("config.json").is_file())
+                    .or(current);
+                root = Some(r);
+                chosen.map(|dir| (dir_suffix_name(&dir), Home::new(dir)))
             }
-            StatusWorkerMsg::Status(Err(e)) => self.last_error = Some(e),
-            StatusWorkerMsg::Init(Ok(pubkey)) => {
-                self.init_pubkey = Some(felt_hex(&pubkey));
-                self.reload_local_state();
-                self.last_error = None;
-            }
-            StatusWorkerMsg::Init(Err(e)) => self.last_error = Some(e),
-            StatusWorkerMsg::Register(Ok(outcome)) => {
-                self.register_outcome = Some(outcome);
-                self.reload_local_state();
-                self.last_error = None;
-            }
-            StatusWorkerMsg::Register(Err(e)) => self.last_error = Some(e),
-        }
-    }
-
-    fn status_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if let Some(err) = &self.last_error {
-            ui.colored_label(egui::Color32::RED, err.as_str());
-            ui.separator();
-        }
-
-        if self.keys.is_none() {
-            self.init_panel(ui, ctx);
-            return;
-        }
-        if self.keys.as_ref().and_then(|k| k.handle.as_ref()).is_none() {
-            self.register_panel(ui, ctx);
-            return;
-        }
-        self.status_panel(ui, ctx);
-    }
-
-    fn init_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Set up zkmsg");
-        ui.label("No keys found under this home — generate a scan identity to get started.");
-        ui.horizontal(|ui| {
-            ui.label("sncast account:");
-            ui.text_edit_singleline(&mut self.account_input);
-        });
-        ui.add_enabled_ui(!self.busy, |ui| {
-            if ui.button("Init").clicked() {
-                self.busy = true;
-                self.last_error = None;
-                self.rx = Some(worker::spawn_init(
-                    self.home.dir.clone(),
-                    self.account_input.clone(),
-                    self.repo_root.clone(),
-                    ctx.clone(),
-                ));
-            }
-        });
-        if self.busy {
-            ui.label("working…");
-        }
-        if let Some(pubkey) = &self.init_pubkey {
-            ui.separator();
-            ui.label(format!("scan pubkey: {pubkey}"));
-        }
-    }
-
-    fn register_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Register a handle");
-        if let Some(scan_pub) = self.keys.as_ref().map(|k| k.scan_pub.clone()) {
-            ui.label(format!("scan pubkey: {scan_pub}"));
-        }
-        ui.horizontal(|ui| {
-            ui.label("handle:");
-            ui.text_edit_singleline(&mut self.handle_input);
-        });
-        ui.add_enabled_ui(!self.busy, |ui| {
-            if ui.button("Register").clicked() {
-                if self.handle_input.trim().is_empty() {
-                    self.last_error = Some("handle cannot be empty".to_string());
-                } else {
-                    self.busy = true;
-                    self.last_error = None;
-                    self.rx = Some(worker::spawn_register(
-                        self.home.dir.clone(),
-                        self.handle_input.trim().to_string(),
-                        ctx.clone(),
-                    ));
-                }
-            }
-        });
-        if self.busy {
-            ui.label("working… (sends a transaction and waits for the receipt)");
-        }
-        if let Some(outcome) = &self.register_outcome {
-            ui.separator();
-            match outcome {
-                RegisterOutcome::Registered { tx_hash, leaf_index } => {
-                    ui.label(format!("registered — tx {tx_hash}, leaf {leaf_index}"));
-                }
-                RegisterOutcome::AlreadyRegistered { leaf_index } => {
-                    ui.label(format!("already registered — leaf {leaf_index}"));
-                }
-            }
-        }
-    }
-
-    fn status_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Kick the first live fetch automatically, exactly once; after
-        // that (success OR error) only the Refresh button re-fires it —
-        // otherwise a persistent RPC failure would re-spawn a fetch on
-        // every frame (status stays None on Err, so the naive check
-        // would never latch).
-        if !self.fetched_once && !self.busy && self.rx.is_none() {
-            self.fetched_once = true;
-            self.busy = true;
-            self.rx = Some(worker::spawn_status(self.home.dir.clone(), ctx.clone()));
-        }
-
-        ui.add_enabled_ui(!self.busy, |ui| {
-            if ui.button("Refresh").clicked() {
-                self.busy = true;
-                self.last_error = None;
-                self.rx = Some(worker::spawn_status(self.home.dir.clone(), ctx.clone()));
-            }
-        });
-        if self.busy {
-            ui.label("refreshing…");
-        }
-        ui.separator();
-
-        let Some(report) = &self.status else {
-            // Local config is cheap and already loaded; show it while the
-            // live (networked) report is still in flight.
-            if let Some(config) = &self.config {
-                ui.label(format!("account: {}", config.account));
-                ui.label(format!("registry: {}", config.registry));
-                ui.label(format!("store: {}", config.store));
-            }
-            ui.label("loading live status…");
-            return;
         };
+        Self {
+            root,
+            repo_root: repo_root(),
+            profiles,
+            session: None,
+            picker_error: None,
+            initial,
+        }
+    }
 
-        egui::Grid::new("status_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label("handle");
-            ui.label(report.handle.as_deref().unwrap_or("(not registered)"));
-            ui.end_row();
-
-            ui.label("leaf index");
-            ui.label(report.leaf_index.map(|i| i.to_string()).unwrap_or_else(|| "-".into()));
-            ui.end_row();
-
-            ui.label("scan pubkey");
-            ui.label(report.scan_pub.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("account");
-            ui.label(&report.account);
-            ui.end_row();
-
-            ui.label("registry");
-            ui.label(&report.registry);
-            ui.end_row();
-
-            ui.label("store");
-            ui.label(if report.store.is_empty() { "(not deployed)" } else { &report.store });
-            ui.end_row();
-
-            ui.label("rpc");
-            ui.label(&report.rpc);
-            ui.end_row();
-
-            ui.label("messages");
-            ui.label(report.n_messages.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("balance");
-            match report.balance_strk {
-                Some(strk) => {
-                    ui.label(format!("~{strk} STRK"));
-                }
-                None => {
-                    let e = report.balance_error.as_deref().unwrap_or("?");
-                    ui.label(format!("unavailable ({e})"));
-                }
-            }
-            ui.end_row();
-        });
+    /// Opens `home` as the active session and retitles the window to name
+    /// the profile. The single path through which a session becomes active
+    /// (the deferred launch open included), so the title always tracks it.
+    pub fn open_session(&mut self, ctx: &egui::Context, name: String, home: Home) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("zkmsg — {name}")));
+        self.session = Some(ProfileSession::new(name, home));
     }
 }
 
 impl eframe::App for ZkmsgApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_worker();
-        self.poll_inbox_worker();
-        self.poll_compose_worker(ctx);
-        self.poll_send_worker();
+        if let Some((name, home)) = self.initial.take() {
+            self.open_session(ctx, name, home);
+        }
+
+        if let Some(session) = &mut self.session {
+            session.poll_all(ctx);
+        }
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Status, "Status");
-                ui.selectable_value(&mut self.tab, Tab::Compose, "Compose");
-                ui.selectable_value(&mut self.tab, Tab::Inbox, "Inbox");
+                if let Some(session) = &mut self.session {
+                    ui.selectable_value(&mut session.tab, Tab::Status, "Status");
+                    ui.selectable_value(&mut session.tab, Tab::Compose, "Compose");
+                    ui.selectable_value(&mut session.tab, Tab::Inbox, "Inbox");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(&session.name);
+                    });
+                }
             });
         });
 
-        self.pending_banner(ctx);
+        if let Some(session) = &mut self.session {
+            session.pending_banner(ctx);
+        }
 
-        let tab = self.tab;
-        egui::CentralPanel::default().show(ctx, |ui| match tab {
-            Tab::Status => self.status_tab(ui, ctx),
-            Tab::Compose => self.compose_tab(ui, ctx),
-            Tab::Inbox => self.inbox_tab(ui, ctx),
+        // Which profile the picker (no-session branch) wants opened —
+        // collected inside the closure and acted on after it, since
+        // `open_session` needs `&mut self` while the closure borrows fields.
+        let mut open_request = None;
+        egui::CentralPanel::default().show(ctx, |ui| match &mut self.session {
+            Some(session) => session.render(ui, ctx, &self.repo_root),
+            None => {
+                ui.vertical_centered(|ui| {
+                    ui.label("no profile selected");
+                    if let Some(err) = &self.picker_error {
+                        ui.colored_label(egui::Color32::RED, err.as_str());
+                    }
+                    for entry in &self.profiles {
+                        if ui.button(&entry.name).clicked() {
+                            open_request = Some((entry.name.clone(), Home::new(entry.dir.clone())));
+                        }
+                    }
+                });
+            }
         });
+        if let Some((name, home)) = open_request {
+            self.open_session(ctx, name, home);
+        }
 
-        let compose_busy =
-            self.compose_resolving || self.compose_preparing || self.send_rx.is_some();
-        if self.busy || self.inbox_loading || compose_busy {
-            // A scan/call is in flight — repaint every frame so the mpsc
-            // channel gets drained promptly once it lands.
-            ctx.request_repaint();
-        } else if self.inbox_auto_refresh {
-            // Idle but armed: wake up periodically to re-check the 30s
-            // elapsed-since-last-refresh condition, without busy-spinning.
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        if let Some(session) = &self.session {
+            session.tick_repaint(ctx);
         }
     }
+}
+
+/// Display name for a concrete home: a registered handle if `keys.json`
+/// carries one, else the `.zkmsg-<suffix>` name, else the dir name.
+fn profile_name(dir: &std::path::Path) -> String {
+    if let Some(handle) = Home::new(dir.to_path_buf()).load_keys().ok().and_then(|k| k.handle) {
+        return handle;
+    }
+    dir_suffix_name(dir)
+}
+
+/// The `.zkmsg-<suffix>` name, falling back to the raw dir name when there
+/// is no prefix (a legacy `~/.zkmsg`).
+fn dir_suffix_name(dir: &std::path::Path) -> String {
+    let fname = dir.file_name().and_then(|s| s.to_str()).unwrap_or("profile");
+    fname.strip_prefix(PROFILE_PREFIX).unwrap_or(fname).to_string()
 }
 
 /// The repo this binary was built from — `init_identity`'s default

@@ -1,16 +1,16 @@
 //! Inbox tab rendering: Refresh button, optional 30s auto-refresh, and a
 //! decrypted-message table. State (`inbox`, `inbox_loading`, `inbox_rx`,
-//! `inbox_auto_refresh`, `last_refresh`) lives on `ZkmsgApp`; this module
-//! only renders and decides when to spawn a scan.
+//! `inbox_auto_refresh`, `last_refresh`) lives on `ProfileSession`; this
+//! module only renders and decides when to spawn a scan.
 
 use eframe::egui;
 
-use crate::app::ZkmsgApp;
+use crate::session::ProfileSession;
 use crate::worker;
 
 const AUTO_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-impl ZkmsgApp {
+impl ProfileSession {
     pub(crate) fn poll_inbox_worker(&mut self) {
         let Some(rx) = &self.inbox_rx else { return };
         let Ok(msg) = rx.try_recv() else { return };

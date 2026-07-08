@@ -1,6 +1,6 @@
 //! Compose tab: recipient resolve, byte counter, the STRK-cost confirm
 //! dialog, and the live send-progress checklist. State lives on
-//! `ZkmsgApp`; this module renders it and drives the worker handoff —
+//! `ProfileSession`; this module renders it and drives the worker handoff —
 //! resolve runs in the background, Confirm kicks off `prepare_send` in
 //! the background, and once that returns a plan `worker::spawn_send`
 //! takes over (also background) feeding `SendFlow::apply`.
@@ -14,8 +14,8 @@ use zkmsg_core::chain::felt_hex;
 use zkmsg_core::config::Home;
 use zkmsg_core::state::{SendState, StepKind};
 
-use crate::app::ZkmsgApp;
 use crate::send_flow::{SendFlow, StepStatus};
+use crate::session::ProfileSession;
 use crate::worker::{self, PrepareWorkerMsg, ResolveWorkerMsg, WorkerMsg};
 
 const BYTE_SOFT_CAP: usize = 1_000;
@@ -25,7 +25,7 @@ const BYTE_SOFT_CAP: usize = 1_000;
 /// show the user before they commit.
 const ESTIMATED_COST_STRK: u32 = 48;
 
-impl ZkmsgApp {
+impl ProfileSession {
     pub(crate) fn poll_compose_worker(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.compose_resolve_rx {
             if let Ok(ResolveWorkerMsg::Resolved(result)) = rx.try_recv() {
@@ -227,7 +227,7 @@ impl ZkmsgApp {
     /// start, or two paid pipelines would run concurrently (double-spend).
     /// Note `compose_preparing` covers the prepare RPC window where
     /// `send_rx` is still `None`.
-    pub(crate) fn send_in_flight(&self) -> bool {
+    pub(crate) fn work_in_flight(&self) -> bool {
         self.compose_preparing || self.send_rx.is_some()
     }
 
@@ -262,7 +262,7 @@ impl ZkmsgApp {
         // run concurrently and double-spend. poll_send_worker clears send_rx
         // in both Done arms before a step is observable as Failed, so the
         // Failed-step Resume path always sees this false and is unaffected.
-        if self.send_in_flight() {
+        if self.work_in_flight() {
             self.last_error = Some("a send is already running".to_string());
             return;
         }

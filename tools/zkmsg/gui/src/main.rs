@@ -2,23 +2,21 @@ mod app;
 mod compose_view;
 mod inbox_view;
 mod send_flow;
+mod session;
 mod worker;
 
 use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
+    // Raw launch path + profile override; classification (profile vs.
+    // profile-root) happens inside `ZkmsgApp::new`.
     let launch_path = parse_home_arg().unwrap_or_else(default_home);
-    let home_dir = match parse_profile_arg() {
-        Some(name) => launch_path.join(format!(".zkmsg-{name}")),
-        None => zkmsg_core::profiles::resolve_cli_home(&launch_path)
-            .unwrap_or(launch_path),
-    };
-    let home = zkmsg_core::config::Home::new(home_dir);
+    let profile_override = parse_profile_arg();
     let native = eframe::NativeOptions::default();
     eframe::run_native(
         "zkmsg",
         native,
-        Box::new(|_cc| Ok(Box::new(app::ZkmsgApp::new(home)))),
+        Box::new(move |_cc| Ok(Box::new(app::ZkmsgApp::new(launch_path, profile_override)))),
     )
 }
 
