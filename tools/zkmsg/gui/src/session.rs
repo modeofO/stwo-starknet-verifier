@@ -162,7 +162,7 @@ impl ProfileSession {
         locked: bool,
     ) {
         match self.tab {
-            Tab::Status => self.status_tab(ui, ctx, repo_root),
+            Tab::Status => self.status_tab(ui, ctx, repo_root, locked),
             Tab::Compose => self.compose_tab(ui, ctx, locked),
             Tab::Inbox => self.inbox_tab(ui, ctx),
         }
@@ -254,6 +254,16 @@ impl ProfileSession {
         self.home.dir.clone()
     }
 
+    /// The status/register worker is in flight. Folded into the wizard's
+    /// spend gate (`session_busy`) alongside `work_in_flight` so a
+    /// register-in-flight — a paid tx from the same account the wizard funds
+    /// from — blocks the setup spend. This also blocks the wizard during a
+    /// plain status refresh (same flag), which over-locks; that is the
+    /// intended safe direction.
+    pub(crate) fn worker_busy(&self) -> bool {
+        self.busy
+    }
+
     fn poll_worker(&mut self) {
         let Some(rx) = &self.rx else { return };
         let Ok(msg) = rx.try_recv() else { return };
@@ -280,7 +290,13 @@ impl ProfileSession {
         }
     }
 
-    fn status_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, repo_root: &Path) {
+    fn status_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        repo_root: &Path,
+        locked: bool,
+    ) {
         if let Some(err) = &self.last_error {
             ui.colored_label(egui::Color32::RED, err.as_str());
             ui.separator();
@@ -291,7 +307,7 @@ impl ProfileSession {
             return;
         }
         if self.keys.as_ref().and_then(|k| k.handle.as_ref()).is_none() {
-            self.register_panel(ui, ctx);
+            self.register_panel(ui, ctx, locked);
             return;
         }
         self.status_panel(ui, ctx);
@@ -325,7 +341,7 @@ impl ProfileSession {
         }
     }
 
-    fn register_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn register_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, locked: bool) {
         ui.heading("Register a handle");
         if let Some(scan_pub) = self.keys.as_ref().map(|k| k.scan_pub.clone()) {
             ui.label(format!("scan pubkey: {scan_pub}"));
@@ -334,7 +350,10 @@ impl ProfileSession {
             ui.label("handle:");
             ui.text_edit_singleline(&mut self.handle_input);
         });
-        ui.add_enabled_ui(!self.busy, |ui| {
+        // Register sends a paid tx from this profile's account; while a wizard
+        // is spending (`locked`), block it so the two can't race the same
+        // account's nonce — the mirror of the wizard's own `session_busy` gate.
+        ui.add_enabled_ui(!self.busy && !locked, |ui| {
             if ui.button("Register").clicked() {
                 if self.handle_input.trim().is_empty() {
                     self.last_error = Some("handle cannot be empty".to_string());
@@ -351,6 +370,9 @@ impl ProfileSession {
         });
         if self.busy {
             ui.label("working… (sends a transaction and waits for the receipt)");
+        }
+        if locked {
+            ui.label("a profile setup is running — registering is paused until it finishes");
         }
         if let Some(outcome) = &self.register_outcome {
             ui.separator();

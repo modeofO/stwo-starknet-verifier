@@ -63,6 +63,12 @@ pub struct WizardUi {
     rx: Option<Receiver<SetupWorkerMsg>>,
     profile_dir: Option<PathBuf>,
     error: Option<String>,
+    /// For a resumed run, the `source_account` captured in `setup.json` at
+    /// creation — the account that actually pays the Fund. `None` for a
+    /// brand-new form, where the active profile's account is the payer. The
+    /// confirm dialog shows this in place of the active account so it never
+    /// misnames the payer.
+    resume_source: Option<String>,
 }
 
 impl WizardUi {
@@ -80,6 +86,7 @@ impl WizardUi {
             rx: None,
             profile_dir: None,
             error: None,
+            resume_source: None,
         }
     }
 
@@ -103,6 +110,7 @@ impl WizardUi {
             rx: None,
             profile_dir: Some(dir),
             error: None,
+            resume_source: Some(state.source_account.clone()),
         })
     }
 
@@ -237,8 +245,9 @@ impl WizardUi {
         if !name.is_ascii() {
             return Some("name must be ASCII".into());
         }
-        if name.contains('/') {
-            return Some("name cannot contain '/'".into());
+        if name.contains('/') || name.contains('\\') {
+            // Parity with plan_migration: no path separators in a profile name.
+            return Some("name cannot contain '/' or '\\'".into());
         }
         if root.join(format!("{PROFILE_PREFIX}{name}")).exists() {
             return Some(format!("{PROFILE_PREFIX}{name} already exists"));
@@ -262,7 +271,17 @@ impl WizardUi {
         let account = self.account_name.trim().to_string();
         let handle = self.handle.trim().to_string();
         let n = self.fund_strk.trim().to_string();
-        let source = wctx.source_account.to_string();
+        // A resumed run pays from the account captured in setup.json at
+        // creation, not the currently active profile — show that account so
+        // the dialog never misnames the payer. `session_busy` still guards
+        // only the ACTIVE profile while a resumed wizard runs, so the payer
+        // may differ from the profile that lock covers; that mismatch is
+        // corrected here for display, and the actual overlap risk (two spends
+        // from the resume's source) is bounded by the single-wizard guard
+        // (`rx.is_some()` in `spawn`), not by `session_busy`.
+        let source = self.resume_source.clone().unwrap_or_else(|| wctx.source_account.to_string());
+        let payer_is_active = self.resume_source.is_none() || source == wctx.source_account;
+        let source_gloss = if payer_is_active { " (the active profile's account)" } else { "" };
         let mut open = true;
         egui::Window::new("Confirm profile setup")
             .collapsible(false)
@@ -271,11 +290,20 @@ impl WizardUi {
             .open(&mut open)
             .show(wctx.egui_ctx, |ui| {
                 ui.label(format!(
-                    "Create account '{account}', fund it with {n} STRK from '{source}' \
-                     (the active profile's account), deploy it, and register '{handle}'? \
+                    "Create account '{account}', fund it with {n} STRK from '{source}'\
+                     {source_gloss}, deploy it, and register '{handle}'? \
                      The {n} STRK moves to the new account — it stays yours. \
                      Fees ≈ under 1 STRK."
                 ));
+                if !payer_is_active {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 140, 40),
+                        format!(
+                            "note: funding comes from '{source}' (the profile that started this \
+                             setup), not the active profile"
+                        ),
+                    );
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         self.confirm_open = false;

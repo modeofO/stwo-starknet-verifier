@@ -198,8 +198,11 @@ pub fn plan_migration(root: &Path, named: &[(LegacySource, String)]) -> Result<V
 
 pub fn execute_migration(moves: &[MigrationMove]) -> Result<()> {
     for mv in moves {
+        // `exists()` follows symlinks, so a dangling link at `to` would pass
+        // the check and `fs::rename` would silently replace it. `symlink_metadata`
+        // does not follow, so any entry — including a broken link — refuses.
         ensure!(
-            !mv.to.exists(),
+            mv.to.symlink_metadata().is_err(),
             "target {} already exists — aborting migration",
             mv.to.display()
         );
@@ -325,6 +328,24 @@ mod tests {
         let again = detect_legacy(&root);
         assert!(again.is_empty());
         fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn execute_migration_refuses_dangling_symlink_target() {
+        let dir = tmp("dangling");
+        let from = dir.join("src");
+        mk_profile(&from, None);
+        // A dangling symlink at `to`: `exists()` returns false (target is
+        // missing), but the entry is present and must not be clobbered.
+        let to = dir.join(".zkmsg-x");
+        std::os::unix::fs::symlink(dir.join("nonexistent"), &to).unwrap();
+        assert!(!to.exists()); // dangling: follows to a missing target
+        let moves = vec![MigrationMove { from: from.clone(), to: to.clone() }];
+        assert!(execute_migration(&moves).is_err());
+        // The source is untouched and the link is still there (not replaced).
+        assert!(from.join("config.json").exists());
+        assert!(to.symlink_metadata().is_ok());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

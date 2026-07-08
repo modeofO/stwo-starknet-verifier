@@ -256,8 +256,14 @@ impl ZkmsgApp {
         let repo_root = self.repo_root.clone();
         // A send in flight on the funding account blocks the wizard's own
         // spend — the mirror of the `locked` flag that blocks the send button
-        // while the wizard runs.
-        let session_busy = self.session.as_ref().is_some_and(|s| s.work_in_flight());
+        // while the wizard runs. Also fold in the status/register worker: a
+        // register is another paid tx from the same account, so it must block
+        // the setup spend too. This over-locks during a plain status refresh
+        // (same `busy` flag) — the intended safe direction.
+        let session_busy = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.work_in_flight() || s.worker_busy());
         let Some(mut wizard) = self.wizard.take() else { return };
         let outcome = wizard.update(&WizardCtx {
             egui_ctx: ctx,
@@ -298,7 +304,14 @@ impl ZkmsgApp {
             // Fall through to pre-migration behavior: `initial` opens the
             // legacy home directly on the next frame (it still classifies as
             // a Profile), exactly as if migration had never been detected.
-            MigrateAction::NotNow => self.migration = None,
+            // Migration detection is the only thing that set `root` to the
+            // launch path (a legacy default-home launch has `root = None`), so
+            // clearing it restores the static top-bar label — no picker or
+            // "New profile…" over an un-migrated root.
+            MigrateAction::NotNow => {
+                self.migration = None;
+                self.root = None;
+            }
             MigrateAction::Migrate => self.run_migration(ctx),
         }
     }
@@ -322,7 +335,13 @@ impl ZkmsgApp {
                 self.initial = None;
                 self.profiles = list_profiles(&root).unwrap_or_default();
                 if let Some((_, name)) = named.first() {
-                    let _ = write_current(&root, name);
+                    // Surface a failed `current` write the same way the switch
+                    // and wizard-completion paths do — the profiles are fully
+                    // migrated, so still open the first; only the next-launch
+                    // default is what didn't persist.
+                    if let Err(e) = write_current(&root, name) {
+                        self.picker_error = Some(format!("failed to set current profile: {e:#}"));
+                    }
                     let dir = root.join(format!("{PROFILE_PREFIX}{name}"));
                     self.open_session(ctx, name.clone(), Home::new(dir));
                 }
@@ -429,7 +448,22 @@ impl eframe::App for ZkmsgApp {
                         ui.colored_label(egui::Color32::RED, err.as_str());
                     }
                     for entry in &self.profiles {
-                        if ui.button(&entry.name).clicked() {
+                        if entry.setup_incomplete {
+                            // An incomplete setup has no config.json — opening
+                            // it as a plain session would be a side door around
+                            // the wizard's resume (and its spend confirm). It
+                            // also can't resume here: resuming needs a funded
+                            // source profile, which the no-session state lacks.
+                            // Show it disabled; the user opens a complete
+                            // profile first, then resumes via the picker.
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(format!(
+                                    "{} (setup incomplete — use the profile menu)",
+                                    entry.name
+                                )),
+                            );
+                        } else if ui.button(&entry.name).clicked() {
                             open_request = Some((entry.name.clone(), Home::new(entry.dir.clone())));
                         }
                     }
