@@ -32,6 +32,14 @@ pub(crate) enum Tab {
     Inbox,
 }
 
+/// Whether a send is mid-flight given the two guard flags: `preparing` is
+/// the compose prepare-RPC window (before `send_rx` exists) and `sending`
+/// is the running pipeline. Pure so the guard both `work_in_flight` and
+/// the profile picker rely on is unit-testable without a live session.
+pub(crate) fn work_in_flight_flags(preparing: bool, sending: bool) -> bool {
+    preparing || sending
+}
+
 pub struct ProfileSession {
     /// The active profile's display name — a registered handle, else the
     /// `.zkmsg-<suffix>` name, else the home dir name. Also drives the
@@ -423,5 +431,17 @@ impl ProfileSession {
             }
             ui.end_row();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::work_in_flight_flags;
+
+    #[test]
+    fn work_in_flight_covers_prepare_and_send_windows() {
+        assert!(!work_in_flight_flags(false, false));
+        assert!(work_in_flight_flags(true, false)); // prepare window (the race the 07-07 review closed)
+        assert!(work_in_flight_flags(false, true));
     }
 }

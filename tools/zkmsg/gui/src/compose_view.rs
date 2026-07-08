@@ -228,7 +228,7 @@ impl ProfileSession {
     /// Note `compose_preparing` covers the prepare RPC window where
     /// `send_rx` is still `None`.
     pub(crate) fn work_in_flight(&self) -> bool {
-        self.compose_preparing || self.send_rx.is_some()
+        crate::session::work_in_flight_flags(self.compose_preparing, self.send_rx.is_some())
     }
 
     fn start_send(&mut self, state: SendState, ctx: &egui::Context) {
