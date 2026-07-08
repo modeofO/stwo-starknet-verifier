@@ -9,10 +9,11 @@ use std::sync::mpsc::Receiver;
 use eframe::egui;
 use starknet_types_core::felt::Felt;
 
-use zkmsg_core::app::{RegisterOutcome, StatusReport};
+use zkmsg_core::app::{RegisterOutcome, StatusReport, pending_sends};
 use zkmsg_core::chain::felt_hex;
 use zkmsg_core::config::{Config, Home, Keys};
 use zkmsg_core::inbox::ReceivedMessage;
+use zkmsg_core::state::StepKind;
 
 use crate::send_flow::SendFlow;
 use crate::worker::{self, InboxWorkerMsg, PrepareWorkerMsg, ResolveWorkerMsg, StatusWorkerMsg, WorkerMsg};
@@ -73,12 +74,19 @@ pub struct ZkmsgApp {
     pub(crate) send_rx: Option<Receiver<WorkerMsg>>,
     /// The in-flight (or last) send's id, for the Resume-on-Failed path.
     pub(crate) send_state_id: Option<String>,
+
+    /// Incomplete sends under `home` (id + next-pending step kind),
+    /// computed once on launch and refreshed after each send
+    /// completes/fails — drives the resume banner. Never rescanned
+    /// per-frame.
+    pub(crate) pending: Vec<(String, StepKind)>,
 }
 
 impl ZkmsgApp {
     pub fn new(home: Home) -> Self {
         let config = home.load_config().ok();
         let keys = home.load_keys().ok();
+        let pending = pending_sends(&home).unwrap_or_default();
         Self {
             home,
             repo_root: repo_root(),
@@ -110,6 +118,46 @@ impl ZkmsgApp {
             send_flow: None,
             send_rx: None,
             send_state_id: None,
+            pending,
+        }
+    }
+
+    /// Re-scans `~/.zkmsg/sends/*.json` for incomplete sends. Cheap local
+    /// fs reads (same cost class as `reload_local_state`) — called once on
+    /// launch and again after each send finishes, never per-frame.
+    pub(crate) fn refresh_pending(&mut self) {
+        self.pending = pending_sends(&self.home).unwrap_or_default();
+    }
+
+    /// Renders a row per incomplete send above the tab content, if any are
+    /// pending. Resume routes through the Compose tab's resume path
+    /// (switch to it, then `resume_send`); Dismiss only drops the entry
+    /// from this in-memory list — the checkpoint file is left untouched.
+    fn pending_banner(&mut self, ctx: &egui::Context) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut resume_id = None;
+        let mut dismiss_id = None;
+        egui::TopBottomPanel::top("pending_banner").show(ctx, |ui| {
+            for (id, kind) in &self.pending {
+                ui.horizontal(|ui| {
+                    ui.label(format!("send {id} stopped at {kind:?}"));
+                    if ui.button("Resume").clicked() {
+                        resume_id = Some(id.clone());
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        dismiss_id = Some(id.clone());
+                    }
+                });
+            }
+        });
+        if let Some(id) = resume_id {
+            self.tab = Tab::Compose;
+            self.resume_send(&id, ctx);
+        }
+        if let Some(id) = dismiss_id {
+            self.pending.retain(|(pid, _)| pid != &id);
         }
     }
 
@@ -335,6 +383,8 @@ impl eframe::App for ZkmsgApp {
                 ui.selectable_value(&mut self.tab, Tab::Inbox, "Inbox");
             });
         });
+
+        self.pending_banner(ctx);
 
         let tab = self.tab;
         egui::CentralPanel::default().show(ctx, |ui| match tab {

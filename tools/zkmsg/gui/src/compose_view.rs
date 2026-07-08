@@ -57,12 +57,14 @@ impl ZkmsgApp {
             }
             WorkerMsg::Done(Ok(())) => {
                 self.send_rx = None;
+                self.refresh_pending();
             }
             WorkerMsg::Done(Err(e)) => {
                 if let Some(flow) = &mut self.send_flow {
                     flow.fail(e);
                 }
                 self.send_rx = None;
+                self.refresh_pending();
             }
         }
     }
@@ -231,14 +233,18 @@ impl ZkmsgApp {
             Some(worker::spawn_send(Home::new(self.home_dir()), config, state, ctx.clone()));
     }
 
-    fn resume_send(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.send_state_id.clone() else { return };
+    /// Loads `id`'s checkpoint, builds a fresh `SendFlow` from it, and
+    /// spawns the (resumed) send worker. Shared by the Failed-step Resume
+    /// button below and the launch-time resume banner (`app.rs`) — both
+    /// end up here rather than duplicating the `spawn_send` wiring.
+    pub(crate) fn resume_send(&mut self, id: &str, ctx: &egui::Context) {
         let Some(config) = self.config.clone() else {
             self.last_error = Some("no config loaded".to_string());
             return;
         };
-        match SendState::load(&Home::new(self.home_dir()), &id) {
+        match SendState::load(&Home::new(self.home_dir()), id) {
             Ok(state) => {
+                self.send_state_id = Some(state.id.clone());
                 self.send_flow = Some(SendFlow::from_state(&state));
                 self.send_rx = Some(worker::spawn_send(
                     Home::new(self.home_dir()),
@@ -320,7 +326,9 @@ impl ZkmsgApp {
 
         ui.separator();
         if has_failed && ui.button("Resume").clicked() {
-            self.resume_send(ctx);
+            if let Some(id) = self.send_state_id.clone() {
+                self.resume_send(&id, ctx);
+            }
         }
         if is_done && ui.button("Compose another").clicked() {
             self.reset_compose();
