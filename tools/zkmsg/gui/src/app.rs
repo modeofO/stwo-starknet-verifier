@@ -36,6 +36,10 @@ pub struct ZkmsgApp {
     register_outcome: Option<RegisterOutcome>,
     last_error: Option<String>,
 
+    /// Guards the status panel's auto-fetch-on-first-render (below) so a
+    /// persistent RPC failure doesn't re-spawn a fetch every frame; once
+    /// set, only the Refresh button fires another one.
+    fetched_once: bool,
     busy: bool,
     rx: Option<Receiver<StatusWorkerMsg>>,
 }
@@ -56,6 +60,7 @@ impl ZkmsgApp {
             init_pubkey: None,
             register_outcome: None,
             last_error: None,
+            fetched_once: false,
             busy: false,
             rx: None,
         }
@@ -149,14 +154,18 @@ impl ZkmsgApp {
             ui.text_edit_singleline(&mut self.handle_input);
         });
         ui.add_enabled_ui(!self.busy, |ui| {
-            if ui.button("Register").clicked() && !self.handle_input.trim().is_empty() {
-                self.busy = true;
-                self.last_error = None;
-                self.rx = Some(worker::spawn_register(
-                    self.home.dir.clone(),
-                    self.handle_input.trim().to_string(),
-                    ctx.clone(),
-                ));
+            if ui.button("Register").clicked() {
+                if self.handle_input.trim().is_empty() {
+                    self.last_error = Some("handle cannot be empty".to_string());
+                } else {
+                    self.busy = true;
+                    self.last_error = None;
+                    self.rx = Some(worker::spawn_register(
+                        self.home.dir.clone(),
+                        self.handle_input.trim().to_string(),
+                        ctx.clone(),
+                    ));
+                }
             }
         });
         if self.busy {
@@ -176,9 +185,13 @@ impl ZkmsgApp {
     }
 
     fn status_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Kick the first live fetch automatically; after that only the
-        // Refresh button re-fires it.
-        if self.status.is_none() && !self.busy && self.rx.is_none() {
+        // Kick the first live fetch automatically, exactly once; after
+        // that (success OR error) only the Refresh button re-fires it —
+        // otherwise a persistent RPC failure would re-spawn a fetch on
+        // every frame (status stays None on Err, so the naive check
+        // would never latch).
+        if !self.fetched_once && !self.busy && self.rx.is_none() {
+            self.fetched_once = true;
             self.busy = true;
             self.rx = Some(worker::spawn_status(self.home.dir.clone(), ctx.clone()));
         }
