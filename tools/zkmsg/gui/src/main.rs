@@ -1,5 +1,7 @@
 mod app;
+mod compose_view;
 mod inbox_view;
+mod send_flow;
 mod worker;
 
 use std::path::PathBuf;

@@ -7,13 +7,15 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use eframe::egui;
+use starknet_types_core::felt::Felt;
 
 use zkmsg_core::app::{RegisterOutcome, StatusReport};
 use zkmsg_core::chain::felt_hex;
 use zkmsg_core::config::{Config, Home, Keys};
 use zkmsg_core::inbox::ReceivedMessage;
 
-use crate::worker::{self, InboxWorkerMsg, StatusWorkerMsg};
+use crate::send_flow::SendFlow;
+use crate::worker::{self, InboxWorkerMsg, PrepareWorkerMsg, ResolveWorkerMsg, StatusWorkerMsg, WorkerMsg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -25,14 +27,14 @@ enum Tab {
 pub struct ZkmsgApp {
     home: Home,
     repo_root: PathBuf,
-    config: Option<Config>,
-    keys: Option<Keys>,
+    pub(crate) config: Option<Config>,
+    pub(crate) keys: Option<Keys>,
     tab: Tab,
 
     account_input: String,
     handle_input: String,
 
-    status: Option<StatusReport>,
+    pub(crate) status: Option<StatusReport>,
     init_pubkey: Option<String>,
     register_outcome: Option<RegisterOutcome>,
     /// Shared across tabs (status + inbox) — each poll routine clears it
@@ -53,6 +55,24 @@ pub struct ZkmsgApp {
     /// Set on every scan spawn (manual or auto); the auto-refresh check in
     /// `inbox_tab` reads it to decide if 30s have elapsed.
     pub(crate) last_refresh: Option<std::time::Instant>,
+
+    pub(crate) compose_handle: String,
+    pub(crate) compose_text: String,
+    pub(crate) compose_resolving: bool,
+    /// `None` before a resolve has run; `Some(Err)` renders "unknown
+    /// handle" rather than silently leaving the field blank.
+    pub(crate) compose_resolved: Option<Result<(Felt, u32), String>>,
+    pub(crate) compose_resolve_rx: Option<Receiver<ResolveWorkerMsg>>,
+    pub(crate) compose_show_confirm: bool,
+    pub(crate) compose_preparing: bool,
+    pub(crate) compose_prepare_rx: Option<Receiver<PrepareWorkerMsg>>,
+    /// `Some` once `prepare_send` has returned a plan — presence of this
+    /// (not `tab`) is what switches the Compose central area to the
+    /// progress checklist.
+    pub(crate) send_flow: Option<SendFlow>,
+    pub(crate) send_rx: Option<Receiver<WorkerMsg>>,
+    /// The in-flight (or last) send's id, for the Resume-on-Failed path.
+    pub(crate) send_state_id: Option<String>,
 }
 
 impl ZkmsgApp {
@@ -79,6 +99,17 @@ impl ZkmsgApp {
             inbox_rx: None,
             inbox_auto_refresh: false,
             last_refresh: None,
+            compose_handle: String::new(),
+            compose_text: String::new(),
+            compose_resolving: false,
+            compose_resolved: None,
+            compose_resolve_rx: None,
+            compose_show_confirm: false,
+            compose_preparing: false,
+            compose_prepare_rx: None,
+            send_flow: None,
+            send_rx: None,
+            send_state_id: None,
         }
     }
 
@@ -294,6 +325,8 @@ impl eframe::App for ZkmsgApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
         self.poll_inbox_worker();
+        self.poll_compose_worker(ctx);
+        self.poll_send_worker();
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -306,13 +339,13 @@ impl eframe::App for ZkmsgApp {
         let tab = self.tab;
         egui::CentralPanel::default().show(ctx, |ui| match tab {
             Tab::Status => self.status_tab(ui, ctx),
-            Tab::Compose => {
-                ui.label("Compose — coming soon");
-            }
+            Tab::Compose => self.compose_tab(ui, ctx),
             Tab::Inbox => self.inbox_tab(ui, ctx),
         });
 
-        if self.busy || self.inbox_loading {
+        let compose_busy =
+            self.compose_resolving || self.compose_preparing || self.send_rx.is_some();
+        if self.busy || self.inbox_loading || compose_busy {
             // A scan/call is in flight — repaint every frame so the mpsc
             // channel gets drained promptly once it lands.
             ctx.request_repaint();

@@ -43,6 +43,52 @@ pub fn spawn_send(
     rx
 }
 
+/// Compose tab: recipient resolve (read-only) and prepare-before-spend
+/// (resolve + root + both merkle paths + encrypt — still no transaction).
+/// Both are chain RPC, so both get the one-shot worker-thread treatment;
+/// `prepare_send` also persists the `SendState` before returning, so a
+/// crash between here and `spawn_send` still leaves a resumable checkpoint.
+pub enum ResolveWorkerMsg {
+    Resolved(Result<(Felt, u32), String>),
+}
+
+pub fn spawn_resolve(home_dir: PathBuf, handle: String, ctx: egui::Context) -> Receiver<ResolveWorkerMsg> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let home = Home::new(home_dir);
+        let result = (|| {
+            let config = home.load_config().map_err(|e| format!("{e:#}"))?;
+            let chain = Chain::new(&config.rpc_url, &config.account);
+            app::resolve_recipient(&chain, &config.store, &handle).map_err(|e| format!("{e:#}"))
+        })();
+        let _ = tx.send(ResolveWorkerMsg::Resolved(result));
+        ctx.request_repaint();
+    });
+    rx
+}
+
+pub enum PrepareWorkerMsg {
+    Prepared(Result<SendState, String>),
+}
+
+pub fn spawn_prepare(
+    home_dir: PathBuf, sender_leaf: u32, handle: String, text: String, ctx: egui::Context,
+) -> Receiver<PrepareWorkerMsg> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let home = Home::new(home_dir);
+        let result = (|| {
+            let config = home.load_config().map_err(|e| format!("{e:#}"))?;
+            let keys = home.load_keys().map_err(|e| format!("{e:#}"))?;
+            app::prepare_send(&home, &config, &keys, sender_leaf, &handle, &text)
+                .map_err(|e| format!("{e:#}"))
+        })();
+        let _ = tx.send(PrepareWorkerMsg::Prepared(result));
+        ctx.request_repaint();
+    });
+    rx
+}
+
 /// Onboarding + status calls. Each does chain RPC (and `register` also
 /// waits on a receipt), so each gets its own one-shot thread that sends
 /// exactly one message back.
