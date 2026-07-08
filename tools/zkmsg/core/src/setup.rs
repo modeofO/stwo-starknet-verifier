@@ -2,12 +2,13 @@
 //!
 //!   CreateAccount → Fund → Deploy → Init → Register
 //!
-//! Mirrors `pipeline.rs`: every step is persisted before and after it runs
-//! (to `<profile_dir>/setup.json`), so a crash resumes at the first
+//! Mirrors `pipeline.rs`: every step is persisted after it runs (to
+//! `<profile_dir>/setup.json`), so a crash resumes at the first
 //! incomplete step and never re-executes a done step. Fund moves the
-//! user's real STRK, so it is gated (`fund_strk > 0`) and — like the send
-//! pipeline's tx steps — emits `TxSubmitted` between the invoke and the
-//! receipt wait.
+//! user's real STRK, so it is gated (`fund_strk > 0`), guarded by a
+//! balance pre-check (a landed-but-uncheckpointed transfer is not
+//! re-sent), and — like the send pipeline's tx steps — emits
+//! `TxSubmitted` between the invoke and the receipt wait.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -173,6 +174,18 @@ impl SetupRunner<'_> {
         ensure!(state.fund_strk > 0, "fund amount must be > 0 STRK");
         let address = state.address.clone().context("fund step before address is known")?;
         let chain = Chain::new(self.rpc_url, &state.source_account);
+
+        // Resume guard: if the new account already holds enough STRK (a
+        // prior run's transfer landed before we could checkpoint Fund),
+        // don't re-send and double-fund. If the balance read itself errors
+        // we fall through and transfer — availability over the rare-crash
+        // guard, since a missing balance almost always means "not funded".
+        if let Ok(balance_fri) = read_balance_fri(&chain, &address) {
+            if !fund_needed(balance_fri, state.fund_strk) {
+                return Ok((None, Some("already funded (balance covers)".into())));
+            }
+        }
+
         let tx = chain.invoke(
             STRK_TOKEN,
             "transfer",
@@ -234,6 +247,23 @@ pub fn strk_to_fri_hex(strk: u64) -> String {
     format!("{:#x}", strk as u128 * 1_000_000_000_000_000_000)
 }
 
+/// Whether the Fund step still needs to send a transfer: true iff the
+/// account's current balance (in fri) does not already cover `fund_strk`.
+/// A balance exactly at the target counts as covered (no transfer).
+fn fund_needed(balance_fri: u128, fund_strk: u64) -> bool {
+    balance_fri < fund_strk as u128 * 1_000_000_000_000_000_000
+}
+
+/// The account's STRK balance in fri (u256 low limb) — same read shape as
+/// `app::account_balance_strk`, but undivided for the exact pre-check.
+fn read_balance_fri(chain: &Chain, address: &str) -> Result<u128> {
+    let out = chain.call(STRK_TOKEN, "balance_of", &[address.to_string()])?;
+    Ok(u128::from_str_radix(
+        out.first().context("balance_of shape")?.trim_start_matches("0x"),
+        16,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +292,18 @@ mod tests {
     fn strk_to_fri_is_wei_scale() {
         assert_eq!(strk_to_fri_hex(60), format!("{:#x}", 60u128 * 1_000_000_000_000_000_000));
         assert_eq!(strk_to_fri_hex(0), "0x0");
+    }
+
+    #[test]
+    fn fund_needed_respects_balance_coverage() {
+        let one = 1_000_000_000_000_000_000u128;
+        // under target -> still needs funding
+        assert!(fund_needed(59 * one, 60));
+        assert!(fund_needed(0, 60));
+        assert!(fund_needed(60 * one - 1, 60));
+        // exact boundary -> covered, no transfer
+        assert!(!fund_needed(60 * one, 60));
+        // over target -> covered
+        assert!(!fund_needed(61 * one, 60));
     }
 }
