@@ -9,5 +9,6 @@ pub mod crypto;
 pub mod inbox;
 pub mod pack;
 pub mod pipeline;
+pub mod profiles;
 pub mod state;
 pub mod tree;
