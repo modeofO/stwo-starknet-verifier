@@ -1,4 +1,5 @@
 mod app;
+mod inbox_view;
 mod worker;
 
 use std::path::PathBuf;

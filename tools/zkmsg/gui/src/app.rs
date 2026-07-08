@@ -11,8 +11,9 @@ use eframe::egui;
 use zkmsg_core::app::{RegisterOutcome, StatusReport};
 use zkmsg_core::chain::felt_hex;
 use zkmsg_core::config::{Config, Home, Keys};
+use zkmsg_core::inbox::ReceivedMessage;
 
-use crate::worker::{self, StatusWorkerMsg};
+use crate::worker::{self, InboxWorkerMsg, StatusWorkerMsg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -34,7 +35,9 @@ pub struct ZkmsgApp {
     status: Option<StatusReport>,
     init_pubkey: Option<String>,
     register_outcome: Option<RegisterOutcome>,
-    last_error: Option<String>,
+    /// Shared across tabs (status + inbox) — each poll routine clears it
+    /// on success and sets it on failure, same as the Status tab always did.
+    pub(crate) last_error: Option<String>,
 
     /// Guards the status panel's auto-fetch-on-first-render (below) so a
     /// persistent RPC failure doesn't re-spawn a fetch every frame; once
@@ -42,6 +45,14 @@ pub struct ZkmsgApp {
     fetched_once: bool,
     busy: bool,
     rx: Option<Receiver<StatusWorkerMsg>>,
+
+    pub(crate) inbox: Vec<ReceivedMessage>,
+    pub(crate) inbox_loading: bool,
+    pub(crate) inbox_rx: Option<Receiver<InboxWorkerMsg>>,
+    pub(crate) inbox_auto_refresh: bool,
+    /// Set on every scan spawn (manual or auto); the auto-refresh check in
+    /// `inbox_tab` reads it to decide if 30s have elapsed.
+    pub(crate) last_refresh: Option<std::time::Instant>,
 }
 
 impl ZkmsgApp {
@@ -63,6 +74,11 @@ impl ZkmsgApp {
             fetched_once: false,
             busy: false,
             rx: None,
+            inbox: Vec::new(),
+            inbox_loading: false,
+            inbox_rx: None,
+            inbox_auto_refresh: false,
+            last_refresh: None,
         }
     }
 
@@ -71,6 +87,12 @@ impl ZkmsgApp {
     fn reload_local_state(&mut self) {
         self.config = self.home.load_config().ok();
         self.keys = self.home.load_keys().ok();
+    }
+
+    /// `Home` has no `Clone`, so worker spawns take the directory and
+    /// build a fresh `Home` on the worker thread (see worker.rs).
+    pub(crate) fn home_dir(&self) -> PathBuf {
+        self.home.dir.clone()
     }
 
     fn poll_worker(&mut self) {
@@ -271,6 +293,7 @@ impl ZkmsgApp {
 impl eframe::App for ZkmsgApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
+        self.poll_inbox_worker();
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -286,13 +309,17 @@ impl eframe::App for ZkmsgApp {
             Tab::Compose => {
                 ui.label("Compose — coming soon");
             }
-            Tab::Inbox => {
-                ui.label("Inbox — coming soon");
-            }
+            Tab::Inbox => self.inbox_tab(ui, ctx),
         });
 
-        if self.busy {
+        if self.busy || self.inbox_loading {
+            // A scan/call is in flight — repaint every frame so the mpsc
+            // channel gets drained promptly once it lands.
             ctx.request_repaint();
+        } else if self.inbox_auto_refresh {
+            // Idle but armed: wake up periodically to re-check the 30s
+            // elapsed-since-last-refresh condition, without busy-spinning.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 }

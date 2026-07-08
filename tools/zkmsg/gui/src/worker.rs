@@ -12,7 +12,9 @@ use eframe::egui;
 use starknet_types_core::felt::Felt;
 
 use zkmsg_core::app::{self, RegisterOutcome, StatusReport};
+use zkmsg_core::chain::Chain;
 use zkmsg_core::config::{Config, Home};
+use zkmsg_core::inbox::{self, ReceivedMessage};
 use zkmsg_core::pipeline::{Pipeline, PipelineEvent};
 use zkmsg_core::state::SendState;
 
@@ -85,6 +87,30 @@ pub fn spawn_register(
         let home = Home::new(home_dir);
         let result = app::register(&home, &handle).map_err(|e| format!("{e:#}"));
         let _ = tx.send(StatusWorkerMsg::Register(result));
+        ctx.request_repaint();
+    });
+    rx
+}
+
+pub enum InboxWorkerMsg {
+    Scan(Result<Vec<ReceivedMessage>, String>),
+}
+
+/// Inbox scan: `getEvents` over the store plus a local trial-decrypt per
+/// event — read-only chain RPC, so it gets the same one-shot worker-thread
+/// treatment as `spawn_status`.
+pub fn spawn_inbox(home_dir: PathBuf, ctx: egui::Context) -> Receiver<InboxWorkerMsg> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let home = Home::new(home_dir);
+        let result = (|| {
+            let config = home.load_config().map_err(|e| format!("{e:#}"))?;
+            let keys = home.load_keys().map_err(|e| format!("{e:#}"))?;
+            let chain = Chain::new(&config.rpc_url, &config.account);
+            let scan_priv = keys.scan_priv_felt().map_err(|e| format!("{e:#}"))?;
+            inbox::scan(&chain, &config.store, &scan_priv).map_err(|e| format!("{e:#}"))
+        })();
+        let _ = tx.send(InboxWorkerMsg::Scan(result));
         ctx.request_repaint();
     });
     rx
