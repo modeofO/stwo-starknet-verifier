@@ -222,7 +222,25 @@ impl ZkmsgApp {
         ));
     }
 
+    /// True while a send is being prepared OR its pipeline is running —
+    /// the window during which NO other send (compose or resume) may
+    /// start, or two paid pipelines would run concurrently (double-spend).
+    /// Note `compose_preparing` covers the prepare RPC window where
+    /// `send_rx` is still `None`.
+    pub(crate) fn send_in_flight(&self) -> bool {
+        self.compose_preparing || self.send_rx.is_some()
+    }
+
     fn start_send(&mut self, state: SendState, ctx: &egui::Context) {
+        // A resume clicked during our prepare window may have already
+        // started a send by the time prepare completes and lands here —
+        // drop this freshly-prepared state rather than spawn a second
+        // concurrent pipeline (the checkpoint is saved; the user can
+        // re-send).
+        if self.send_rx.is_some() {
+            self.last_error = Some("a send is already running".to_string());
+            return;
+        }
         let Some(config) = self.config.clone() else {
             self.last_error = Some("no config loaded".to_string());
             return;
@@ -239,11 +257,12 @@ impl ZkmsgApp {
     /// end up here rather than duplicating the `spawn_send` wiring.
     pub(crate) fn resume_send(&mut self, id: &str, ctx: &egui::Context) {
         // Belt-and-suspenders on a spend action: never spawn a second send
-        // while one is already in flight (it would orphan the first worker's
-        // channel and could double-spend). poll_send_worker clears send_rx in
-        // both Done arms before a step is observable as Failed, so the
-        // Failed-step Resume path always sees send_rx == None and is unaffected.
-        if self.send_rx.is_some() {
+        // while one is in flight OR being prepared (a compose prepare RPC is
+        // running with send_rx still None) — else two paid pipelines could
+        // run concurrently and double-spend. poll_send_worker clears send_rx
+        // in both Done arms before a step is observable as Failed, so the
+        // Failed-step Resume path always sees this false and is unaffected.
+        if self.send_in_flight() {
             self.last_error = Some("a send is already running".to_string());
             return;
         }

@@ -134,6 +134,12 @@ impl ZkmsgApp {
     /// (switch to it, then `resume_send`); Dismiss only drops the entry
     /// from this in-memory list — the checkpoint file is left untouched.
     fn pending_banner(&mut self, ctx: &egui::Context) {
+        // Never offer Resume while a send is being prepared or run — a
+        // second paid pipeline started here would race the active one
+        // (double-spend). The banner returns once that send completes.
+        if self.send_in_flight() {
+            return;
+        }
         if self.pending.is_empty() {
             return;
         }
