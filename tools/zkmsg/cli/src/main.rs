@@ -243,6 +243,14 @@ fn cmd_resume(home: &Home, id: &str) -> Result<()> {
     result
 }
 
+fn format_step_line(id: &str, index: usize, total: usize, kind: &zkmsg_core::state::StepKind) -> String {
+    format!("[{id}] step {}/{}: {kind:?}", index + 1, total)
+}
+
+fn format_complete_line(id: &str, fact: Option<&str>) -> String {
+    format!("[{id}] complete — fact {}", fact.unwrap_or("(recorded on-chain)"))
+}
+
 /// Reproduces the pre-refactor CLI's live progress output exactly:
 /// a "step N/M: Kind" line per step start, and a "complete — fact …" line
 /// at the end. Tx submissions and step completions print nothing, as
@@ -251,15 +259,12 @@ fn cli_sink(id: &str) -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) + '_ {
     use zkmsg_core::pipeline::PipelineEvent as E;
     move |event| match event {
         E::StepStarted { index, total, kind } => {
-            println!("[{id}] step {}/{}: {kind:?}", index + 1, total);
+            println!("{}", format_step_line(id, index, total, &kind));
         }
         E::TxSubmitted { .. } => {}
         E::StepCompleted { .. } => {}
         E::Completed { fact } => {
-            println!(
-                "[{id}] complete — fact {}",
-                fact.as_deref().unwrap_or("(recorded on-chain)"),
-            );
+            println!("{}", format_complete_line(id, fact.as_deref()));
         }
     }
 }
@@ -395,21 +400,30 @@ mod tests {
 
     #[test]
     fn cli_sink_line_formats() {
-        use zkmsg_core::pipeline::PipelineEvent as E;
         use zkmsg_core::state::StepKind;
-        let mut lines = vec![];
-        // Reuse cli_sink's formatting by mirroring it into a string sink.
-        let mut sink = |e: E| match e {
-            E::StepStarted { index, total, kind } =>
-                lines.push(format!("[id] step {}/{}: {kind:?}", index + 1, total)),
-            E::Completed { fact } =>
-                lines.push(format!("[id] complete — fact {}",
-                    fact.as_deref().unwrap_or("(recorded on-chain)"))),
-            _ => {}
-        };
-        sink(E::StepStarted { index: 0, total: 6, kind: StepKind::Prove });
-        sink(E::Completed { fact: Some("0xabc".into()) });
-        assert_eq!(lines[0], "[id] step 1/6: Prove");
-        assert_eq!(lines[1], "[id] complete — fact 0xabc");
+
+        // Plain kind.
+        assert_eq!(
+            format_step_line("6d3671ecef", 0, 6, &StepKind::Prove),
+            "[6d3671ecef] step 1/6: Prove",
+        );
+        // Kind with a field.
+        assert_eq!(
+            format_step_line("6d3671ecef", 2, 6, &StepKind::Stage { offset: 0 }),
+            "[6d3671ecef] step 3/6: Stage { offset: 0 }",
+        );
+        // Completed with a fact.
+        assert_eq!(
+            format_complete_line(
+                "6d3671ecef",
+                Some("0x2dc0a3703c2703c471591c64307ebb8a50f8c4eae35f0c916d6fca56014145f"),
+            ),
+            "[6d3671ecef] complete — fact 0x2dc0a3703c2703c471591c64307ebb8a50f8c4eae35f0c916d6fca56014145f",
+        );
+        // Completed without a fact falls back to the placeholder.
+        assert_eq!(
+            format_complete_line("6d3671ecef", None),
+            "[6d3671ecef] complete — fact (recorded on-chain)",
+        );
     }
 }
