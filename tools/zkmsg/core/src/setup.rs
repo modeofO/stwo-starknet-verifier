@@ -45,6 +45,17 @@ pub struct SetupStep {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum FundMode {
+    /// STRK transfer from `source_account` (the original wizard behavior).
+    #[default]
+    Transfer,
+    /// Wait until the new address holds >= `fund_strk`; the app never
+    /// transfers — the user deposits from outside their account graph.
+    /// `source_account` is unused (and empty) in this mode.
+    External,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupState {
     pub profile_name: String,
@@ -52,6 +63,8 @@ pub struct SetupState {
     pub account_name: String,
     pub fund_strk: u64,
     pub source_account: String,
+    #[serde(default)]
+    pub fund_mode: FundMode,
     /// The new account's address, filled once CreateAccount runs.
     pub address: Option<String>,
     pub steps: Vec<SetupStep>,
@@ -75,7 +88,16 @@ impl SetupState {
         .into_iter()
         .map(|kind| SetupStep { kind, done: false, tx_hash: None, note: None })
         .collect();
-        Self { profile_name, handle, account_name, fund_strk, source_account, address: None, steps }
+        Self {
+            profile_name,
+            handle,
+            account_name,
+            fund_strk,
+            source_account,
+            fund_mode: FundMode::Transfer,
+            address: None,
+            steps,
+        }
     }
 
     pub fn next_pending(&self) -> Option<usize> {
@@ -110,7 +132,17 @@ pub enum SetupEvent {
     StepStarted { index: usize, total: usize, kind: SetupStepKind },
     TxSubmitted { kind: SetupStepKind, tx_hash: String },
     StepCompleted { kind: SetupStepKind, tx_hash: Option<String>, note: Option<String> },
+    /// External fund mode only: the runner parked because the new address
+    /// does not yet hold the target. Emitted INSTEAD of executing Fund;
+    /// the run returns Ok(()) with Fund still pending.
+    AwaitingDeposit { address: String, target_strk: u64, balance_fri: u128 },
     Completed,
+}
+
+enum StepOutcome {
+    Done(Option<String>, Option<String>),
+    /// External Fund, deposit not yet arrived: stop the run, keep pending.
+    Park,
 }
 
 pub struct SetupRunner<'a> {
@@ -126,10 +158,14 @@ impl SetupRunner<'_> {
             let kind = state.steps[index].kind.clone();
             let total = state.steps.len();
             sink(SetupEvent::StepStarted { index, total, kind: kind.clone() });
-            let (tx, note) = self.execute(state, &kind, sink)?;
-            state.mark_done(index, tx.clone(), note.clone());
-            state.save(self.profile_dir)?;
-            sink(SetupEvent::StepCompleted { kind, tx_hash: tx, note });
+            match self.execute(state, &kind, sink)? {
+                StepOutcome::Done(tx, note) => {
+                    state.mark_done(index, tx.clone(), note.clone());
+                    state.save(self.profile_dir)?;
+                    sink(SetupEvent::StepCompleted { kind, tx_hash: tx, note });
+                }
+                StepOutcome::Park => return Ok(()),
+            }
         }
         sink(SetupEvent::Completed);
         Ok(())
@@ -140,13 +176,25 @@ impl SetupRunner<'_> {
         state: &mut SetupState,
         kind: &SetupStepKind,
         sink: &mut dyn FnMut(SetupEvent),
-    ) -> Result<(Option<String>, Option<String>)> {
+    ) -> Result<StepOutcome> {
         match kind {
-            SetupStepKind::CreateAccount => self.step_create(state),
+            SetupStepKind::CreateAccount => {
+                let (tx, note) = self.step_create(state)?;
+                Ok(StepOutcome::Done(tx, note))
+            }
             SetupStepKind::Fund => self.step_fund(state, kind, sink),
-            SetupStepKind::Deploy => self.step_deploy(state, kind, sink),
-            SetupStepKind::Init => self.step_init(state),
-            SetupStepKind::Register => self.step_register(state),
+            SetupStepKind::Deploy => {
+                let (tx, note) = self.step_deploy(state, kind, sink)?;
+                Ok(StepOutcome::Done(tx, note))
+            }
+            SetupStepKind::Init => {
+                let (tx, note) = self.step_init(state)?;
+                Ok(StepOutcome::Done(tx, note))
+            }
+            SetupStepKind::Register => {
+                let (tx, note) = self.step_register(state)?;
+                Ok(StepOutcome::Done(tx, note))
+            }
         }
     }
 
@@ -170,11 +218,28 @@ impl SetupRunner<'_> {
         state: &SetupState,
         kind: &SetupStepKind,
         sink: &mut dyn FnMut(SetupEvent),
-    ) -> Result<(Option<String>, Option<String>)> {
+    ) -> Result<StepOutcome> {
         ensure!(state.fund_strk > 0, "fund amount must be > 0 STRK");
         let address = state.address.clone().context("fund step before address is known")?;
         let chain = Chain::new(self.rpc_url, &state.source_account);
 
+        if state.fund_mode == FundMode::External {
+            // Never transfers. Covered -> done; not covered -> park. A
+            // balance-read error also parks (retry via Refresh) rather
+            // than failing the checklist red.
+            let balance = read_balance_fri(&chain, &address).unwrap_or(0);
+            if !fund_needed(balance, state.fund_strk) {
+                return Ok(StepOutcome::Done(None, Some("funded externally".into())));
+            }
+            sink(SetupEvent::AwaitingDeposit {
+                address,
+                target_strk: state.fund_strk,
+                balance_fri: balance,
+            });
+            return Ok(StepOutcome::Park);
+        }
+
+        // FundMode::Transfer — unchanged behavior (resume guard + transfer).
         // Resume guard: if the new account already holds enough STRK (a
         // prior run's transfer landed before we could checkpoint Fund),
         // don't re-send and double-fund. If the balance read itself errors
@@ -182,7 +247,7 @@ impl SetupRunner<'_> {
         // guard, since a missing balance almost always means "not funded".
         if let Ok(balance_fri) = read_balance_fri(&chain, &address) {
             if !fund_needed(balance_fri, state.fund_strk) {
-                return Ok((None, Some("already funded (balance covers)".into())));
+                return Ok(StepOutcome::Done(None, Some("already funded (balance covers)".into())));
             }
         }
 
@@ -194,7 +259,7 @@ impl SetupRunner<'_> {
         )?;
         sink(SetupEvent::TxSubmitted { kind: kind.clone(), tx_hash: tx.clone() });
         chain.wait_receipt(&tx, RECEIPT_TIMEOUT)?;
-        Ok((Some(tx), Some(format!("funded {} STRK", state.fund_strk))))
+        Ok(StepOutcome::Done(Some(tx), Some(format!("funded {} STRK", state.fund_strk))))
     }
 
     fn step_deploy(
@@ -256,7 +321,8 @@ fn fund_needed(balance_fri: u128, fund_strk: u64) -> bool {
 
 /// The account's STRK balance in fri (u256 low limb) — same read shape as
 /// `app::account_balance_strk`, but undivided for the exact pre-check.
-fn read_balance_fri(chain: &Chain, address: &str) -> Result<u128> {
+/// Also reused by the External-fund deposit poll and by Task 4's sweep.
+pub fn read_balance_fri(chain: &Chain, address: &str) -> Result<u128> {
     let out = chain.call(STRK_TOKEN, "balance_of", &[address.to_string()])?;
     Ok(u128::from_str_radix(
         out.first().context("balance_of shape")?.trim_start_matches("0x"),
@@ -292,6 +358,35 @@ mod tests {
     fn strk_to_fri_is_wei_scale() {
         assert_eq!(strk_to_fri_hex(60), format!("{:#x}", 60u128 * 1_000_000_000_000_000_000));
         assert_eq!(strk_to_fri_hex(0), "0x0");
+    }
+
+    #[test]
+    fn setup_state_serde_defaults_fund_mode_to_transfer() {
+        // A carol-era setup.json: no fund_mode field. Must load as Transfer.
+        let carol_era = r#"{
+            "profile_name": "carol", "handle": "carol",
+            "account_name": "zkmsg-carol", "fund_strk": 60,
+            "source_account": "funded-deployer", "address": null,
+            "steps": [
+                {"kind": "CreateAccount", "done": false, "tx_hash": null, "note": null},
+                {"kind": "Fund", "done": false, "tx_hash": null, "note": null},
+                {"kind": "Deploy", "done": false, "tx_hash": null, "note": null},
+                {"kind": "Init", "done": false, "tx_hash": null, "note": null},
+                {"kind": "Register", "done": false, "tx_hash": null, "note": null}
+            ]
+        }"#;
+        let s: SetupState = serde_json::from_str(carol_era).unwrap();
+        assert_eq!(s.fund_mode, FundMode::Transfer);
+        // And it round-trips with the field present.
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: SetupState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s2.fund_mode, FundMode::Transfer);
+    }
+
+    #[test]
+    fn new_plan_is_transfer_mode() {
+        let s = SetupState::new_plan("x".into(), "x".into(), "zkmsg-x".into(), 60, "src".into());
+        assert_eq!(s.fund_mode, FundMode::Transfer);
     }
 
     #[test]

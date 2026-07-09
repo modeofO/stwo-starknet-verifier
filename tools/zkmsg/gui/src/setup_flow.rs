@@ -63,6 +63,8 @@ impl SetupFlow {
                     }
                 }
             }
+            // Task 5 replaces this with the real awaiting-deposit handling.
+            SetupEvent::AwaitingDeposit { .. } => {}
             SetupEvent::Completed => {
                 self.completed = true;
                 for step in &mut self.steps {
