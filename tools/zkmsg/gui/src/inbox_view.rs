@@ -78,7 +78,20 @@ impl ProfileSession {
             for m in &self.inbox {
                 ui.label(m.nonce.to_string());
                 ui.label(&m.commitment[..m.commitment.len().min(18)]);
-                ui.label(&m.text);
+                match crate::fromline::split_from_line(&m.text) {
+                    Some((handle, body)) => {
+                        ui.vertical(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(120, 160, 220),
+                                format!("from: {handle}"),
+                            );
+                            ui.label(body);
+                        });
+                    }
+                    None => {
+                        ui.label(&m.text);
+                    }
+                }
                 ui.end_row();
             }
         });

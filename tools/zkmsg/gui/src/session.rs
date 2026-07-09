@@ -83,6 +83,10 @@ pub struct ProfileSession {
     pub(crate) compose_resolved: Option<Result<(Felt, u32), String>>,
     pub(crate) compose_resolve_rx: Option<Receiver<ResolveWorkerMsg>>,
     pub(crate) compose_show_confirm: bool,
+    /// Burner-only: prepend `from: <reply_handle>` inside the encrypted
+    /// plaintext so the recipient can reply to the real identity. Default
+    /// on; the checkbox only renders for burner profiles with a handle.
+    pub(crate) compose_reveal_from: bool,
     pub(crate) compose_preparing: bool,
     pub(crate) compose_prepare_rx: Option<Receiver<PrepareWorkerMsg>>,
     /// `Some` once `prepare_send` has returned a plan — presence of this
@@ -131,6 +135,7 @@ impl ProfileSession {
             compose_resolved: None,
             compose_resolve_rx: None,
             compose_show_confirm: false,
+            compose_reveal_from: true,
             compose_preparing: false,
             compose_prepare_rx: None,
             send_flow: None,

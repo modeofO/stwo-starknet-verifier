@@ -145,6 +145,13 @@ impl ProfileSession {
         };
         ui.colored_label(counter_color, format!("{n_bytes} / {BYTE_SOFT_CAP} bytes"));
 
+        if let Some(reply) = self.config.as_ref().filter(|c| c.burner).and_then(|c| c.reply_handle.clone()) {
+            ui.checkbox(
+                &mut self.compose_reveal_from,
+                format!("reveal my handle ('{reply}') to the recipient (encrypted from-line)"),
+            );
+        }
+
         ui.separator();
         let balance_line = match self.status.as_ref().and_then(|r| r.balance_strk) {
             Some(strk) => format!("send costs ~{ESTIMATED_COST_STRK} STRK · balance ~{strk} STRK"),
@@ -224,11 +231,20 @@ impl ProfileSession {
         };
         self.compose_preparing = true;
         self.last_error = None;
+        let text = match self
+            .config
+            .as_ref()
+            .filter(|c| c.burner && self.compose_reveal_from)
+            .and_then(|c| c.reply_handle.as_deref())
+        {
+            Some(reply) => crate::fromline::apply_from_line(&self.compose_text, reply),
+            None => self.compose_text.clone(),
+        };
         self.compose_prepare_rx = Some(worker::spawn_prepare(
             self.home_dir(),
             sender_leaf,
             self.compose_handle.trim().to_string(),
-            self.compose_text.clone(),
+            text,
             ctx.clone(),
         ));
     }

@@ -1,5 +1,6 @@
 mod app;
 mod compose_view;
+mod fromline;
 mod inbox_view;
 mod migrate_view;
 mod send_flow;
