@@ -33,6 +33,10 @@ const HEAD_LEN: usize = 4_991;
 const STAGE_CHUNK: usize = 1_900;
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Phase-2 l2-gas bound (measured 815.7M + margin). Public because the
+/// wizard's funding recommendation prices the same worst case.
+pub const L2_GAS_BOUND_PHASE2: u64 = 1_000_000_000;
+
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
     StepStarted { index: usize, total: usize, kind: StepKind },
@@ -311,7 +315,7 @@ fn bounds_for(kind: &StepKind, prices: (u128, u128, u128)) -> GasBounds {
     let l2_gas = match kind {
         StepKind::Stage { .. } => Some(400_000_000),
         StepKind::Phase1 => Some(1_050_000_000),
-        StepKind::Phase2 => Some(1_000_000_000),
+        StepKind::Phase2 => Some(L2_GAS_BOUND_PHASE2),
         StepKind::SendMessage => Some(80_000_000),
         _ => None,
     };

@@ -306,6 +306,35 @@ impl SetupRunner<'_> {
     }
 }
 
+/// Static fallback when the live gas-price read fails.
+pub const FALLBACK_FUNDING_STRK: u64 = 80;
+
+/// Expected ACTUAL l2 gas spent before phase 2 submits: one stage tx
+/// (~28M measured) + phase 1 (~865M measured, max 873.8M) + publish
+/// (~3.3M), rounded up per leg.
+const ACTUAL_L2_BEFORE_PHASE2: u128 = 935_000_000;
+/// create + deploy + register fees, generously (measured 0.35 STRK total).
+const FLAT_SETUP_FRI: u128 = 1_000_000_000_000_000_000;
+const FRI_PER_STRK: u128 = 1_000_000_000_000_000_000;
+
+/// Recommended funding for one send from a fresh account, in whole STRK,
+/// from live (l1, l2, l1_data) gas prices in fri.
+///
+/// The binding constraint is sequential worst-case-bounds validation
+/// (carol's 2026-07-08 stall): after phase 1's ACTUAL fee lands, the
+/// account must still hold phase 2's BOUNDS PRODUCT (amounts x 1.5x
+/// prices, mirroring `pipeline::bounds_for`). +10% margin, ceil.
+pub fn recommended_funding_strk(prices: (u128, u128, u128)) -> u64 {
+    let (l1_price, l2_price, l1_data_price) = prices;
+    let actuals = ACTUAL_L2_BEFORE_PHASE2 * l2_price;
+    let phase2_bound = 100 * (l1_price * 3 / 2)
+        + crate::pipeline::L2_GAS_BOUND_PHASE2 as u128 * (l2_price * 3 / 2)
+        + 32_768 * (l1_data_price * 3 / 2);
+    let total_fri = actuals + phase2_bound + FLAT_SETUP_FRI;
+    let with_margin = total_fri * 11 / 10;
+    with_margin.div_ceil(FRI_PER_STRK) as u64
+}
+
 /// Whole STRK to fri (wei-scale, 1e18) as a u256-low hex literal for
 /// calldata.
 pub fn strk_to_fri_hex(strk: u64) -> String {
@@ -387,6 +416,24 @@ mod tests {
     fn new_plan_is_transfer_mode() {
         let s = SetupState::new_plan("x".into(), "x".into(), "zkmsg-x".into(), 60, "src".into());
         assert_eq!(s.fund_mode, FundMode::Transfer);
+    }
+
+    #[test]
+    fn recommended_funding_tracks_l2_price() {
+        // Pure-l2 price points (l1/data zero to keep arithmetic exact).
+        // 20 Gfri: actuals 935M*20e9 = 1.87e19 fri; phase2 bound 1e9*30e9 = 3.0e19;
+        // + 1 STRK flat = 4.97e19; *1.1 = 5.467e19 -> ceil 55 STRK.
+        assert_eq!(recommended_funding_strk((0, 20_000_000_000, 0)), 55);
+        // carol's spike, 43.9 Gfri: 4.10465e19 + 6.585e19 + 0.1e19 = 10.78965e19;
+        // *1.1 = 11.868615e19 -> ceil 119 STRK.
+        assert_eq!(recommended_funding_strk((0, 43_900_000_000, 0)), 119);
+        // Monotonic in l2 price.
+        assert!(
+            recommended_funding_strk((0, 50_000_000_000, 0))
+                > recommended_funding_strk((0, 20_000_000_000, 0))
+        );
+        // Zero prices still demand the flat fee floor (deploy+register+margin).
+        assert!(recommended_funding_strk((0, 0, 0)) >= 2);
     }
 
     #[test]
