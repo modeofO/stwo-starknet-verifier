@@ -44,6 +44,14 @@ pub struct Config {
     pub bridge_bin: PathBuf,
     /// The built circuit executable.
     pub circuit_executable: PathBuf,
+    /// This profile is a throwaway sender created by the burner wizard.
+    /// Local-only; nothing on-chain marks a burner.
+    #[serde(default)]
+    pub burner: bool,
+    /// The creating profile's registered handle, for the compose
+    /// from-line. Local-only.
+    #[serde(default)]
+    pub reply_handle: Option<String>,
 }
 
 impl Config {
@@ -57,6 +65,8 @@ impl Config {
                 .join(".prover/proving-utils/target/release/privacy_prove_cairo_bridge"),
             circuit_executable: repo_root
                 .join("fixtures/target/dev/messagezk_scan.executable.json"),
+            burner: false,
+            reply_handle: None,
         }
     }
 }
@@ -165,5 +175,18 @@ mod tests {
         let loaded = home.load_keys().unwrap();
         assert_eq!(loaded.scan_priv, "0x5");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_serde_defaults_burner_fields() {
+        // A pre-burner config.json (alice/bob/carol era): no burner fields.
+        let old = r#"{
+            "rpc_url": "https://x", "account": "funded-deployer",
+            "registry": "0x1", "store": "0x2",
+            "bridge_bin": "/b", "circuit_executable": "/c"
+        }"#;
+        let c: Config = serde_json::from_str(old).unwrap();
+        assert!(!c.burner);
+        assert!(c.reply_handle.is_none());
     }
 }

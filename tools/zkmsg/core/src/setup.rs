@@ -65,6 +65,10 @@ pub struct SetupState {
     pub source_account: String,
     #[serde(default)]
     pub fund_mode: FundMode,
+    #[serde(default)]
+    pub burner: bool,
+    #[serde(default)]
+    pub reply_handle: Option<String>,
     /// The new account's address, filled once CreateAccount runs.
     pub address: Option<String>,
     pub steps: Vec<SetupStep>,
@@ -95,9 +99,29 @@ impl SetupState {
             fund_strk,
             source_account,
             fund_mode: FundMode::Transfer,
+            burner: false,
+            reply_handle: None,
             address: None,
             steps,
         }
+    }
+
+    /// A burner plan: external funding (the app never transfers), flagged
+    /// so Init stamps the profile config. `source_account` is empty —
+    /// External mode never signs with it (create/deploy are
+    /// `--name`-addressed; Register pays from the new account itself).
+    pub fn new_plan_external_burner(
+        profile_name: String,
+        handle: String,
+        account_name: String,
+        fund_strk: u64,
+        reply_handle: Option<String>,
+    ) -> Self {
+        let mut s = Self::new_plan(profile_name, handle, account_name, fund_strk, String::new());
+        s.fund_mode = FundMode::External;
+        s.burner = true;
+        s.reply_handle = reply_handle;
+        s
     }
 
     pub fn next_pending(&self) -> Option<usize> {
@@ -286,11 +310,21 @@ impl SetupRunner<'_> {
 
     fn step_init(&self, state: &SetupState) -> Result<(Option<String>, Option<String>)> {
         let home = Home::new(self.profile_dir.to_path_buf());
-        if home.keys_path().exists() {
-            return Ok((None, Some("already initialized".into())));
+        let note = if home.keys_path().exists() {
+            Some("already initialized".into())
+        } else {
+            app::init_identity(&home, &state.account_name, None, self.repo_root)?;
+            None
+        };
+        if state.burner {
+            // Stamp burner metadata on the freshly written (or existing)
+            // config — idempotent, local-only.
+            let mut config = home.load_config()?;
+            config.burner = true;
+            config.reply_handle = state.reply_handle.clone();
+            home.save_config(&config)?;
         }
-        app::init_identity(&home, &state.account_name, None, self.repo_root)?;
-        Ok((None, None))
+        Ok((None, note))
     }
 
     fn step_register(&self, state: &SetupState) -> Result<(Option<String>, Option<String>)> {
@@ -304,6 +338,16 @@ impl SetupRunner<'_> {
             }
         }
     }
+}
+
+/// Auto-identity for a burner: `burner-<6 lowercase hex>` from OS
+/// randomness. Doubles as the registered handle (public on-chain
+/// forever), so it must never derive from the user or the machine.
+pub fn burner_name() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 3];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("burner-{}", hex::encode(bytes))
 }
 
 /// Static fallback when the live gas-price read fails.
@@ -434,6 +478,32 @@ mod tests {
         );
         // Zero prices still demand the flat fee floor (deploy+register+margin).
         assert!(recommended_funding_strk((0, 0, 0)) >= 2);
+    }
+
+    #[test]
+    fn burner_name_shape() {
+        let a = burner_name();
+        let b = burner_name();
+        assert!(a.starts_with("burner-"));
+        let hexpart = &a["burner-".len()..];
+        assert_eq!(hexpart.len(), 6);
+        assert!(hexpart.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a, b); // 2^24 space — collision here means broken randomness
+        // Registered-handle legal (short_string_felt: ASCII, <= 31 chars).
+        assert!(a.is_ascii() && a.len() <= 31);
+    }
+
+    #[test]
+    fn burner_plan_is_external_and_flagged() {
+        let s = SetupState::new_plan_external_burner(
+            "burner-ab12cd".into(), "burner-ab12cd".into(),
+            "zkmsg-burner-ab12cd".into(), 80, Some("alice".into()),
+        );
+        assert_eq!(s.fund_mode, FundMode::External);
+        assert!(s.burner);
+        assert_eq!(s.reply_handle.as_deref(), Some("alice"));
+        assert!(s.source_account.is_empty());
+        assert_eq!(s.steps.len(), 5);
     }
 
     #[test]
