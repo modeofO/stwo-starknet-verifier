@@ -251,6 +251,13 @@ impl SetupRunner<'_> {
             // Never transfers. Covered -> done; not covered -> park. A
             // balance-read error also parks (retry via Refresh) rather
             // than failing the checklist red.
+            //
+            // This read goes through Chain::sncast with `--account ""`
+            // (source_account is empty in External mode). sncast 0.61 tolerates
+            // an empty account for a read-only call; a future sncast that
+            // eager-resolves accounts would reject it, and every read would
+            // error -> unwrap_or(0) -> park forever at balance 0. If that
+            // happens, move this read to raw RPC (no account needed).
             let balance = read_balance_fri(&chain, &address).unwrap_or(0);
             if !fund_needed(balance, state.fund_strk) {
                 return Ok(StepOutcome::Done(None, Some("funded externally".into())));
@@ -450,6 +457,9 @@ mod tests {
         }"#;
         let s: SetupState = serde_json::from_str(carol_era).unwrap();
         assert_eq!(s.fund_mode, FundMode::Transfer);
+        // The carol-era JSON also predates the burner/reply_handle fields.
+        assert!(!s.burner);
+        assert!(s.reply_handle.is_none());
         // And it round-trips with the field present.
         let json = serde_json::to_string(&s).unwrap();
         let s2: SetupState = serde_json::from_str(&json).unwrap();

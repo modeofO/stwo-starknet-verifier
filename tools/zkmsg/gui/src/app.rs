@@ -338,10 +338,19 @@ impl ZkmsgApp {
         // register is another paid tx from the same account, so it must block
         // the setup spend too. This over-locks during a plain status refresh
         // (same `busy` flag) — the intended safe direction.
+        // Also block on an in-flight retire sweep: a sweep is a second paid tx
+        // waiting on its own receipt, so letting the wizard's Create/Confirm/
+        // Resume/Refresh stay live during it would run two concurrent paid
+        // pipelines. `self.retire` is still in self here — update_wizard() runs
+        // before the retire dialog is taken/driven at the end of update() — so
+        // this reads the live sweep flag with no take() race. No self-deadlock:
+        // the sweep's own buttons gate on the separate `paid_elsewhere`, which
+        // deliberately excludes retire.sweeping().
         let session_busy = self
             .session
             .as_ref()
-            .is_some_and(|s| s.work_in_flight() || s.worker_busy());
+            .is_some_and(|s| s.work_in_flight() || s.worker_busy())
+            || self.retire.as_ref().is_some_and(|r| r.sweeping());
         let Some(mut wizard) = self.wizard.take() else { return };
         let outcome = wizard.update(&WizardCtx {
             egui_ctx: ctx,
@@ -655,8 +664,14 @@ impl eframe::App for ZkmsgApp {
         // buttons and never process the sweep's completion, deadlocking it.
         // Snapshot only the session+wizard paid work before the take.
         if let Some(mut retire) = self.retire.take() {
+            // Fold in the session's register/status worker: an in-flight
+            // Register is another paid tx from the same account, so it must
+            // block Sweep. This over-locks the dialog during a plain status
+            // refresh (same `worker_busy` flag) — the intended safe direction,
+            // matching worker_busy's own doc comment.
             let paid_elsewhere = self.session.as_ref().is_some_and(|s| s.work_in_flight())
-                || self.wizard.as_ref().is_some_and(|w| w.running());
+                || self.wizard.as_ref().is_some_and(|w| w.running())
+                || self.session.as_ref().is_some_and(|s| s.worker_busy());
             retire.app_busy = paid_elsewhere;
             let Some(root) = self.root.clone() else {
                 // No root (bare-profile launch) — retirement needs the
