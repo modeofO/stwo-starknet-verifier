@@ -294,8 +294,13 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   native egui GUI (2026-07-07): `tools/zkmsg` split into a core lib +
   CLI (byte-identical stdout) + `zkmsg-gui` — compose/confirm/live step
   checklist, trial-decrypt inbox, resume banner; first GUI-driven send
-  fact `0x5b824d25…f6e25`, 47.2 STRK. Suites: store 12/12, zkmsg-core
-  29/29 + gui reducer 2/2, blake 5/5, poseidon 30/30.
+  fact `0x5b824d25…f6e25`, 47.2 STRK. Profiles + identity wizard
+  (2026-07-08): in-app switching over a root-`.zkmsg` layout (one-time
+  rename-only migration) and one-confirm funded-identity creation
+  (create/fund/deploy/init/register, checkpointed + resumable) — first
+  wizard-born identity `carol` sent fact `0x18dbb303…305a`, surviving
+  a real mid-send balance stall via Resume. Suites: store 12/12,
+  zkmsg-core 39/39 + gui 5/5, blake 5/5, poseidon 30/30.
 - **Next:** the qm31 gate-probe re-test on Starknet version bumps (the
   only blocker for the public network), the messagezk-circuit sizing
   pass (re-run `prove-blake` + the devnet drive on the real circuit;
