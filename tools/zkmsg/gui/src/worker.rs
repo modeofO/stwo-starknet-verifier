@@ -31,6 +31,26 @@ pub enum SetupWorkerMsg {
     Done(Result<(), String>),
 }
 
+pub enum RecommendMsg {
+    Recommended(u64),
+}
+
+/// One-shot: live gas prices -> recommended funding, static fallback on
+/// any read failure. Read-only RPC.
+pub fn spawn_recommend(rpc_url: String, ctx: egui::Context) -> Receiver<RecommendMsg> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let chain = Chain::new(&rpc_url, "");
+        let strk = chain
+            .gas_prices()
+            .map(zkmsg_core::setup::recommended_funding_strk)
+            .unwrap_or(zkmsg_core::setup::FALLBACK_FUNDING_STRK);
+        let _ = tx.send(RecommendMsg::Recommended(strk));
+        ctx.request_repaint();
+    });
+    rx
+}
+
 /// Runs (or resumes) the identity-setup pipeline on a worker thread; the
 /// returned receiver yields progress until Done. Mirrors `spawn_send`:
 /// blocking chain RPC / subprocess work off the UI thread, one repaint per

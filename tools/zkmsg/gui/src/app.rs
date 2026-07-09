@@ -26,6 +26,8 @@ enum PickerAction {
     Switch(String, PathBuf),
     /// Open the New-profile wizard on a blank form.
     New,
+    /// Open the wizard in burner mode (auto-identity, external funding).
+    NewBurner,
     /// Resume an incomplete profile's setup wizard (from its checkpoint dir;
     /// the name is read back from `setup.json`).
     Resume(PathBuf),
@@ -165,12 +167,26 @@ impl ZkmsgApp {
                             // still needs a funding source (the active
                             // profile's config) to continue, so gate it the
                             // same way as New.
+                            // An external-funding run parked at its unfunded
+                            // Fund step reads as "(awaiting funding)"; anything
+                            // else is a plain "(setup incomplete)".
+                            let label = match zkmsg_core::setup::SetupState::load(&entry.dir) {
+                                Ok(s)
+                                    if s.fund_mode == zkmsg_core::setup::FundMode::External
+                                        && s.steps.iter().any(|st| {
+                                            matches!(
+                                                st.kind,
+                                                zkmsg_core::setup::SetupStepKind::Fund
+                                            ) && !st.done
+                                        }) =>
+                                {
+                                    format!("{} (awaiting funding)", entry.name)
+                                }
+                                _ => format!("{} (setup incomplete)", entry.name),
+                            };
                             let resume = ui.add_enabled(
                                 source_available,
-                                egui::SelectableLabel::new(
-                                    false,
-                                    format!("{} (setup incomplete)", entry.name),
-                                ),
+                                egui::SelectableLabel::new(false, label),
                             );
                             if resume.clicked() {
                                 action = PickerAction::Resume(entry.dir.clone());
@@ -201,6 +217,19 @@ impl ZkmsgApp {
                     if !source_available {
                         new.on_hover_text(
                             "open a profile with a funded account first — it funds the new one",
+                        );
+                    }
+                    let newb = ui.add_enabled(
+                        source_available,
+                        egui::SelectableLabel::new(false, "New burner…"),
+                    );
+                    if newb.clicked() {
+                        action = PickerAction::NewBurner;
+                    }
+                    if !source_available {
+                        newb.on_hover_text(
+                            "open a configured profile first — its RPC endpoint drives the setup \
+                             (no funds are drawn from it)",
                         );
                     }
                 },
@@ -417,6 +446,15 @@ impl eframe::App for ZkmsgApp {
             PickerAction::New => {
                 self.picker_error = None;
                 self.wizard = Some(WizardUi::new_profile());
+            }
+            PickerAction::NewBurner => {
+                self.picker_error = None;
+                let reply = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.keys.as_ref())
+                    .and_then(|k| k.handle.clone());
+                self.wizard = Some(WizardUi::new_burner(reply));
             }
             PickerAction::Resume(dir) => match WizardUi::resume(dir) {
                 Ok(w) => {

@@ -14,11 +14,23 @@ pub struct SetupStepView {
     pub tx_hash: Option<String>,
 }
 
+/// The external-deposit waiting state: the runner parked at an unfunded
+/// Fund step, so the checklist shows a deposit card instead of a Resume row.
+#[derive(Debug, Clone)]
+pub struct AwaitingView {
+    pub address: String,
+    pub target_strk: u64,
+    pub balance_fri: u128,
+}
+
 #[derive(Debug, Clone)]
 pub struct SetupFlow {
     pub steps: Vec<SetupStepView>,
     pub error: Option<String>,
     pub completed: bool,
+    /// `Some` while an external-funding run is parked awaiting a deposit;
+    /// set by `AwaitingDeposit`, cleared the moment any step (re)starts.
+    pub awaiting: Option<AwaitingView>,
 }
 
 impl SetupFlow {
@@ -33,7 +45,7 @@ impl SetupFlow {
             })
             .collect();
         let completed = state.steps.iter().all(|s| s.done);
-        Self { steps, error: None, completed }
+        Self { steps, error: None, completed, awaiting: None }
     }
 
     /// The first not-yet-Done step matching `kind`; the setup plan has no
@@ -46,6 +58,7 @@ impl SetupFlow {
     pub fn apply(&mut self, event: SetupEvent) {
         match event {
             SetupEvent::StepStarted { kind, .. } => {
+                self.awaiting = None;
                 if let Some(step) = self.find_pending_mut(&kind) {
                     step.status = StepStatus::Running;
                 }
@@ -63,8 +76,14 @@ impl SetupFlow {
                     }
                 }
             }
-            // Task 5 replaces this with the real awaiting-deposit handling.
-            SetupEvent::AwaitingDeposit { .. } => {}
+            SetupEvent::AwaitingDeposit { address, target_strk, balance_fri } => {
+                // Park: the runner returned without executing Fund. Not a
+                // failure — revert the row to Pending and expose the info.
+                if let Some(step) = self.find_pending_mut(&SetupStepKind::Fund) {
+                    step.status = StepStatus::Pending;
+                }
+                self.awaiting = Some(AwaitingView { address, target_strk, balance_fri });
+            }
             SetupEvent::Completed => {
                 self.completed = true;
                 for step in &mut self.steps {
@@ -99,6 +118,7 @@ mod tests {
             ],
             error: None,
             completed: false,
+            awaiting: None,
         };
         f.apply(E::StepStarted { index: 0, total: 2, kind: K::CreateAccount });
         assert!(matches!(f.steps[0].status, StepStatus::Running));
@@ -121,6 +141,7 @@ mod tests {
             ],
             error: None,
             completed: false,
+            awaiting: None,
         };
         f.apply(E::StepStarted { index: 1, total: 2, kind: K::Fund });
         // CreateAccount was never started, so Fund is the running one.
@@ -128,5 +149,31 @@ mod tests {
         f.fail("transfer reverted".to_string());
         assert!(matches!(f.steps[1].status, StepStatus::Failed));
         assert_eq!(f.error.as_deref(), Some("transfer reverted"));
+    }
+
+    #[test]
+    fn awaiting_deposit_parks_fund_row() {
+        let mut f = SetupFlow {
+            steps: vec![
+                SetupStepView { kind: K::CreateAccount, status: StepStatus::Done, tx_hash: None },
+                SetupStepView { kind: K::Fund, status: StepStatus::Pending, tx_hash: None },
+            ],
+            error: None,
+            completed: false,
+            awaiting: None,
+        };
+        f.apply(E::StepStarted { index: 1, total: 2, kind: K::Fund });
+        assert!(matches!(f.steps[1].status, StepStatus::Running));
+        f.apply(E::AwaitingDeposit {
+            address: "0xburner".into(), target_strk: 80, balance_fri: 5,
+        });
+        // Parked: Fund back to Pending (not Failed — nothing went wrong),
+        // and the waiting info is exposed for the card.
+        assert!(matches!(f.steps[1].status, StepStatus::Pending));
+        let a = f.awaiting.as_ref().unwrap();
+        assert_eq!((a.address.as_str(), a.target_strk, a.balance_fri), ("0xburner", 80, 5));
+        // A re-run (Refresh) clears the card the moment any step starts.
+        f.apply(E::StepStarted { index: 1, total: 2, kind: K::Fund });
+        assert!(f.awaiting.is_none());
     }
 }

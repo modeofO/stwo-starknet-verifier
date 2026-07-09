@@ -69,6 +69,17 @@ pub struct WizardUi {
     /// confirm dialog shows this in place of the active account so it never
     /// misnames the payer.
     resume_source: Option<String>,
+    /// Burner mode: auto-named, external funding, stamps burner metadata.
+    burner: bool,
+    /// The creating profile's handle, recorded for the compose from-line.
+    reply_handle: Option<String>,
+    /// External resume: loaded state's fund mode (a resumed Transfer
+    /// wizard still re-arms the confirm; External never needs it once the
+    /// dir exists — nothing transfers).
+    fund_mode: zkmsg_core::setup::FundMode,
+    fund_touched: bool,
+    recommend_rx: Option<std::sync::mpsc::Receiver<worker::RecommendMsg>>,
+    recommend_fetched: bool,
 }
 
 impl WizardUi {
@@ -78,7 +89,7 @@ impl WizardUi {
             name: String::new(),
             handle: String::new(),
             account_name: String::new(),
-            fund_strk: "60".to_string(),
+            fund_strk: String::new(),
             handle_touched: false,
             account_touched: false,
             confirm_open: false,
@@ -87,7 +98,30 @@ impl WizardUi {
             profile_dir: None,
             error: None,
             resume_source: None,
+            burner: false,
+            reply_handle: None,
+            fund_mode: zkmsg_core::setup::FundMode::Transfer,
+            fund_touched: false,
+            recommend_rx: None,
+            recommend_fetched: false,
         }
+    }
+
+    /// A burner form: auto-generated identity, external funding. The name
+    /// stays editable but arrives filled so the default path is zero
+    /// typing.
+    pub fn new_burner(reply_handle: Option<String>) -> Self {
+        let name = zkmsg_core::setup::burner_name();
+        let mut w = Self::new_profile();
+        w.handle = name.clone();
+        w.account_name = format!("zkmsg-{name}");
+        w.name = name;
+        w.handle_touched = true;
+        w.account_touched = true;
+        w.burner = true;
+        w.reply_handle = reply_handle;
+        w.fund_mode = zkmsg_core::setup::FundMode::External;
+        w
     }
 
     /// Resume an incomplete setup from its checkpoint dir. Opens straight to
@@ -105,12 +139,21 @@ impl WizardUi {
             fund_strk: state.fund_strk.to_string(),
             handle_touched: true,
             account_touched: true,
-            confirm_open: fund_pending,
+            // An external resume never re-arms the confirm (nothing
+            // transfers); only a Transfer resume with Fund still pending does.
+            confirm_open: fund_pending
+                && state.fund_mode == zkmsg_core::setup::FundMode::Transfer,
             flow: Some(SetupFlow::from_state(&state)),
             rx: None,
             profile_dir: Some(dir),
             error: None,
             resume_source: Some(state.source_account.clone()),
+            burner: state.burner,
+            reply_handle: state.reply_handle.clone(),
+            fund_mode: state.fund_mode.clone(),
+            fund_touched: true,
+            recommend_rx: None,
+            recommend_fetched: true,
         })
     }
 
@@ -122,6 +165,19 @@ impl WizardUi {
     }
 
     pub fn update(&mut self, wctx: &WizardCtx) -> WizardOutcome {
+        if !self.recommend_fetched && self.flow.is_none() {
+            self.recommend_fetched = true;
+            self.recommend_rx =
+                Some(worker::spawn_recommend(wctx.rpc_url.to_string(), wctx.egui_ctx.clone()));
+        }
+        if let Some(rx) = &self.recommend_rx {
+            if let Ok(worker::RecommendMsg::Recommended(strk)) = rx.try_recv() {
+                self.recommend_rx = None;
+                if !self.fund_touched {
+                    self.fund_strk = strk.to_string();
+                }
+            }
+        }
         self.poll();
         if self.running() {
             wctx.egui_ctx.request_repaint();
@@ -136,7 +192,8 @@ impl WizardUi {
 
         let has_flow = self.flow.is_some();
         let mut outcome = WizardOutcome::None;
-        egui::Window::new("New profile")
+        let title = if self.burner { "New burner" } else { "New profile" };
+        egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -173,8 +230,16 @@ impl WizardUi {
 
     fn render_form(&mut self, ui: &mut egui::Ui, wctx: &WizardCtx) -> WizardOutcome {
         let mut outcome = WizardOutcome::None;
-        ui.heading("Create a new profile");
-        ui.label(format!("funded from '{}' (the active profile's account)", wctx.source_account));
+        if self.burner {
+            ui.heading("Create a burner");
+            ui.label("externally funded — nothing is transferred from your profiles");
+        } else {
+            ui.heading("Create a new profile");
+            ui.label(format!(
+                "funded from '{}' (the active profile's account)",
+                wctx.source_account
+            ));
+        }
         if let Some(err) = &self.error {
             ui.colored_label(egui::Color32::RED, err.as_str());
         }
@@ -206,8 +271,20 @@ impl WizardUi {
             }
             ui.end_row();
 
-            ui.label("fund (STRK)");
-            ui.text_edit_singleline(&mut self.fund_strk);
+            ui.label(if self.burner { "deposit target (STRK)" } else { "fund (STRK)" });
+            ui.horizontal(|ui| {
+                if ui.text_edit_singleline(&mut self.fund_strk).changed() {
+                    self.fund_touched = true;
+                }
+                if self.fund_strk.trim().is_empty() {
+                    let note = if self.recommend_rx.is_some() {
+                        "fetching live estimate…"
+                    } else {
+                        "(live estimate)"
+                    };
+                    ui.colored_label(ui.visuals().weak_text_color(), note);
+                }
+            });
             ui.end_row();
         });
 
@@ -289,13 +366,22 @@ impl WizardUi {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 40.0])
             .open(&mut open)
             .show(wctx.egui_ctx, |ui| {
-                ui.label(format!(
-                    "Create account '{account}', fund it with {n} STRK from '{source}'\
-                     {source_gloss}, deploy it, and register '{handle}'? \
-                     The {n} STRK moves to the new account — it stays yours. \
-                     Fees ≈ under 1 STRK."
-                ));
-                if !payer_is_active {
+                if self.burner {
+                    ui.label(format!(
+                        "Create account '{account}'? Funding is external: the app will show a \
+                         deposit address and wait until it holds {n} STRK — nothing is \
+                         transferred from your profiles. Deploy and registering '{handle}' are \
+                         then paid by the burner itself. Fees ≈ under 1 STRK of the deposit."
+                    ));
+                } else {
+                    ui.label(format!(
+                        "Create account '{account}', fund it with {n} STRK from '{source}'\
+                         {source_gloss}, deploy it, and register '{handle}'? \
+                         The {n} STRK moves to the new account — it stays yours. \
+                         Fees ≈ under 1 STRK."
+                    ));
+                }
+                if !self.burner && !payer_is_active {
                     ui.colored_label(
                         egui::Color32::from_rgb(200, 140, 40),
                         format!(
@@ -363,6 +449,35 @@ impl WizardUi {
             ui.label("working…");
             return outcome;
         }
+        // Parked at an unfunded external Fund step: show the deposit card
+        // instead of a plain Resume row. Parked implies not running (the
+        // worker returned), so this holds no lock — Refresh is gated on
+        // `!session_busy` just like Resume.
+        if let Some(a) = &flow.awaiting {
+            ui.separator();
+            ui.label("waiting for an external deposit:");
+            ui.horizontal(|ui| {
+                ui.monospace(&a.address);
+                if ui.button("copy").clicked() {
+                    ui.ctx().copy_text(a.address.clone());
+                }
+            });
+            let balance_strk = a.balance_fri / 1_000_000_000_000_000_000;
+            ui.label(format!(
+                "target {} STRK — current balance ~{balance_strk} STRK",
+                a.target_strk
+            ));
+            ui.label("fund it from outside your own accounts to keep the burner unlinkable");
+            ui.horizontal(|ui| {
+                if !wctx.session_busy && ui.button("Refresh").clicked() {
+                    self.request_resume(wctx);
+                }
+                if ui.button("Close").clicked() {
+                    outcome = WizardOutcome::Cancelled;
+                }
+            });
+            return outcome;
+        }
         // Not running and not complete → offer a resume. `request_resume`
         // routes through the confirm dialog whenever Fund is still pending,
         // so no spend ever starts without it.
@@ -394,7 +509,10 @@ impl WizardUi {
     }
 
     fn request_resume(&mut self, wctx: &WizardCtx) {
-        if self.fund_done() {
+        // External mode never transfers, so a parked/failed external run
+        // resumes without the spend confirm; Transfer mode keeps the gate
+        // until Fund is checkpointed done.
+        if self.fund_done() || self.fund_mode == zkmsg_core::setup::FundMode::External {
             self.spawn(wctx);
         } else {
             // Money has not moved — re-gate on the confirm dialog.
@@ -432,13 +550,23 @@ impl WizardUi {
                         return;
                     }
                 };
-                let s = SetupState::new_plan(
-                    self.name.trim().to_string(),
-                    self.handle.trim().to_string(),
-                    self.account_name.trim().to_string(),
-                    fund,
-                    wctx.source_account.to_string(),
-                );
+                let s = if self.burner {
+                    SetupState::new_plan_external_burner(
+                        self.name.trim().to_string(),
+                        self.handle.trim().to_string(),
+                        self.account_name.trim().to_string(),
+                        fund,
+                        self.reply_handle.clone(),
+                    )
+                } else {
+                    SetupState::new_plan(
+                        self.name.trim().to_string(),
+                        self.handle.trim().to_string(),
+                        self.account_name.trim().to_string(),
+                        fund,
+                        wctx.source_account.to_string(),
+                    )
+                };
                 if let Err(e) = s.save(&dir) {
                     self.error = Some(format!("{e:#}"));
                     return;
