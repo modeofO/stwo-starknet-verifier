@@ -43,6 +43,11 @@ pub struct ZkmsgApp {
     /// scope profile creation/switching, and by the migration flow as the
     /// destination root (set to the launch path when migration is pending).
     root: Option<PathBuf>,
+    /// What `classify_home` said the root was, independent of the migration
+    /// flow's temporary `root` reassignment. Lets `MigrateAction::NotNow`
+    /// restore a genuine picker root (which also happened to have a legacy
+    /// sibling) rather than blanket-clearing to the static label.
+    classified_root: Option<PathBuf>,
     repo_root: PathBuf,
     profiles: Vec<ProfileEntry>,
     session: Option<ProfileSession>,
@@ -76,7 +81,9 @@ impl ZkmsgApp {
         is_default_home: bool,
     ) -> Self {
         let mut root = None;
+        let mut classified_root = None;
         let mut profiles = Vec::new();
+        let mut picker_error_init = None;
         let initial = match classify_home(&launch_path) {
             // A concrete home (or an empty one, where the Init onboarding
             // renders): open it directly, named by its handle.
@@ -88,12 +95,23 @@ impl ZkmsgApp {
             // neither resolves, stay unopened — the picker list renders.
             HomeKind::Root { root: r, current } => {
                 profiles = list_profiles(&r).unwrap_or_default();
-                let chosen = profile_override
-                    .as_ref()
-                    .map(|n| r.join(format!("{PROFILE_PREFIX}{n}")))
-                    .filter(|p| p.join("config.json").is_file())
-                    .or(current);
+                let (chosen, profile_error) = match &profile_override {
+                    Some(n) => {
+                        let dir = r.join(format!("{PROFILE_PREFIX}{n}"));
+                        if dir.join("config.json").is_file() {
+                            (Some(dir), None)
+                        } else {
+                            // Do NOT fall back to `current`: opening a
+                            // different profile than the one asked for is
+                            // worse than opening none.
+                            (None, Some(format!("--profile {n}: no such profile under {}", r.display())))
+                        }
+                    }
+                    None => (current, None),
+                };
+                classified_root = Some(r.clone());
                 root = Some(r);
+                picker_error_init = profile_error;
                 chosen.map(|dir| (dir_suffix_name(&dir), Home::new(dir)))
             }
         };
@@ -120,10 +138,11 @@ impl ZkmsgApp {
 
         Self {
             root,
+            classified_root,
             repo_root: repo_root(),
             profiles,
             session: None,
-            picker_error: None,
+            picker_error: picker_error_init,
             initial,
             migration,
             wizard: None,
@@ -216,9 +235,7 @@ impl ZkmsgApp {
                             .unwrap_or(false);
                         ui.horizontal(|ui| {
                             let selected = entry.name == active_name;
-                            // Task 8 replaces `&entry.name` with a name+handle
-                            // picker_label helper; inline until then.
-                            if ui.selectable_label(selected, &entry.name).clicked() && !selected {
+                            if ui.selectable_label(selected, picker_label(entry)).clicked() && !selected {
                                 action = PickerAction::Switch(entry.name.clone(), entry.dir.clone());
                             }
                             if is_burner && ui.small_button("retire…").clicked() {
@@ -264,8 +281,17 @@ impl ZkmsgApp {
         // A switch that failed to persist `current` leaves the old session
         // active, so surface its error next to the picker rather than in the
         // no-session central panel (which this frame won't render).
+        let mut dismiss = false;
         if let Some(err) = &self.picker_error {
-            ui.colored_label(egui::Color32::RED, err.as_str());
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::RED, err.as_str());
+                if ui.small_button("\u{2715}").clicked() {
+                    dismiss = true;
+                }
+            });
+        }
+        if dismiss {
+            self.picker_error = None;
         }
         action
     }
@@ -356,13 +382,14 @@ impl ZkmsgApp {
             // Fall through to pre-migration behavior: `initial` opens the
             // legacy home directly on the next frame (it still classifies as
             // a Profile), exactly as if migration had never been detected.
-            // Migration detection is the only thing that set `root` to the
-            // launch path (a legacy default-home launch has `root = None`), so
-            // clearing it restores the static top-bar label — no picker or
-            // "New profile…" over an un-migrated root.
             MigrateAction::NotNow => {
                 self.migration = None;
-                self.root = None;
+                // Restore what classification said, not blanket None: a
+                // genuine Root that ALSO had a legacy sibling detected keeps
+                // its picker; only a legacy-Profile launch (where migration
+                // detection was the sole reason root was set) reverts to the
+                // static label.
+                self.root = self.classified_root.clone();
             }
             MigrateAction::Migrate => self.run_migration(ctx),
         }
@@ -556,8 +583,17 @@ impl eframe::App for ZkmsgApp {
             None => {
                 ui.vertical_centered(|ui| {
                     ui.label("no profile selected");
+                    let mut dismiss = false;
                     if let Some(err) = &self.picker_error {
-                        ui.colored_label(egui::Color32::RED, err.as_str());
+                        ui.horizontal(|ui| {
+                            ui.colored_label(egui::Color32::RED, err.as_str());
+                            if ui.small_button("\u{2715}").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    }
+                    if dismiss {
+                        self.picker_error = None;
                     }
                     for entry in &self.profiles {
                         if entry.setup_incomplete {
@@ -575,7 +611,7 @@ impl eframe::App for ZkmsgApp {
                                     entry.name
                                 )),
                             );
-                        } else if ui.button(&entry.name).clicked() {
+                        } else if ui.button(picker_label(entry)).clicked() {
                             open_request = Some((entry.name.clone(), Home::new(entry.dir.clone())));
                         }
                     }
@@ -644,6 +680,15 @@ impl eframe::App for ZkmsgApp {
                 }
             }
         }
+    }
+}
+
+/// Picker label: `name (handle)` when a registered handle differs from
+/// the profile name — e.g. a renamed dir — else just the name.
+fn picker_label(entry: &ProfileEntry) -> String {
+    match &entry.handle {
+        Some(h) if h != &entry.name => format!("{} ({h})", entry.name),
+        _ => entry.name.clone(),
     }
 }
 
