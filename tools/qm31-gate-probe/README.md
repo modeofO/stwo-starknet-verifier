@@ -25,6 +25,15 @@ libfuncs; only a real gateway declare is.
 gateway error, gate unchanged. **Third probe 2026-07-05 (later still):
 rejected again**, same error.
 
+**Re-tested 2026-07-08: rejected**, same gateway error. Also checked
+upstream `starkware-libs/cairo` `main` that day: the qm31 libfuncs
+appear only in `all.json` — absent from BOTH `audited.json` and
+`experimental.json` — so no scarb/compiler upgrade (released or
+imminent) changes the outcome; the unlock is StarkWare auditing the
+libfuncs and the gateway accepting them, i.e. a network-side change.
+Local sequencers (devnet, and katana likewise) execute qm31 happily
+and remain non-oracles for deployability.
+
 ## snforge executes qm31 (measured 2026-07-05)
 
 `snforge test` in this package runs two probes
