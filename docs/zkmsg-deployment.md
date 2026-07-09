@@ -81,6 +81,44 @@ remain on `funded-deployer`. The CLI survived the refactor byte-identical
 (hard parity gate); the GUI adds nothing to the trust surface — same
 pipeline, same checkpoints, same pre-spend gates.
 
+## Profiles + the identity wizard (2026-07-08, first wizard-born sender)
+
+The GUI gained in-app profiles (root `~/.zkmsg/` of `.zkmsg-<name>/`
+homes + `current`; alice and bob migrated by atomic rename via the
+one-time migration screen) and a one-confirm identity wizard. `carol`
+was created entirely in-app — account `zkmsg-carol`
+(`0x012466d1…f80`), funded 60 STRK from alice, deployed, scan-keygen'd,
+registered at leaf 2 — for 0.35 STRK of fees on top of the retained
+funding:
+
+| wizard leg | tx | fee |
+|---|---|---|
+| fund (60 STRK from alice) | `0x049be4d1…8b39` | 0.05 STRK |
+| deploy account | `0x042c0d7e…0eba` | 0.07 STRK |
+| register `carol` (leaf 2) | `0x03451d68…072f` | 0.23 STRK |
+
+Carol's first send (id `1d0acab64b`, carol → alice, message #4) also
+proved the checkpoint system on a REAL failure: Sepolia gas was at
+~43.9 Gfri (~1.5× the first send's price), so after phase 1 landed,
+phase 2's worst-case resource bounds (~44 STRK) exceeded carol's
+remaining 33.3 STRK and validation refused the tx — nothing burned. A
+25 STRK top-up + one Resume click re-entered at phase 2 without
+re-paying anything:
+
+| send leg | tx | fee |
+|---|---|---|
+| stage tail (71 slots) | `0x065900fd…693e` | 1.07 STRK |
+| verify_phase1 (864.4M l2_gas) | `0x06bbcfb6…e64b` | 25.31 STRK |
+| verify_phase2 → fact (799.2M l2_gas) | `0x0358f27b…fec5` | 23.39 STRK |
+| send_message | `0x0700a0d4…2ef2` | 0.08 STRK |
+
+**fact `0x18dbb303f3ba506b5e8da3ccc614c896c60e55d12d44dfde455b57f1f00305a`
+— `is_valid == true` on the live registry**; alice trial-decrypted
+"first message from carol to alice". Send total 49.9 STRK at spiky
+prices — the flat-cost claim holds at the fourth data point. Known
+follow-up: the wizard's 60-STRK default funding is thin at elevated
+gas; scale it by live prices.
+
 ## What this demonstrates
 
 - Lane 1 verifies arbitrary app circuits TODAY — including `ec_op`-using

@@ -65,8 +65,25 @@ to the pre-refactor tool), `zkmsg-gui` (egui/eframe; the pipeline runs on
 a worker thread feeding an `mpsc` channel — the UI thread never blocks on
 RPC or subprocesses, and no async runtime is involved).
 
+**Profiles (2026-07-08):** `~/.zkmsg` is a profile root — one
+`.zkmsg-<name>/` dir per identity plus a `current` pointer — and the
+GUI switches identities in-app from a top-bar picker (window title
+always names the active profile; switching is blocked while paid work
+runs). First launch offers a one-time migration of legacy homes
+(atomic renames only; nothing is copied, deleted, or overwritten).
+**New profile…** creates a funded identity in one confirm:
+`sncast account create` → STRK transfer from the active profile →
+deploy → init → register, as a checkpointed checklist that resumes
+after failures without re-paying landed steps (the Fund step
+balance-checks so a resume can never double-transfer). The CLI follows
+the layout transparently: profile dirs passed to `--home` work
+unchanged; the bare default resolves through `current`.
+
 First GUI-driven send shipped 2026-07-07 (fact `0x5b824d25…f6e25`,
-47.2 STRK): see `docs/zkmsg-deployment.md`.
+47.2 STRK); first wizard-born identity (carol) created, funded and
+registered in-app 2026-07-08, and her first send (fact
+`0x18dbb303…305a`) survived a real mid-send balance stall via
+top-up + Resume: see `docs/zkmsg-deployment.md`.
 
 ## What's public, what's private (v1, honest)
 
