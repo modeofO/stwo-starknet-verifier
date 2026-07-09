@@ -532,10 +532,17 @@ impl eframe::App for ZkmsgApp {
             }
         }
 
-        // The app-level spend lock: a wizard actively spending. Suppresses
-        // the pending-send banner's Resume and disables the Compose spend
-        // buttons, so no paid pipeline races the wizard's funding transfer.
-        let locked = self.wizard.as_ref().is_some_and(|w| w.running());
+        // The app-level spend lock: a wizard actively spending OR a retire
+        // sweep waiting on its receipt. Suppresses the pending-send banner's
+        // Resume and disables the Compose spend buttons (and Register), so no
+        // paid pipeline races the wizard's funding transfer — or a sweep
+        // draining the very burner account a new send would spend from
+        // (reachable via the post-send offer: sweep starts → "Compose
+        // another" → Send). Computed while `retire` is still in `self`; the
+        // dialog's own buttons gate on the separate session+wizard-only
+        // `paid_elsewhere`, so this cannot deadlock the dialog itself.
+        let locked = self.wizard.as_ref().is_some_and(|w| w.running())
+            || self.retire.as_ref().is_some_and(|r| r.sweeping());
         if let Some(session) = &mut self.session {
             session.pending_banner(ctx, locked);
         }
