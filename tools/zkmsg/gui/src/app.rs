@@ -5,7 +5,7 @@
 //! it is a static name label. When no profile is open (a profile root with no
 //! `current`) the central panel lists the discovered profiles as buttons.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
@@ -16,6 +16,7 @@ use zkmsg_core::profiles::{
 };
 
 use crate::migrate_view::{self, MigrateAction, MigrationUi};
+use crate::retire_view::{RetireOutcome, RetireUi};
 use crate::session::{ProfileSession, Tab};
 use crate::wizard_view::{WizardCtx, WizardOutcome, WizardUi};
 
@@ -31,6 +32,8 @@ enum PickerAction {
     /// Resume an incomplete profile's setup wizard (from its checkpoint dir;
     /// the name is read back from `setup.json`).
     Resume(PathBuf),
+    /// Retire a burner profile (open the sweep + archive dialog).
+    Retire(String, PathBuf),
 }
 
 pub struct ZkmsgApp {
@@ -59,6 +62,11 @@ pub struct ZkmsgApp {
     /// (which supplies the funding source account); `running()` folds into
     /// the app-level in-flight guard.
     wizard: Option<WizardUi>,
+
+    /// The burner-retirement dialog, when open. Owned here (not on the
+    /// session) because a successful archive drops the very session it may
+    /// have been opened from; its sweep folds into `work_in_flight`.
+    retire: Option<RetireUi>,
 }
 
 impl ZkmsgApp {
@@ -119,6 +127,7 @@ impl ZkmsgApp {
             initial,
             migration,
             wizard: None,
+            retire: None,
         }
     }
 
@@ -128,6 +137,7 @@ impl ZkmsgApp {
     fn work_in_flight(&self) -> bool {
         self.session.as_ref().is_some_and(|s| s.work_in_flight())
             || self.wizard.as_ref().is_some_and(|w| w.running())
+            || self.retire.as_ref().is_some_and(|r| r.sweeping())
     }
 
     /// Opens `home` as the active session and retitles the window to name
@@ -198,10 +208,23 @@ impl ZkmsgApp {
                             }
                             continue;
                         }
-                        let selected = entry.name == active_name;
-                        if ui.selectable_label(selected, &entry.name).clicked() && !selected {
-                            action = PickerAction::Switch(entry.name.clone(), entry.dir.clone());
-                        }
+                        // A burner entry gets a small "retire…" button beside
+                        // its row; the config read is a cheap local fs read.
+                        let is_burner = Home::new(entry.dir.clone())
+                            .load_config()
+                            .map(|c| c.burner)
+                            .unwrap_or(false);
+                        ui.horizontal(|ui| {
+                            let selected = entry.name == active_name;
+                            // Task 8 replaces `&entry.name` with a name+handle
+                            // picker_label helper; inline until then.
+                            if ui.selectable_label(selected, &entry.name).clicked() && !selected {
+                                action = PickerAction::Switch(entry.name.clone(), entry.dir.clone());
+                            }
+                            if is_burner && ui.small_button("retire…").clicked() {
+                                action = PickerAction::Retire(entry.name.clone(), entry.dir.clone());
+                            }
+                        });
                     }
                     ui.separator();
                     // New profile needs a funded source account (the active
@@ -382,6 +405,45 @@ impl ZkmsgApp {
             }
         }
     }
+
+    /// Sweep targets for retiring `exclude`: every other complete profile
+    /// whose config + account address resolve. The retiring burner's
+    /// `reply_handle` profile (its creator) sorts first, so it is the
+    /// default selection — spec: "default: the profile named by
+    /// reply_handle, else first non-burner".
+    fn retire_targets(&self, exclude: &str, exclude_dir: &Path) -> Vec<(String, String)> {
+        let reply = Home::new(exclude_dir.to_path_buf())
+            .load_config()
+            .ok()
+            .and_then(|c| c.reply_handle);
+        let mut targets: Vec<(String, String)> = self
+            .profiles
+            .iter()
+            .filter(|p| !p.setup_incomplete && p.name != exclude)
+            .filter_map(|p| {
+                let config = Home::new(p.dir.clone()).load_config().ok()?;
+                let address = zkmsg_core::chain::account_address(&config.account).ok()?;
+                Some((p.name.clone(), address))
+            })
+            .collect();
+        // Creator first (matched by profile name OR cached handle), then
+        // non-burners before burners, then name order (list is name-sorted
+        // already, and the sort is stable).
+        targets.sort_by_key(|(name, _)| {
+            let is_reply = reply.as_deref() == Some(name.as_str())
+                || self.profiles.iter().any(|p| {
+                    p.name == *name && p.handle.as_deref() == reply.as_deref() && reply.is_some()
+                });
+            let is_burner = Home::new(
+                self.profiles.iter().find(|p| p.name == *name).map(|p| p.dir.clone()).unwrap_or_default(),
+            )
+            .load_config()
+            .map(|c| c.burner)
+            .unwrap_or(false);
+            (!is_reply, is_burner)
+        });
+        targets
+    }
 }
 
 impl eframe::App for ZkmsgApp {
@@ -463,6 +525,11 @@ impl eframe::App for ZkmsgApp {
                 }
                 Err(e) => self.picker_error = Some(e),
             },
+            PickerAction::Retire(name, dir) => {
+                self.picker_error = None;
+                let targets = self.retire_targets(&name, &dir);
+                self.retire = Some(RetireUi::new(name, dir, targets));
+            }
         }
 
         // The app-level spend lock: a wizard actively spending. Suppresses
@@ -512,6 +579,23 @@ impl eframe::App for ZkmsgApp {
             self.open_session(ctx, name, home);
         }
 
+        // The post-send "Sweep & archive this burner…" button set an offer
+        // flag on the session; drain it and open the retire dialog (once,
+        // and only under a root — a bare-profile launch has no archive dir).
+        if self.session.as_ref().is_some_and(|s| s.retire_offer) {
+            if let Some(s) = &mut self.session {
+                s.retire_offer = false;
+            }
+            if self.retire.is_none() && self.root.is_some() {
+                let (name, dir) = {
+                    let s = self.session.as_ref().unwrap();
+                    (s.name.clone(), s.home_dir())
+                };
+                let targets = self.retire_targets(&name, &dir);
+                self.retire = Some(RetireUi::new(name, dir, targets));
+            }
+        }
+
         // The wizard floats over whatever the session rendered; drive it after
         // the central panel so its window lands on top.
         if self.wizard.is_some() {
@@ -520,6 +604,38 @@ impl eframe::App for ZkmsgApp {
 
         if let Some(session) = &self.session {
             session.tick_repaint(ctx);
+        }
+
+        // Drive the retire dialog last, over everything. `app_busy` here MUST
+        // exclude the retire's own sweep — folding `work_in_flight()` in whole
+        // (which now counts retire.sweeping()) would disable the dialog's own
+        // buttons and never process the sweep's completion, deadlocking it.
+        // Snapshot only the session+wizard paid work before the take.
+        if let Some(mut retire) = self.retire.take() {
+            let paid_elsewhere = self.session.as_ref().is_some_and(|s| s.work_in_flight())
+                || self.wizard.as_ref().is_some_and(|w| w.running());
+            retire.app_busy = paid_elsewhere;
+            let Some(root) = self.root.clone() else {
+                // No root (bare-profile launch) — retirement needs the
+                // archive dir under a root; drop the dialog.
+                self.retire = None;
+                return;
+            };
+            match retire.update(ctx, &root) {
+                RetireOutcome::None => self.retire = Some(retire),
+                RetireOutcome::Cancelled => {}
+                RetireOutcome::Archived { name } => {
+                    if self.session.as_ref().is_some_and(|s| s.name == name) {
+                        // The archived profile was active: drop the session;
+                        // the no-session picker panel renders (a dangling
+                        // `current` already falls back to the picker on
+                        // relaunch — same behavior, live).
+                        self.session = None;
+                    }
+                    self.profiles =
+                        self.root.as_deref().map(list_profiles).and_then(Result::ok).unwrap_or_default();
+                }
+            }
         }
     }
 }

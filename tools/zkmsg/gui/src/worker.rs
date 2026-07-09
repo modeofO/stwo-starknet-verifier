@@ -195,6 +195,47 @@ pub fn spawn_register(
     rx
 }
 
+/// Burner retirement: a read-only balance probe and the paid sweep.
+pub enum RetireWorkerMsg {
+    Balance(Result<u128, String>),
+    Swept(Result<(String, u128), String>),
+}
+
+/// Read-only: the burner profile's own account balance in fri.
+pub fn spawn_retire_balance(home_dir: PathBuf, ctx: egui::Context) -> Receiver<RetireWorkerMsg> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let result = (|| {
+            let config = Home::new(home_dir).load_config().map_err(|e| format!("{e:#}"))?;
+            let chain = Chain::new(&config.rpc_url, &config.account);
+            let address =
+                zkmsg_core::chain::account_address(&config.account).map_err(|e| format!("{e:#}"))?;
+            zkmsg_core::setup::read_balance_fri(&chain, &address).map_err(|e| format!("{e:#}"))
+        })();
+        let _ = tx.send(RetireWorkerMsg::Balance(result));
+        ctx.request_repaint();
+    });
+    rx
+}
+
+/// Paid: sweep (balance - headroom) to `to_address` and wait the receipt.
+pub fn spawn_sweep(
+    home_dir: PathBuf,
+    to_address: String,
+    ctx: egui::Context,
+) -> Receiver<RetireWorkerMsg> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let result = (|| {
+            let config = Home::new(home_dir).load_config().map_err(|e| format!("{e:#}"))?;
+            app::sweep_strk(&config, &to_address).map_err(|e| format!("{e:#}"))
+        })();
+        let _ = tx.send(RetireWorkerMsg::Swept(result));
+        ctx.request_repaint();
+    });
+    rx
+}
+
 pub enum InboxWorkerMsg {
     Scan(Result<Vec<ReceivedMessage>, String>),
 }

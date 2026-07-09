@@ -388,6 +388,12 @@ impl ProfileSession {
         if is_done && ui.button("Compose another").clicked() {
             self.reset_compose();
         }
+        if is_done
+            && self.config.as_ref().is_some_and(|c| c.burner)
+            && ui.button("Sweep & archive this burner…").clicked()
+        {
+            self.retire_offer = true;
+        }
     }
 }
 

@@ -3,6 +3,7 @@ mod compose_view;
 mod fromline;
 mod inbox_view;
 mod migrate_view;
+mod retire_view;
 mod send_flow;
 mod session;
 mod setup_flow;

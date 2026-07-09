@@ -102,6 +102,11 @@ pub struct ProfileSession {
     /// completes/fails — drives the resume banner. Never rescanned
     /// per-frame.
     pub(crate) pending: Vec<(String, StepKind)>,
+
+    /// Set by the post-send "Sweep & archive this burner…" button, drained
+    /// by the app to open the retire dialog. Lives here (not compose state)
+    /// because the app owns the dialog, which outlives this session.
+    pub(crate) retire_offer: bool,
 }
 
 impl ProfileSession {
@@ -142,6 +147,7 @@ impl ProfileSession {
             send_rx: None,
             send_state_id: None,
             pending,
+            retire_offer: false,
         }
     }
 
