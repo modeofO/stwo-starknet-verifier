@@ -266,6 +266,39 @@ pub fn account_balance_strk(chain: &Chain, config: &Config) -> Result<u128> {
     Ok(low / 1_000_000_000_000_000_000)
 }
 
+/// Fri retained on a swept account to cover the transfer's own fee
+/// (measured transfers cost ~0.05 STRK; 0.2 is generous, and the dust
+/// left behind is the price of never under-providing the fee).
+pub const SWEEP_HEADROOM_FRI: u128 = 200_000_000_000_000_000;
+
+/// How much a sweep can move: balance minus headroom, `None` when the
+/// balance doesn't exceed the headroom (nothing worth sweeping).
+pub fn sweep_amount_fri(balance_fri: u128, headroom_fri: u128) -> Option<u128> {
+    (balance_fri > headroom_fri).then(|| balance_fri - headroom_fri)
+}
+
+/// Sweeps (balance - headroom) STRK from `config.account` (the burner)
+/// to `to_address`, waiting for the receipt. Returns (tx_hash, swept
+/// fri). Blocking (invoke + receipt wait) — worker threads only.
+///
+/// The caller's UI must have shown the linking warning: this transfer
+/// is a public on-chain edge from the burner to the target.
+pub fn sweep_strk(config: &Config, to_address: &str) -> Result<(String, u128)> {
+    let chain = Chain::new(&config.rpc_url, &config.account);
+    let own_address = account_address(&config.account)?;
+    let balance = crate::setup::read_balance_fri(&chain, &own_address)?;
+    let amount = sweep_amount_fri(balance, SWEEP_HEADROOM_FRI)
+        .with_context(|| format!("balance {balance} fri does not exceed the fee headroom"))?;
+    let tx = chain.invoke(
+        STRK_TOKEN,
+        "transfer",
+        &[to_address.to_string(), format!("{amount:#x}"), "0x0".into()],
+        &Default::default(),
+    )?;
+    chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
+    Ok((tx, amount))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +307,13 @@ mod tests {
         assert_eq!(short_string_felt("zkmsg").unwrap(),
             starknet_types_core::felt::Felt::from_hex("0x7a6b6d7367").unwrap());
         assert!(short_string_felt("x".repeat(40).as_str()).is_err());
+    }
+    #[test]
+    fn sweep_amount_leaves_headroom() {
+        let one = 1_000_000_000_000_000_000u128;
+        assert_eq!(sweep_amount_fri(10 * one, one / 5), Some(10 * one - one / 5));
+        assert_eq!(sweep_amount_fri(one / 5, one / 5), None); // exactly headroom: nothing to sweep
+        assert_eq!(sweep_amount_fri(0, one / 5), None);
     }
     #[test]
     fn pending_sends_reads_incomplete_only() {

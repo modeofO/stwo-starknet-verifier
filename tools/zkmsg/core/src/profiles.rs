@@ -215,6 +215,29 @@ pub fn execute_migration(moves: &[MigrationMove]) -> Result<()> {
     Ok(())
 }
 
+/// Retired (archived) profiles live under `root/archive/` — invisible to
+/// `list_profiles` (which only matches `.zkmsg-*` direct children) but
+/// fully intact: moving the dir back restores the profile, keys and all.
+pub const ARCHIVE_DIR: &str = "archive";
+
+/// Archives `root/.zkmsg-<name>` to `root/archive/.zkmsg-<name>` by
+/// rename only — never copy, never delete; keys are irreplaceable. A
+/// collision (even a dangling symlink) refuses before any move.
+pub fn archive_profile(root: &Path, name: &str) -> Result<PathBuf> {
+    let from = root.join(format!("{PROFILE_PREFIX}{name}"));
+    ensure!(from.is_dir(), "no profile dir at {}", from.display());
+    let to = root.join(ARCHIVE_DIR).join(format!("{PROFILE_PREFIX}{name}"));
+    ensure!(
+        to.symlink_metadata().is_err(),
+        "archive target {} already exists — refusing to overwrite",
+        to.display()
+    );
+    fs::create_dir_all(root.join(ARCHIVE_DIR))?;
+    fs::rename(&from, &to)
+        .with_context(|| format!("archiving {} -> {}", from.display(), to.display()))?;
+    Ok(to)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +369,26 @@ mod tests {
         assert!(from.join("config.json").exists());
         assert!(to.symlink_metadata().is_ok());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn archive_moves_profile_out_of_picker_keys_intact() {
+        let root = tmp("archive");
+        mk_profile(&root.join(".zkmsg-burner-aa11bb"), Some("burner-aa11bb"));
+        assert_eq!(list_profiles(&root).unwrap().len(), 1);
+        let to = archive_profile(&root, "burner-aa11bb").unwrap();
+        // Gone from the picker, present (renamed, keys intact) under archive/.
+        assert!(list_profiles(&root).unwrap().is_empty());
+        assert_eq!(to, root.join("archive/.zkmsg-burner-aa11bb"));
+        assert!(to.join("keys.json").exists());
+        assert!(to.join("config.json").exists());
+        // Archiving a missing profile errors.
+        assert!(archive_profile(&root, "burner-aa11bb").is_err());
+        // A collision in archive/ refuses and leaves the source untouched.
+        mk_profile(&root.join(".zkmsg-burner-aa11bb"), Some("again"));
+        assert!(archive_profile(&root, "burner-aa11bb").is_err());
+        assert!(root.join(".zkmsg-burner-aa11bb/keys.json").exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
