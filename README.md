@@ -299,8 +299,15 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   rename-only migration) and one-confirm funded-identity creation
   (create/fund/deploy/init/register, checkpointed + resumable) — first
   wizard-born identity `carol` sent fact `0x18dbb303…305a`, surviving
-  a real mid-send balance stall via Resume. Suites: store 12/12,
-  zkmsg-core 39/39 + gui 5/5, blake 5/5, poseidon 30/30.
+  a real mid-send balance stall via Resume. Burners (2026-07-10):
+  externally-funded throwaway senders — the wizard parks lock-free
+  awaiting a deposit (target priced from live gas), the user's own
+  accounts never sign, an optional encrypted `from:` line preserves
+  replyability, and retirement sweeps (with an explicit linking
+  warning) + archives by rename. First burner send: fact
+  `0x4535d688…c46a`, whole loop deposit→send→sweep. Suites: store
+  12/12, zkmsg-core 47/47 + gui 9/9 + cli 1/1, blake 5/5,
+  poseidon 30/30.
 - **Next:** the qm31 gate-probe re-test on Starknet version bumps (the
   only blocker for the public network), the messagezk-circuit sizing
   pass (re-run `prove-blake` + the devnet drive on the real circuit;

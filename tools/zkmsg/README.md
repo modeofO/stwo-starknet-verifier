@@ -79,11 +79,30 @@ balance-checks so a resume can never double-transfer). The CLI follows
 the layout transparently: profile dirs passed to `--home` work
 unchanged; the bare default resolves through `current`.
 
+**Burners (2026-07-10):** `New burner…` creates a throwaway sender —
+auto-named `burner-<hex>` from OS randomness, **externally funded**:
+the wizard parks at the Fund step showing a deposit address and a
+funding target computed from live gas prices (the flat default died
+with carol's stall), and none of your existing accounts ever signs
+anything for it. While parked it holds no lock — switch profiles,
+read inboxes, come back and hit Refresh when the deposit lands.
+Compose from a burner offers an optional `from:` line inside the
+encrypted plaintext (only the recipient sees it — that's how they
+know who to reply to); after the send, a retire prompt optionally
+sweeps the leftover STRK to another profile (**with an explicit
+warning: the sweep is a public on-chain edge linking the burner to
+the target**) and archives the profile by rename into
+`~/.zkmsg/archive/` — keys are never deleted; un-archive by moving
+the dir back.
+
 First GUI-driven send shipped 2026-07-07 (fact `0x5b824d25…f6e25`,
 47.2 STRK); first wizard-born identity (carol) created, funded and
 registered in-app 2026-07-08, and her first send (fact
 `0x18dbb303…305a`) survived a real mid-send balance stall via
-top-up + Resume: see `docs/zkmsg-deployment.md`.
+top-up + Resume; first burner (`burner-7ec070`) ran the full
+unlinkable loop 2026-07-10 — external deposit, send to alice (fact
+`0x4535d688…c46a`), sweep + archive: see
+`docs/zkmsg-deployment.md`.
 
 ## What's public, what's private (v1, honest)
 
@@ -92,9 +111,20 @@ top-up + Resume: see `docs/zkmsg-deployment.md`.
   message is for, or that any particular registered user received one.
   Recipients find their mail by trial-ECDH against every envelope; that
   asymmetry is the anonymity.
-- **Public**: that YOUR account sent something (the send + verify txs are
-  yours — same as messagezk's live V1; burner accounts are the shared V2
-  fix), the registered-user set, and timing.
+- **Public**: that *some* registered account sent something, the
+  registered-user set, and timing. With a normal profile that account
+  is YOURS (same as messagezk's live V1). With a **burner** (shipped
+  2026-07-10) the sending account is a fresh, externally-funded
+  throwaway with no on-chain edge to any account you own — the app
+  never draws one; only an optional post-use sweep does, and it warns
+  first.
+- **Burner caveats, honestly**: the anonymity set is the registered-user
+  count (tiny on Sepolia); timing correlates (a registration shortly
+  before a send); reusing a burner links its sends to each other; the
+  `from:` line is an UNAUTHENTICATED claim — any sender can write
+  `from: alice`, and the inbox chip renders whatever the plaintext
+  says. Fund a burner from your own account and you've drawn the very
+  edge it exists to avoid.
 - **Caveats**: scan-key compromise exposes past content (the
   double-ratchet layer is deferred); Stwo proofs are not formally ZK and
   ride in public calldata permanently — the scan key is the only

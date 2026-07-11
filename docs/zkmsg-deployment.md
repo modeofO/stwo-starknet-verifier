@@ -119,6 +119,41 @@ prices — the flat-cost claim holds at the fourth data point. Known
 follow-up: the wizard's 60-STRK default funding is thin at elevated
 gas; scale it by live prices.
 
+## Burners (2026-07-10, the first unlinkable sender)
+
+The GUI gained burner accounts: throwaway sender profiles with **no
+on-chain edge to any account the user owns**. `burner-7ec070`
+(auto-named from OS randomness, account
+`0x0733887f…600c`) was funded by an **external deposit** — the wizard
+parks at the Fund step (no lock held, app fully usable) until the
+address holds the target, which is now computed from live gas prices
+(79 STRK recommended at ~29 Gfri; the flat-60 default died with
+carol's stall). None of the user's accounts signed anything: deploy,
+register (leaf 4) and the whole send were paid by the burner itself.
+
+| leg | tx | fee |
+|---|---|---|
+| deploy account | `0x018235ea…1a88` | 0.07 STRK |
+| register `burner-7ec070` (leaf 4) | `0x0174b418…e884` | 0.24 STRK |
+| stage tail (96 slots) | `0x0587b90e…f10a` | 1.40 STRK |
+| verify_phase1 | `0x063611a7…880c` | 24.92 STRK |
+| verify_phase2 → fact | `0x06fd8a83…da01` | 23.16 STRK |
+| send_message | `0x03565291…c1e9` | 0.08 STRK |
+| sweep 49.94 STRK → `deployer` (bob) | `0x04f3a859…d7bb` | 0.04 STRK |
+
+**fact `0x4535d6880c0f959c7a1a1864173df3b2d22a699759648cee274c7ce1d88c46a`
+— `is_valid == true` on the live registry** (send id `eeca22558f`,
+burner → alice, carrying the optional encrypted `from:` line so alice
+knows who to reply to). Send total 49.9 STRK. After the send, one
+retire prompt swept the leftover 49.94 STRK out (the UI states
+verbatim that the sweep is a public linking edge — declining leaves
+the burner unlinkable) and archived the profile by rename to
+`~/.zkmsg/archive/.zkmsg-burner-7ec070/` — keys intact, restorable.
+
+Honest limits (also in the README): tiny anonymity set on Sepolia,
+timing correlation, burner reuse links its sends, and the `from:`
+line is an unauthenticated plaintext claim.
+
 ## What this demonstrates
 
 - Lane 1 verifies arbitrary app circuits TODAY — including `ec_op`-using
