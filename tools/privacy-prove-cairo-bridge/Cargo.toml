@@ -2,7 +2,7 @@
 name = "privacy-prove-cairo-bridge"
 version = "1.0.0"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 description = "Bridge: Cairo PIE -> privacy bootloader Stwo proof -> cairo-verifier circuit proof -> multiverifier proof -> felt252 cairo-serde for the on-chain Stwo circuit verifier"
 

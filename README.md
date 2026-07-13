@@ -345,5 +345,16 @@ scarb build
 
 ## License
 
-Apache-2.0. Vendored code is Copyright StarkWare Industries Ltd., also
-Apache-2.0.
+**Apache-2.0** (see [LICENSE](./LICENSE)) for all original code in this
+repository — Copyright (C) 2026 modus (see [NOTICE](./NOTICE)).
+Redistribution must retain the copyright notices, license, and NOTICE
+file (Apache-2.0 §4) — build on this freely, but don't republish it as
+your own.
+
+**Exception — `vendor/stwo_cairo_verifier/`:** vendored from
+[starkware-libs/stwo-cairo](https://github.com/starkware-libs/stwo-cairo)
+for build/measurement purposes. Upstream currently ships **no license
+file** (its sibling `stwo` repo is Apache-2.0); all rights to that code
+remain with StarkWare Industries Ltd., and this repository's license
+does **not** apply to that directory. The `.prover/` proving stack is
+not part of this repository (fetched by `scripts/setup-prover.sh`).
