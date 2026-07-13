@@ -3,7 +3,7 @@
 R&D: compiling StarkWare's [stwo-cairo](https://github.com/starkware-libs/stwo-cairo)
 **Stwo (Circle-STARK) verifier** as a **Starknet smart contract**, so proofs of
 custom Cairo programs — including browser-generated ones — can be verified
-on-chain by contract code. Nobody has shipped this as of July 2026.
+on-chain by contract code.
 
 Full background, constraints, and plan: [`stwostarknetverifierhandoff.md`](./stwostarknetverifierhandoff.md).
 Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
