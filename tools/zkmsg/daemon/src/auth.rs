@@ -35,13 +35,38 @@ pub fn load_or_create_token(home_dir: &Path) -> Result<(String, bool)> {
     }
     let token = generate_token();
     std::fs::create_dir_all(home_dir)?;
-    std::fs::write(&path, &token).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_token_file(&path, &token)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok((token, true))
+}
+
+/// Writes the token so it is never readable by other users, not even for the
+/// instant between create and chmod. On unix the file is created with mode 0600
+/// in one step (`create_new` also refuses to follow a pre-planted symlink);
+/// elsewhere a plain write is the best available.
+#[cfg(unix)]
+fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // create_new fails if the path exists; the caller only reaches here when no
+    // usable token was read, but a racing writer or a stale empty file is
+    // possible, so replace atomically via a fresh 0600 temp + rename.
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(token.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
+#[cfg(not(unix))]
+fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    std::fs::write(path, token)
 }
 
 /// True when the `Authorization` header value is exactly `Bearer <token>`.
