@@ -355,7 +355,7 @@ impl ProfileSession {
     fn register_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, locked: bool) {
         ui.heading("Register a handle");
         if let Some(scan_pub) = self.keys.as_ref().map(|k| k.scan_pub.clone()) {
-            ui.label(format!("scan pubkey: {scan_pub}"));
+            ui.label(format!("scan pubkey: {}", zkmsg_core::chain::felt_hex_grouped(&scan_pub)));
         }
         ui.horizontal(|ui| {
             ui.label("handle:");
@@ -444,7 +444,7 @@ impl ProfileSession {
             ui.end_row();
 
             ui.label("scan pubkey");
-            ui.label(report.scan_pub.as_deref().unwrap_or("-"));
+            ui.label(report.scan_pub.as_deref().map(zkmsg_core::chain::felt_hex_grouped).unwrap_or_else(|| "-".into()));
             ui.end_row();
 
             ui.label("account");

@@ -106,7 +106,7 @@ fn cmd_init(home: &Home, account: String, store: Option<String>) -> Result<()> {
     let config = home.load_config()?;
 
     println!("zkmsg home: {}", home.dir.display());
-    println!("scan pubkey: {}", felt_hex(&scan_pub));
+    println!("scan pubkey: {}", zkmsg_core::chain::felt_hex_grouped(&felt_hex(&scan_pub)));
     println!("account: {}", config.account);
     if config.store.is_empty() {
         println!("NOTE: no MessageStore address configured yet (set it in config.json)");
@@ -212,7 +212,7 @@ fn cmd_status(home: &Home) -> Result<()> {
         if report.store.is_empty() { "(not deployed)" } else { &report.store },
     );
     if let Some(scan_pub) = &report.scan_pub {
-        println!("scan pub : {scan_pub}");
+        println!("scan pub : {}", zkmsg_core::chain::felt_hex_grouped(scan_pub));
         match (&report.handle, report.leaf_index) {
             (Some(h), Some(i)) => println!("handle   : {h} (leaf {i})"),
             _ => println!("handle   : (not registered)"),

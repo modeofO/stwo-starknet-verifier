@@ -306,6 +306,21 @@ pub fn snkeccak(name: &str) -> Felt {
 
 // --- calldata serde helpers -------------------------------------------------
 
+/// Fixed-width read-aloud form of a felt: 64 hex digits, grouped in fours.
+/// Matches the iOS client's `HexDisplay` exactly — both clients must render a
+/// scan key identically or the read-aloud peer-verification flow stumbles on
+/// the first group (trimmed hex slides every group when leading zeros differ).
+pub fn felt_hex_grouped(hex_or_felt: &str) -> String {
+    let digits = hex_or_felt.trim_start_matches("0x");
+    let padded = format!("{digits:0>64}");
+    padded
+        .as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).expect("hex is ascii"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn felt_hex(f: &Felt) -> String {
     format!("{f:#x}")
 }
@@ -366,6 +381,18 @@ fn felt_from_be_bytes(bytes: &[u8]) -> Felt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn grouped_hex_matches_ios_fixed_width() {
+        // Same rendering rule as the iOS client's HexDisplay: 64 digits, so a
+        // felt shows at least one leading zero and every group stays aligned.
+        let g = felt_hex_grouped("0x361c1db");
+        assert_eq!(g.len(), 64 + 15); // 16 groups, 15 separators
+        assert!(g.starts_with("0000 0000"));
+        assert!(g.ends_with("0361 c1db"));
+        assert_eq!(felt_hex_grouped("361c1db"), felt_hex_grouped("0x361c1db"));
+    }
 
     #[test]
     fn parses_last_json_line() {
