@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "gui"]
+members = ["core", "cli", "gui", "daemon"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -17,3 +17,7 @@ rand = "0.8"
 hex = "0.4"
 sha3 = "0.10"
 clap = { version = "4", features = ["derive"] }
+# Blocking, threaded HTTP/1.1 server for the companion daemon. Chosen over
+# any async runtime because the send pipeline blocks on subprocess proving —
+# a thread-per-request model matches it (companion-protocol.md, "Server").
+tiny_http = "0.12"

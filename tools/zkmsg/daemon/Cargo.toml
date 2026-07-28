@@ -1,0 +1,25 @@
+[package]
+license = "Apache-2.0"
+name = "zkmsg-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zkmsgd"
+path = "src/main.rs"
+
+[lib]
+name = "zkmsg_daemon"
+
+[dependencies]
+# The whole daemon is a thin HTTP shell around this crate: prepare_send +
+# Pipeline::run with the daemon's own Home/Config/Keys.
+zkmsg-core = { path = "../core" }
+# Blocking, threaded HTTP server (see workspace comment on tiny_http).
+tiny_http.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+# Bearer-token generation (32 random bytes) and its hex encoding. Both are
+# already in the workspace tree via zkmsg-core; no new third-party crate.
+rand.workspace = true
+hex.workspace = true
