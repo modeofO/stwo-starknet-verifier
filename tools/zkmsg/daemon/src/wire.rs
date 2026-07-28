@@ -80,7 +80,7 @@ pub fn snapshot_step_json(step: &StepRecord) -> Value {
 pub fn health_json(
     chain_id: Option<&str>,
     handle: Option<&str>,
-    account_address: &str,
+    account_address: Option<&str>,
     store: &str,
     registry: &str,
     ready: bool,
@@ -89,6 +89,9 @@ pub fn health_json(
         "version": "1",
         "chain_id": chain_id,
         "handle": handle,
+        // null, never "", when there is no account — an empty string is not a
+        // felt, so a client that types this field as an optional felt would
+        // fail to decode "" (the not-ready state is exactly first pairing).
         "account_address": account_address,
         "store": store,
         "registry": registry,
@@ -195,15 +198,18 @@ mod tests {
 
     #[test]
     fn health_body_shape() {
-        let v = health_json(Some("0x534e5f5345504f4c4941"), Some("alice"), "0x073", "0x2d6", "0x194", true);
+        let v = health_json(Some("0x534e5f5345504f4c4941"), Some("alice"), Some("0x073"), "0x2d6", "0x194", true);
         assert_eq!(v["version"], "1");
         assert_eq!(v["chain_id"], "0x534e5f5345504f4c4941");
         assert_eq!(v["handle"], "alice");
         assert_eq!(v["ready"], true);
         // Unregistered / unknown chain id serialize as null.
-        let v = health_json(None, None, "0x0", "", "", false);
+        let v = health_json(None, None, None, "", "", false);
         assert_eq!(v["chain_id"], Value::Null);
         assert_eq!(v["handle"], Value::Null);
+        // No account serializes as null, never "" — a client typing this as an
+        // optional felt must be able to decode the not-ready state.
+        assert_eq!(v["account_address"], Value::Null);
         assert_eq!(v["ready"], false);
     }
 }

@@ -127,14 +127,14 @@ fn handle_health(app: &Arc<AppState>, request: Request) -> io::Result<()> {
     let keys = app.home.load_keys().ok();
     let handle = keys.as_ref().and_then(|k| k.handle.clone());
     let registered = keys.as_ref().and_then(|k| k.leaf_index).is_some();
-    let account_address = account_address(&app.config.account).unwrap_or_default();
+    let account_address = account_address(&app.config.account).ok();
     let chain_id = app.reads.chain_id().ok();
     let balance = app.reads.balance_strk().ok();
     let ready = readiness(registered, balance);
     let body = wire::health_json(
         chain_id.as_deref(),
         handle.as_deref(),
-        &account_address,
+        account_address.as_deref(),
         &app.config.store,
         &app.config.registry,
         ready,

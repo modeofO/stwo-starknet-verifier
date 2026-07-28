@@ -96,9 +96,11 @@ fn main() -> Result<()> {
 
 fn print_startup(addr: &str, token: &str, created: bool, token_file: &str) {
     println!("zkmsgd listening on http://{addr}/v1");
+    // The pairing base URL is the host root. The client owns the /v1 prefix, so
+    // a base URL that already ends in /v1 would double it.
     if created {
         println!("\n  PAIRING (shown once)");
-        println!("  base URL : http://{addr}/v1");
+        println!("  base URL : http://{addr}");
         println!("  token    : {token}");
         println!("  Enter both on the phone to pair. The token is stored at {token_file} (0600).");
     } else {
