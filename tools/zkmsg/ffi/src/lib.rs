@@ -185,13 +185,49 @@ struct SyncRequest {
     /// Defaults to the chain head.
     #[serde(default)]
     to_block: Option<u64>,
-    /// The feeder rate-limits per IP; 2 is the measured sustainable value.
+    /// The feeder's limiter punishes connection count before request rate;
+    /// one kept-alive, client-paced connection saturates the per-IP
+    /// allowance (measured ~12 blocks/s cold, ~10 paced).
     #[serde(default = "default_workers")]
     workers: usize,
+    /// Handles to also return Merkle paths for. One sync pass serves the
+    /// whole send: the root, both parties and both paths come from the same
+    /// locally rebuilt tree. Three separate passes cost ~5.5 minutes each at
+    /// the feeder's sustainable rate — measured the hard way.
+    #[serde(default)]
+    paths_for: Vec<String>,
+    /// Where the synced index persists between calls. With it, only the first
+    /// sync pays for the whole chain history; every later one pays for the
+    /// delta, and an interrupted sync resumes from its last checkpoint
+    /// (saved every 256 blocks) rather than from `from_block`.
+    #[serde(default)]
+    cache_path: Option<String>,
 }
 
 fn default_workers() -> usize {
-    2
+    1
+}
+
+/// Sync `[from_block, to)` for `store`, resuming from and checkpointing to
+/// `cache_path` when one is given. The checkpoint interval lives in
+/// `Index::sync`; a failure mid-sync therefore costs one window of blocks,
+/// not the whole history.
+fn sync_index(
+    feeder: &Feeder,
+    store: &str,
+    from_block: u64,
+    to: u64,
+    workers: usize,
+    cache_path: Option<&str>,
+) -> Result<Index> {
+    let mut index = cache_path
+        .and_then(|p| Index::load_cache(std::path::Path::new(p), store, from_block))
+        .unwrap_or_else(|| Index::new(store, from_block));
+    index.sync(feeder, to, workers, |i| match cache_path {
+        Some(p) => i.save_cache(std::path::Path::new(p)),
+        None => Ok(()),
+    })?;
+    Ok(index)
 }
 
 #[derive(Serialize)]
@@ -208,6 +244,9 @@ struct SyncResponse {
     root: String,
     members: Vec<Member>,
     events_seen: usize,
+    /// Merkle paths for the requested handles, from the same tree the root
+    /// came from — so they cannot disagree with it.
+    paths: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Syncs blocks and rebuilds the membership tree locally, replacing the
@@ -228,10 +267,8 @@ pub unsafe extern "C" fn zkmsg_sync_registry(request: *const c_char) -> *mut c_c
             Some(n) => n,
             None => feeder.latest()?.block_number + 1,
         };
-        let mut index = Index::new(&req.store, req.from_block);
-        for block in feeder.blocks(req.from_block, to, req.workers)? {
-            index.absorb(&block);
-        }
+        let index = sync_index(
+            &feeder, &req.store, req.from_block, to, req.workers, req.cache_path.as_deref())?;
         let registry = Registry::rebuild(&index)?;
         let mut members: Vec<Member> = registry
             .handles
@@ -248,11 +285,23 @@ pub unsafe extern "C" fn zkmsg_sync_registry(request: *const c_char) -> *mut c_c
             .collect();
         members.sort_by_key(|m| m.leaf_index);
 
+        let mut paths = std::collections::BTreeMap::new();
+        for handle in &req.paths_for {
+            let (leaf, _) = registry
+                .resolve(handle)
+                .ok_or_else(|| anyhow!("no such handle: {handle}"))?;
+            paths.insert(
+                handle.clone(),
+                registry.path(leaf).iter().map(|f| format!("{f:#x}")).collect(),
+            );
+        }
+
         Ok(SyncResponse {
             next_block: index.next_block,
             root: format!("{:#x}", registry.root()),
             members,
             events_seen: index.events.len(),
+            paths,
         })
     })
 }
@@ -268,6 +317,10 @@ struct PathRequest {
     #[serde(default = "default_workers")]
     workers: usize,
     leaf_index: u32,
+    /// Same contract, same cache: a path request after a registry sync costs
+    /// only the blocks minted in between.
+    #[serde(default)]
+    cache_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -293,10 +346,8 @@ pub unsafe extern "C" fn zkmsg_merkle_path(request: *const c_char) -> *mut c_cha
             Some(n) => n,
             None => feeder.latest()?.block_number + 1,
         };
-        let mut index = Index::new(&req.store, req.from_block);
-        for block in feeder.blocks(req.from_block, to, req.workers)? {
-            index.absorb(&block);
-        }
+        let index = sync_index(
+            &feeder, &req.store, req.from_block, to, req.workers, req.cache_path.as_deref())?;
         let registry = Registry::rebuild(&index)?;
         Ok(PathResponse {
             root: format!("{:#x}", registry.root()),

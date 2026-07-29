@@ -29,17 +29,19 @@
 //! (that is a light client, a much larger build).
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 use zkmsg_core::tree::MerkleTree;
 
 pub mod feeder;
 
 /// A decoded event, in the shape the zkmsg scanners already consume
-/// (hex strings, matching `zkmsg_core::chain::events`).
-#[derive(Debug, Clone)]
+/// (hex strings, matching `zkmsg_core::chain::events`). Serializable because
+/// an `Index` persists its events between syncs — see `Index::save_cache`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub from_address: String,
     pub keys: Vec<String>,
@@ -133,19 +135,97 @@ pub fn normalize_felt(s: &str) -> String {
 /// the cost of not depending on an indexing provider.
 pub struct Index {
     pub address: String,
+    /// Where this index started; a cache is only reusable by a caller asking
+    /// for the same starting point, or events before it would be missing.
+    pub first_block: u64,
     pub next_block: u64,
     pub events: Vec<Event>,
 }
 
+/// On-disk form of an `Index`. What turns the one growing cost of a feeder-only
+/// network — replaying the whole event history every time — into a one-time
+/// cost: a synced index is saved, and the next sync pays only for the delta.
+#[derive(Serialize, Deserialize)]
+struct IndexCache {
+    address: String,
+    first_block: u64,
+    next_block: u64,
+    events: Vec<Event>,
+}
+
 impl Index {
     pub fn new(address: &str, from_block: u64) -> Self {
-        Self { address: address.to_string(), next_block: from_block, events: Vec::new() }
+        Self {
+            address: address.to_string(),
+            first_block: from_block,
+            next_block: from_block,
+            events: Vec::new(),
+        }
     }
 
     /// Ingests one block's events for this contract.
     pub fn absorb(&mut self, block: &Block) {
         self.events.extend(block.events_from(&self.address));
         self.next_block = block.block_number + 1;
+    }
+
+    /// A previously saved index, if one exists at `path` and covers the same
+    /// contract from the same starting block. Anything else — no file, another
+    /// contract, another starting point, an unreadable cache — returns None
+    /// and the caller syncs from scratch: a cache must never be able to make
+    /// a sync wrong, only cheaper.
+    pub fn load_cache(path: &Path, address: &str, from_block: u64) -> Option<Self> {
+        let data = std::fs::read(path).ok()?;
+        let cache: IndexCache = serde_json::from_slice(&data).ok()?;
+        if normalize_felt(&cache.address) != normalize_felt(address)
+            || cache.first_block != from_block
+        {
+            return None;
+        }
+        Some(Self {
+            address: cache.address,
+            first_block: cache.first_block,
+            next_block: cache.next_block,
+            events: cache.events,
+        })
+    }
+
+    /// Persists the index for `load_cache`, atomically: a torn write must not
+    /// be able to replace a good cache with a corrupt one.
+    pub fn save_cache(&self, path: &Path) -> Result<()> {
+        let cache = IndexCache {
+            address: self.address.clone(),
+            first_block: self.first_block,
+            next_block: self.next_block,
+            events: self.events.clone(),
+        };
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&cache)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))
+    }
+
+    /// Syncs `[next_block, to)` in windows, calling `checkpoint` after each so
+    /// an interrupted sync resumes from its last window rather than from
+    /// `first_block`. On a phone syncing thousands of blocks through a
+    /// rate-limited feeder, this is the difference between a failure costing
+    /// seconds and costing the whole sync.
+    pub fn sync(
+        &mut self,
+        feeder: &feeder::Feeder,
+        to: u64,
+        workers: usize,
+        mut checkpoint: impl FnMut(&Index) -> Result<()>,
+    ) -> Result<()> {
+        const WINDOW: u64 = 256;
+        while self.next_block < to {
+            let end = (self.next_block + WINDOW).min(to);
+            for block in feeder.blocks(self.next_block, end, workers)? {
+                self.absorb(&block);
+            }
+            checkpoint(self)?;
+        }
+        Ok(())
     }
 
     pub fn with_key0(&self, selector: Felt) -> impl Iterator<Item = &Event> {
@@ -222,5 +302,61 @@ impl Registry {
 
     pub fn path(&self, leaf_index: u32) -> Vec<Felt> {
         self.tree.path(leaf_index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index_with_event() -> Index {
+        let mut index = Index::new("0x0abc", 100);
+        index.events.push(Event {
+            from_address: "0xabc".into(),
+            keys: vec!["0x1".into()],
+            data: vec!["0x2".into(), "0x3".into(), "0x0".into()],
+            block_number: 150,
+        });
+        index.next_block = 200;
+        index
+    }
+
+    #[test]
+    fn cache_round_trips() {
+        let dir = std::env::temp_dir().join(format!("zkmsg-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("round-trip.json");
+
+        let index = index_with_event();
+        index.save_cache(&path).unwrap();
+
+        // Address comparison is normalized: 0x0abc and 0xABC are the same felt.
+        let loaded = Index::load_cache(&path, "0xABC", 100).expect("cache should load");
+        assert_eq!(loaded.next_block, 200);
+        assert_eq!(loaded.first_block, 100);
+        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(loaded.events[0].block_number, 150);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cache_is_rejected_unless_it_matches_exactly() {
+        let dir = std::env::temp_dir().join(format!("zkmsg-cache-rej-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.json");
+        index_with_event().save_cache(&path).unwrap();
+
+        // A different contract or starting block would mean missing events —
+        // the cache must be ignored, not adapted.
+        assert!(Index::load_cache(&path, "0xdef", 100).is_none());
+        assert!(Index::load_cache(&path, "0xabc", 99).is_none());
+        // Corruption degrades to a fresh sync, never an error.
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(Index::load_cache(&path, "0xabc", 100).is_none());
+        // As does absence.
+        assert!(Index::load_cache(&dir.join("missing.json"), "0xabc", 100).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
