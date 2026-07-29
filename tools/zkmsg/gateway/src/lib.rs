@@ -105,6 +105,23 @@ impl Block {
     }
 }
 
+/// Decodes a Cairo short string (ASCII packed into one felt) back to text —
+/// how handles travel on the wire.
+pub fn short_string(hex: &str) -> Result<String> {
+    let bytes = hex_to_bytes(hex)?;
+    let text: Vec<u8> = bytes.into_iter().skip_while(|b| *b == 0).collect();
+    String::from_utf8(text).map_err(|e| anyhow!("handle is not utf-8: {e}"))
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    let t = hex.trim_start_matches("0x");
+    let padded = if t.len() % 2 == 1 { format!("0{t}") } else { t.to_string() };
+    (0..padded.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&padded[i..i + 2], 16).context("handle hex"))
+        .collect()
+}
+
 /// Canonical form of a felt hex string, so `0x0ae4…` and `0xae4…` compare equal.
 pub fn normalize_felt(s: &str) -> String {
     let t = s.trim_start_matches("0x").trim_start_matches('0').to_lowercase();
@@ -142,9 +159,10 @@ impl Index {
 /// The membership tree, rebuilt from `UserRegistered` events rather than read
 /// from the contract — the substitute for `get_merkle_root` / `get_merkle_path`.
 ///
-/// Event shape (messagezk_store::UserRegistered):
-///   keys = [sn_keccak("UserRegistered"), handle]
-///   data = [scan_pubkey, leaf_index]
+/// Event shape (messagezk_store::UserRegistered) — verified live on
+/// sepolia-integration, since only `owner` carries `#[key]`:
+///   keys = [sn_keccak("UserRegistered"), owner]
+///   data = [handle, scan_pubkey, leaf_index]
 /// Leaves are inserted in `leaf_index` order, which the contract assigns
 /// sequentially; we sort explicitly rather than trusting block ordering.
 pub struct Registry {
@@ -158,16 +176,16 @@ impl Registry {
         let selector = zkmsg_core::chain::snkeccak("UserRegistered");
         let mut rows: Vec<(u32, String, Felt)> = Vec::new();
         for e in index.with_key0(selector) {
-            let handle = e.keys.get(1).ok_or_else(|| anyhow!("UserRegistered without handle"))?;
-            let scan = e.data.first().ok_or_else(|| anyhow!("UserRegistered without scan key"))?;
+            let handle = e.data.first().ok_or_else(|| anyhow!("UserRegistered without handle"))?;
+            let scan = e.data.get(1).ok_or_else(|| anyhow!("UserRegistered without scan key"))?;
             let leaf_index = e
                 .data
-                .get(1)
+                .get(2)
                 .ok_or_else(|| anyhow!("UserRegistered without leaf index"))?;
             rows.push((
                 u32::from_str_radix(leaf_index.trim_start_matches("0x"), 16)
                     .context("leaf index")?,
-                handle.clone(),
+                short_string(handle)?,
                 Felt::from_hex(scan).map_err(|e| anyhow!("scan key: {e}"))?,
             ));
         }

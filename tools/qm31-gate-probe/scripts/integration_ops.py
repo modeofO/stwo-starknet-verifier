@@ -23,6 +23,7 @@ matches apollo_starknet_client writer objects (established in declare_probe.py).
 import base64
 import gzip
 import json
+import os
 import pathlib
 import sys
 import urllib.error
@@ -280,6 +281,31 @@ elif cmd == "declare-file":
         **v3_base(message_signature(h, PRIV), nonce, rb),
     }
     print("declaring class", hex(class_hash), "tx hash", hex(h))
+    post(payload)
+
+elif cmd == "invoke":
+    # Generic single-call invoke: invoke <nonce> <contract> <selector> [felt args...]
+    # Used to drive contracts on integration, where no RPC provider exists and
+    # sncast therefore cannot reach the network.
+    nonce = int(sys.argv[2])
+    contract = int(sys.argv[3], 16)
+    selector = get_selector_from_name(sys.argv[4])
+    call_args = [int(x, 16) if x.startswith("0x") else int(x) for x in sys.argv[5:]]
+    l2_amount = int(os.environ.get("L2_GAS", "40000000"))
+    calldata = [1, contract, selector, len(call_args)] + call_args
+    rb = bounds(l2_amount)
+    h = compute_invoke_v3_transaction_hash(
+        account_deployment_data=[], calldata=calldata,
+        common_fields=common(TransactionHashPrefix.INVOKE, ACCOUNT, nonce, rb),
+    )
+    payload = {
+        "type": "INVOKE_FUNCTION",
+        "sender_address": hex(ACCOUNT),
+        "calldata": [hex(c) for c in calldata],
+        "account_deployment_data": [],
+        **v3_base(message_signature(h, PRIV), nonce, rb),
+    }
+    print(f"invoking {sys.argv[4]} on {hex(contract)} tx hash {hex(h)}")
     post(payload)
 
 elif cmd == "deploy-udc":

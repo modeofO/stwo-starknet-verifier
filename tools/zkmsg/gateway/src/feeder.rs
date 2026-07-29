@@ -76,6 +76,39 @@ impl Feeder {
         serde_json::from_str(&body).context("parsing latest block")
     }
 
+    /// Storage writes made by `contract` in `block`, from `get_state_update`.
+    ///
+    /// This is the one way to read contract state on a feeder-only network:
+    /// the deprecated `call_contract` is gone, but state diffs are still
+    /// published. Used here to check derived state against the chain's own
+    /// storage; a client could in principle replay diffs to read any slot.
+    pub fn storage_writes(&self, block: u64, contract: &str) -> Result<Vec<(String, String)>> {
+        let url = format!("{}/get_state_update?blockNumber={block}", self.base);
+        let body = ureq::get(&url)
+            .timeout(Duration::from_secs(30))
+            .call()
+            .map_err(|e| anyhow!("state update: {e}"))?
+            .into_string()?;
+        let v: serde_json::Value = serde_json::from_str(&body).context("parsing state update")?;
+        let want = crate::normalize_felt(contract);
+        let diffs = v
+            .get("state_diff")
+            .and_then(|d| d.get("storage_diffs"))
+            .and_then(|d| d.as_object())
+            .ok_or_else(|| anyhow!("state update has no storage_diffs"))?;
+        Ok(diffs
+            .iter()
+            .filter(|(addr, _)| crate::normalize_felt(addr) == want)
+            .flat_map(|(_, entries)| entries.as_array().cloned().unwrap_or_default())
+            .filter_map(|e| {
+                Some((
+                    e.get("key")?.as_str()?.to_string(),
+                    e.get("value")?.as_str()?.to_string(),
+                ))
+            })
+            .collect())
+    }
+
     /// Fetches `[from, to)` with `parallelism` workers. Blocks are independent,
     /// so the only ordering requirement is that the caller absorbs them in
     /// sequence — hence results are collected and sorted before returning.

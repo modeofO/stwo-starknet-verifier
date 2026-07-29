@@ -90,3 +90,41 @@ fn selector_filter_selects() {
     assert!(hits > 0, "no Transfer events matched");
     assert_eq!(misses, 0, "a nonexistent selector matched events");
 }
+
+/// The zkmsg message store deployed on integration by this work (class
+/// 0x4dc67c0a…765745), pinned to the qm31 fact registry.
+const STORE: &str = "0x6f3db45f5a5bbef78dd7f8c93b76894c453fce935423fc40bb68475df64a30b";
+
+/// Block in which `register("boat", …)` landed — the store's first member.
+const REGISTER_BLOCK: u64 = 13_898_986;
+
+/// The load-bearing claim: state derived locally from events equals the state
+/// the contract itself stores.
+///
+/// On a feeder-only network `get_merkle_root` cannot be called, so the check
+/// goes through `get_state_update`: the root our tree computes from
+/// `UserRegistered` events must appear among the store's own storage writes.
+/// If this ever fails, sends built on a locally-derived root would be rejected
+/// on-chain after paying to prove them.
+#[test]
+#[ignore = "network"]
+fn derived_root_matches_onchain_storage() {
+    let feeder = Feeder::integration();
+
+    let mut index = zkmsg_gateway::Index::new(STORE, REGISTER_BLOCK);
+    index.absorb(&feeder.block(REGISTER_BLOCK).expect("register block"));
+    let registry = zkmsg_gateway::Registry::rebuild(&index).expect("rebuild tree from events");
+
+    assert_eq!(registry.handles.len(), 1, "expected exactly one member");
+    let (leaf, _scan) = registry.resolve("boat").expect("handle 'boat' should resolve");
+    assert_eq!(leaf, 0, "first registration should take leaf 0");
+    assert_eq!(registry.path(leaf).len(), 20, "depth-20 tree");
+
+    let derived = normalize_felt(&format!("{:#x}", registry.root()));
+    let writes = feeder.storage_writes(REGISTER_BLOCK, STORE).expect("storage diffs");
+    assert!(!writes.is_empty(), "no storage writes for the store in that block");
+    assert!(
+        writes.iter().any(|(_, v)| normalize_felt(v) == derived),
+        "locally derived root {derived} is absent from the store's own storage writes"
+    );
+}

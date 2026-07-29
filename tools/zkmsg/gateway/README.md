@@ -70,6 +70,33 @@ feeder rather than an RPC provider — the same operator that runs the
 sequencer. Verifying block headers against L1 would make this a light client;
 that is a much larger build and is not attempted here.
 
+## Live on sepolia-integration (deployed 2026-07-29)
+
+The store now exists next to the qm31 verifier, so the full phone-first
+architecture has a home on the network where single-transaction verification
+is possible:
+
+| Thing | Address |
+|---|---|
+| `MessageStoreV3` class | `0x4dc67c0ad76d9674a80d6dcb717cec7334014f2d5df986c440ed1aa62765745` |
+| store instance (salt `qm31`) | `0x6f3db45f5a5bbef78dd7f8c93b76894c453fce935423fc40bb68475df64a30b` |
+| pinned fact registry (qm31) | `0xae46627b660dfc659e00e21e5c03660f1c891e8230cd5900ddc564fe36cf22` |
+
+Declared for 620M L2 gas (the gateway pre-executes and reports actual usage on
+an under-provisioned bound), deployed via UDC, and seeded with one member —
+handle `boat` at leaf 0. Declares there need the gateway's own compiled class
+hash, recoverable free of charge from the `INVALID_COMPILED_CLASS_HASH`
+rejection.
+
+**The approach is verified against the chain, not just self-consistent.**
+`get_merkle_root` cannot be called on integration, so the check runs through
+`get_state_update`: the root this crate derives from `UserRegistered` events —
+`0x2883a854ab57d90076c43e80f268f244b651e6876183710340c2f2121bd335d` — appears
+in the store's own storage writes for that block. Pinned by
+`derived_root_matches_onchain_storage`. State diffs are also the general
+escape hatch for reading state on a feeder-only network, should anything ever
+need a slot the event stream cannot reconstruct.
+
 ## Try it
 
 ```sh
