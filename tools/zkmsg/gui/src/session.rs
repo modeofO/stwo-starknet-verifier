@@ -117,6 +117,11 @@ pub struct ProfileSession {
     /// The last "Save pairing file…" result — `Ok(path)` shows where it
     /// landed, `Err(msg)` the failure. `None` before the first save.
     pub(crate) pair_saved: Option<Result<PathBuf, String>>,
+    /// Manages the companion daemon (`zkmsgd`) this session started, if any.
+    /// Never auto-starts — the Pair tab's Start button does. Its `Drop` kills
+    /// the child on a profile switch (this session is dropped) or GUI exit, so
+    /// a GUI-started daemon is never orphaned.
+    pub(crate) daemon: crate::daemon_control::DaemonManager,
 }
 
 impl ProfileSession {
@@ -160,6 +165,7 @@ impl ProfileSession {
             retire_offer: false,
             pair_addr: crate::pair_view::default_pair_addr(),
             pair_saved: None,
+            daemon: crate::daemon_control::DaemonManager::default(),
         }
     }
 
@@ -170,6 +176,9 @@ impl ProfileSession {
         self.poll_inbox_worker();
         self.poll_compose_worker(ctx);
         self.poll_send_worker();
+        // Reap/promote a daemon this session started (crash, bind failure, or
+        // the Starting -> Running promotion). Cheap non-blocking `try_wait`.
+        self.daemon.poll();
     }
 
     /// Renders the active tab's central content. `repo_root` is the shell's
@@ -201,6 +210,11 @@ impl ProfileSession {
             // A scan/call is in flight — repaint every frame so the mpsc
             // channel gets drained promptly once it lands.
             ctx.request_repaint();
+        } else if self.daemon.is_active() {
+            // A daemon is Starting/Running: wake periodically so `poll` catches
+            // an exit (crash/bind failure) and the Pair tab re-reads the token
+            // file the daemon just minted, without busy-spinning.
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         } else if self.inbox_auto_refresh {
             // Idle but armed: wake up periodically to re-check the 30s
             // elapsed-since-last-refresh condition, without busy-spinning.

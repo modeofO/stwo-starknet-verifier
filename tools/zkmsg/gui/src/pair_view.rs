@@ -44,20 +44,14 @@ impl ProfileSession {
     pub(crate) fn pair_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Pair a phone");
         ui.label(
-            "The phone drives sends over the companion daemon. Copy this link or save the file, \
-             then open it on the phone — no camera, no typing.",
+            "The phone drives sends over the companion daemon. Start the daemon, then copy this \
+             link or save the file and open it on the phone — no camera, no typing.",
         );
         ui.separator();
 
-        let token = load_token(&self.home_dir());
-        let Some(token) = token else {
-            ui.label("No daemon token yet.");
-            ui.label(
-                "Start the daemon once (zkmsgd) to mint the bearer token, then return here.",
-            );
-            return;
-        };
-
+        // The address is confirmed first: it is both the daemon's `--addr` bind
+        // and what the pairing URI points the phone at, so it must be right
+        // before either Start or Copy/Save.
         ui.horizontal(|ui| {
             ui.label("daemon address (host:port):");
             ui.text_edit_singleline(&mut self.pair_addr);
@@ -70,15 +64,32 @@ impl ProfileSession {
             .weak(),
         );
 
-        // Own the trimmed address so the closures below can hold `&mut self`
-        // (for `pair_saved`) without a live borrow of `self.pair_addr`.
+        // Own the trimmed address + home so the daemon controls and the
+        // Copy/Save closures can each hold `&mut self` (for `self.daemon` and
+        // `self.pair_saved`) without a live borrow of `self.pair_addr`.
         let addr = self.pair_addr.trim().to_string();
+        let home = self.home_dir();
+
+        // Daemon Start/Stop + live status. The user presses Start — nothing
+        // auto-starts. Only `&mut self.daemon` is borrowed here.
+        ui.separator();
+        self.daemon.ui(ui, &addr, &home);
+
+        // The pairing section needs the bearer token, minted by the daemon on
+        // its first start. Re-read each frame so it appears the moment the
+        // freshly started daemon writes it.
+        ui.separator();
+        let Some(token) = load_token(&home) else {
+            ui.label("No daemon token yet — start the daemon above to mint it.");
+            return;
+        };
+
         if addr.is_empty() {
             ui.colored_label(egui::Color32::RED, "enter the daemon address to build a link");
             return;
         }
         let uri = pairing_uri(&addr, &token);
-        let save_path = self.home_dir().join("pair.zkmsgpair");
+        let save_path = home.join("pair.zkmsgpair");
 
         ui.separator();
         ui.label("pairing link:");
