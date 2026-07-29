@@ -208,6 +208,18 @@ Pipeline driver: `integration_ops.py run-proof <nonce> <send_dir>
 <registry> <fri_offset> <proof_id>` — python port of the zkmsg send
 pipeline with a pack_v1 parity assertion against `packed.txt`.
 
+## PROVEN: ACCEPTED_ON_L1 (2026-07-29, same day)
+
+Every campaign transaction — the qm31 declare, `mul_qm31(100)`, and the
+full messagezk verify pipeline on the qm31 registry — reached
+**ACCEPTED_ON_L1**: StarkWare's production prover proved the blocks
+containing native qm31-opcode execution and Ethereum Sepolia accepted
+the state updates at the integration core contract
+(`0x4737c0c1…`, LogStateUpdate cadence ~2 min / 200 L2 blocks).
+End-to-end, the entire qm31 story is now demonstrated on production
+infrastructure: declared through the real gateway, executed by the real
+sequencer, proven by the real prover, settled on the real L1.
+
 ## Design choices the unlock opens (assessment, 2026-07-29)
 
 Emulated qm31 was an architectural constraint, not just a cost; with it
