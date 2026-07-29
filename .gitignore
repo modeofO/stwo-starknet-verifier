@@ -18,3 +18,10 @@ fixtures/poseidon_chain_n100.extended_proof.json
 fixtures/poseidon_chain_n100.blake_proof_serde.json
 fixtures/poseidon_chain_n100.blake_extended_proof.json
 __pycache__/
+
+# iOS bench: generated project, build output, and staged workload
+# (regenerate with tools/prover-bench-ios/prepare-fixtures.sh + xcodegen)
+tools/prover-bench-ios/ProverBench.xcodeproj/
+tools/prover-bench-ios/ProverBench.entitlements
+tools/prover-bench-ios/build/
+tools/prover-bench-ios/Resources/
