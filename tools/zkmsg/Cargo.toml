@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "gui", "daemon"]
+members = ["core", "cli", "gui", "daemon", "gateway"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

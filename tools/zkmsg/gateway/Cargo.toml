@@ -1,0 +1,18 @@
+[package]
+name = "zkmsg-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Self-serving Starknet client: syncs blocks from a feeder gateway and answers zkmsg's queries locally, with no JSON-RPC provider"
+
+[dependencies]
+zkmsg-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+ureq.workspace = true
+starknet-types-core.workspace = true
+
+[[bin]]
+name = "zkmsg-gateway"
+path = "src/main.rs"
