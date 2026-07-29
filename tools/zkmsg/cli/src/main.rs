@@ -206,6 +206,10 @@ fn cmd_status(home: &Home) -> Result<()> {
 
     println!("rpc      : {}", report.rpc);
     println!("account  : {}", report.account);
+    println!(
+        "address  : {}",
+        report.account_address.as_deref().unwrap_or("(not in sncast accounts file)"),
+    );
     println!("registry : {} (live lane-1)", report.registry);
     println!(
         "store    : {}",

@@ -16,6 +16,10 @@ use crate::state::{SendState, StepKind};
 pub struct StatusReport {
     pub rpc: String,
     pub account: String,
+    /// The account's on-chain address from sncast's accounts file; `None`
+    /// when the named account is missing from it (the name alone is
+    /// ambiguous — profiles can share one funding account).
+    pub account_address: Option<String>,
     pub registry: String,
     pub store: String,
     pub scan_pub: Option<String>,
@@ -51,6 +55,7 @@ pub fn status(home: &Home) -> Result<StatusReport> {
     Ok(StatusReport {
         rpc: config.rpc_url.clone(),
         account: config.account.clone(),
+        account_address: account_address(&config.account).ok(),
         registry: config.registry.clone(),
         store: config.store.clone(),
         scan_pub: keys.as_ref().map(|k| k.scan_pub.clone()),

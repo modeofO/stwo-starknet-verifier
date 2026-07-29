@@ -454,6 +454,9 @@ impl ProfileSession {
             // live (networked) report is still in flight.
             if let Some(config) = &self.config {
                 ui.label(format!("account: {}", config.account));
+                if let Ok(addr) = zkmsg_core::chain::account_address(&config.account) {
+                    ui.label(format!("address: {addr}"));
+                }
                 ui.label(format!("registry: {}", config.registry));
                 ui.label(format!("store: {}", config.store));
             }
@@ -476,6 +479,10 @@ impl ProfileSession {
 
             ui.label("account");
             ui.label(&report.account);
+            ui.end_row();
+
+            ui.label("address");
+            ui.label(report.account_address.as_deref().unwrap_or("(not in sncast accounts file)"));
             ui.end_row();
 
             ui.label("registry");
