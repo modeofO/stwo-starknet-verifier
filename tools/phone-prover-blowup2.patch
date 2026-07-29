@@ -1,0 +1,53 @@
+# Phone-tier parameter patch (2026-07-29): inner blowup 3->2, queries 23->35
+# (security 97 bits vs 96) + the two padding-target bumps it needs (eq 2^18,
+# blake_g_gate 2^21; outer trace log 21 unchanged).
+#
+# Measured on the real messagezk witness, with ZKMSG_SPILL_DIR set (the
+# spill allocator now lives in the canonical bridge crate, not this patch):
+#   prove: 8.22 GB -> 4.62 GB RSS; 764 MB phys_footprint with spill
+#   wrap:  35,906 felts (vs 36,022 baseline); 377 MB phys_footprint with spill
+# Without ZKMSG_SPILL_DIR behavior is pure-RAM (desktop default).
+#
+# Apply to .prover/proving-utils AFTER setup-prover.sh installs the bridge:
+#   git apply tools/phone-prover-blowup2.patch
+# New inner circuit root + multiverifier preprocessed root => re-pin verifier
+# consts, INNER_ROOT in zkmsg config, redeploy registry/store before on-chain use.
+
+--- a/crates/privacy_prove_cairo_bridge/src/main.rs	2026-07-29 06:05:57
++++ b/crates/privacy_prove_cairo_bridge/src/main.rs	2026-07-29 06:06:41
+@@ -171,11 +171,11 @@
+ const PCS_CONFIG: stwo::core::pcs::PcsConfig =
+     get_pcs_config(PRIVACY_CAIRO_VERIFIER_TRACE_LOG_SIZE, LOG_BLOWUP_FACTOR);
+ const TARGET_PADDING_SIZES: ComponentSizes = ComponentSizes {
+-    eq: 1 << 17,
++    eq: 1 << 18,
+     qm31_ops: 1 << 21,
+     m31_to_u32: 1 << 18,
+     triple_xor: 1 << 17,
+-    blake_g_gate: 1 << 20,
++    blake_g_gate: 1 << 21,
+ };
+ const CIRCUIT_N_PREPROCESSED_COLUMNS: usize = 45;
+ 
+diff --git a/crates/privacy_circuit_verify/src/consts.rs b/crates/privacy_circuit_verify/src/consts.rs
+index b8957b6..eb5f4c6 100644
+--- a/crates/privacy_circuit_verify/src/consts.rs
++++ b/crates/privacy_circuit_verify/src/consts.rs
+@@ -32,7 +32,7 @@ pub const CIRCUIT_OUTPUT_ADDRESSES: [usize; 9] = [3, 4, 5, 6, 7, 8, 9, 10, 2];
+ pub const PRIVACY_RECURSION_CIRCUIT_PREPROCESSED_ROOT: [u32; 8] = [
+     800377284, 3072891210, 312668056, 4159802026, 3280170003, 3058368945, 3010382083, 3621697867,
+ ];
+-pub const CAIRO_LOG_BLOWUP_FACTOR: u32 = 3;
++pub const CAIRO_LOG_BLOWUP_FACTOR: u32 = 2;
+ pub const CAIRO_TRACE_LOG_SIZE: u32 = 20;
+ pub const CIRCUIT_LOG_BLOWUP_FACTOR: u32 = 2;
+ pub const CIRCUIT_TRACE_LOG_SIZE: u32 = 21;
+@@ -40,7 +40,7 @@ pub const CIRCUIT_TRACE_LOG_SIZE: u32 = 21;
+ pub const CAIRO_FRI_CONFIG: FriConfig = FriConfig {
+     log_blowup_factor: CAIRO_LOG_BLOWUP_FACTOR,
+     log_last_layer_degree_bound: 0,
+-    n_queries: 23,
++    n_queries: 35,
+     fold_step: 4,
+ };
+ 
