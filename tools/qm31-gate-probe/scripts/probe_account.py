@@ -39,7 +39,12 @@ GATEWAY = "https://integration-sepolia.starknet.io/gateway"
 CHAIN_ID = int.from_bytes(b"SN_INTEGRATION_SEPOLIA", "big")
 STRK = 0x04718F5A0FC34CC1AF16A1CDEE98FFB20C31F5CD61D6AB07201858F4287C938D
 
-keys = json.loads((pathlib.Path.home() / ".config/qm31-integration/keys.json").read_text())
+# ZKMSG_KEYS selects the identity, as in integration_ops.py.
+import os
+_keyfile = os.environ.get(
+    "ZKMSG_KEYS", str(pathlib.Path.home() / ".config/qm31-integration/keys.json")
+)
+keys = json.loads(pathlib.Path(_keyfile).read_text())
 PRIV = int(keys["stark_private_key"], 16)
 ACCOUNT = int(keys["l2_account_address"], 16)
 

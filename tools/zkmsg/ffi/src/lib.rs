@@ -21,6 +21,9 @@
 //! a separate workspace (`.prover/proving-utils`) and is linked alongside this
 //! one. They are split because the prover pins StarkWare's proving stack at a
 //! specific revision, which the app crates must not be forced to share.
+//!
+//! Swift side: `App/Sources/ZkmsgBridge.swift` in the zkmsg-ios repo conforms
+//! to its `ProofBridging` protocol by forwarding to these symbols.
 
 use std::ffi::{c_char, CStr, CString};
 
