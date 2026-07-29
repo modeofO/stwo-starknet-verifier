@@ -6,6 +6,11 @@ license = "Apache-2.0"
 repository.workspace = true
 description = "Bridge: Cairo PIE -> privacy bootloader Stwo proof -> cairo-verifier circuit proof -> multiverifier proof -> felt252 cairo-serde for the on-chain Stwo circuit verifier"
 
+[lib]
+name = "privacy_prove_cairo_bridge"
+crate-type = ["lib", "staticlib"]
+path = "src/lib.rs"
+
 [[bin]]
 name = "privacy_prove_cairo_bridge"
 path = "src/main.rs"
@@ -36,3 +41,4 @@ stwo-cairo-adapter.workspace = true
 stwo-cairo-serialize.workspace = true
 starknet-types-core.workspace = true
 starknet-ff.workspace = true
+libc = "0.2.189"

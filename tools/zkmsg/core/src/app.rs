@@ -7,10 +7,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use starknet_types_core::felt::Felt;
 
-use crate::args::{CircuitInputs, args_to_json, build_circuit_args};
 use crate::chain::{Chain, account_address, felt_hex, felt_to_u64};
 use crate::config::{Config, Home, Keys, STRK_TOKEN};
-use crate::crypto::{ecdh_shared_x, encrypt, poseidon2, scan_keygen};
+use crate::crypto::scan_keygen;
 use crate::state::{SendState, StepKind};
 
 pub struct StatusReport {
@@ -187,37 +186,25 @@ pub fn prepare_send(
     let sender_path = call_path(&chain, config, sender_leaf)?;
     let recipient_path = call_path(&chain, config, recipient_leaf)?;
 
-    let (eph_priv, _) = scan_keygen();
-    let (circuit_args, tuple) = build_circuit_args(&CircuitInputs {
+    let material = crate::send::build_send(&crate::send::SendInputs {
         merkle_root: root,
         sender_scan_priv: keys.scan_priv_felt()?,
         recipient_scan_pub: recipient_pub,
-        ephemeral_priv: eph_priv,
         sender_leaf_index: sender_leaf,
         recipient_leaf_index: recipient_leaf,
         sender_path: &sender_path,
         recipient_path: &recipient_path,
+        text,
+        ephemeral_priv: None,
     })?;
 
-    let shared = ecdh_shared_x(&eph_priv, &recipient_pub)?;
-    let ciphertext = encrypt(&shared, text.as_bytes());
-
-    let id = format!("{:.10}", felt_hex(&tuple.commitment).trim_start_matches("0x"));
-    let proof_id = poseidon2(&tuple.commitment, &short_string_felt("zkmsg")?);
-    let args_hex: Vec<String> =
-        serde_json::from_str(&args_to_json(&circuit_args)).expect("round trip");
-
     let send_state = SendState::new_plan(
-        id.clone(),
+        material.id.clone(),
         handle.to_string(),
-        hex::encode(&ciphertext),
-        args_hex,
-        (
-            felt_hex(&tuple.commitment),
-            felt_hex(&tuple.ephemeral_pubkey),
-            felt_hex(&tuple.merkle_root),
-        ),
-        felt_hex(&proof_id),
+        material.ciphertext,
+        material.args,
+        (material.commitment, material.ephemeral_pubkey, material.merkle_root),
+        material.proof_id,
     );
     send_state.save(home)?;
     Ok(send_state)

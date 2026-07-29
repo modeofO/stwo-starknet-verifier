@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "gui", "daemon"]
+members = ["core", "cli", "gui", "daemon", "gateway", "ffi"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", features = ["json", "gzip"] }
 starknet-crypto = "0.8"
 starknet-types-core = { version = "0.2", features = ["curve"] }
 starknet-curve = "0.6"

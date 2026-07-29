@@ -31,6 +31,9 @@ zkmsg register <your-handle>                 # one cheap tx
 zkmsg status                                 # balance, addresses, count
 
 zkmsg send <their-handle> "hello"            # ~1 min local proving + 5 txs (~50 STRK)
+                                             # (qm31-native verifier, measured on
+                                             # sepolia-integration 2026-07-29: −36% verify
+                                             # gas, 5 txs → 3 — tools/qm31-gate-probe/README.md)
 zkmsg inbox                                  # trial-decrypt everything addressed to you
 ```
 

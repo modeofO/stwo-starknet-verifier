@@ -8,8 +8,12 @@ edition = "2024_07"
 starknet = "2.18.0"
 stwo_verifier_phases = { path = "../stwo_verifier_phases" }
 
-# NOTE: blake2s configuration (no features) — the circuit verifier only
+# NOTE: blake2s configuration (default) — the circuit verifier only
 # supports the blake2s hasher, and blake2s libfuncs are in the audited set.
+
+[features]
+# See stwo_verifier_phases: qm31-native build for sepolia-integration.
+qm31_opcode = ["stwo_verifier_phases/qm31_opcode"]
 
 [[target.starknet-contract]]
 sierra = true
