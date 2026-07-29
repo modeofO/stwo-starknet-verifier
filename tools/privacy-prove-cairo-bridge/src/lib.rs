@@ -220,6 +220,19 @@ pub fn wrap_stage(
     )?;
 
     eprintln!("[wrap 3/3] serializing for the Cairo1 verifier");
+    // The FRI section's start offset in the felt stream. Phase 2 needs it, and
+    // the on-chain phase 1 returns it — but only through a transaction trace,
+    // and integration's trace endpoint is deprecated. It is derivable here
+    // instead: `fri_proof` is the last field of the serialized stark proof and
+    // is followed by exactly one felt (`channel_salt`), so the section starts
+    // `len - fri_len - 1` felts in. Emitting it at wrap time removes the trace
+    // dependency on every network.
+    let fri_len = {
+        use stwo_cairo_serialize::CairoSerialize;
+        let mut buf = Vec::new();
+        CairoSerialize::serialize(&multi_circuit_proof.stark_proof.proof.0.fri_proof, &mut buf);
+        buf.len()
+    };
     let component_log_sizes = circuit_component_log_sizes(
         &all_circuit_components::<NoValue>(),
         &preprocessed_multiverifier.preprocessed_trace.log_sizes(),
@@ -227,7 +240,18 @@ pub fn wrap_stage(
     let felts = prepare_circuit_proof_for_cairo_verifier(multi_circuit_proof, &component_log_sizes);
     let hex: Vec<String> = felts.iter().map(|f| format!("0x{f:x}")).collect();
     std::fs::write(out_path, serde_json::to_string(&hex)?)?;
-    eprintln!("wrote {} felts to {}", hex.len(), out_path.display());
+    let fri_offset = hex
+        .len()
+        .checked_sub(fri_len + 1)
+        .ok_or("fri section longer than the proof stream")?;
+    std::fs::write(
+        out_path.with_extension("meta.json"),
+        serde_json::to_string(&serde_json::json!({
+            "n_values": hex.len(),
+            "fri_offset": fri_offset,
+        }))?,
+    )?;
+    eprintln!("wrote {} felts to {} (fri_offset {fri_offset})", hex.len(), out_path.display());
     Ok(())
 }
 
