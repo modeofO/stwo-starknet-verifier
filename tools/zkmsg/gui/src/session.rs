@@ -30,6 +30,7 @@ pub(crate) enum Tab {
     Status,
     Compose,
     Inbox,
+    Pair,
 }
 
 /// Whether a send is mid-flight given the two guard flags: `preparing` is
@@ -107,6 +108,15 @@ pub struct ProfileSession {
     /// by the app to open the retire dialog. Lives here (not compose state)
     /// because the app owns the dialog, which outlives this session.
     pub(crate) retire_offer: bool,
+
+    /// Pair tab: the daemon's listen address (`host:port`) the pairing URI
+    /// points a phone at. The GUI cannot know the daemon's runtime bind, so
+    /// this defaults to the machine's LAN IP (else the loopback default) and
+    /// the user confirms it. The daemon stays the source of truth.
+    pub(crate) pair_addr: String,
+    /// The last "Save pairing file…" result — `Ok(path)` shows where it
+    /// landed, `Err(msg)` the failure. `None` before the first save.
+    pub(crate) pair_saved: Option<Result<PathBuf, String>>,
 }
 
 impl ProfileSession {
@@ -148,6 +158,8 @@ impl ProfileSession {
             send_state_id: None,
             pending,
             retire_offer: false,
+            pair_addr: crate::pair_view::default_pair_addr(),
+            pair_saved: None,
         }
     }
 
@@ -176,6 +188,7 @@ impl ProfileSession {
             Tab::Status => self.status_tab(ui, ctx, repo_root, locked),
             Tab::Compose => self.compose_tab(ui, ctx, locked),
             Tab::Inbox => self.inbox_tab(ui, ctx),
+            Tab::Pair => self.pair_tab(ui),
         }
     }
 

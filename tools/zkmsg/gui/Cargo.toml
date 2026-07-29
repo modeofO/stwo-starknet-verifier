@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 zkmsg-core = { path = "../core" }
+# The pairing panel reuses the daemon's URI builder and its 0600 pair-file
+# writer, so the desktop and the phone agree on one exact wire format.
+zkmsg-daemon = { path = "../daemon" }
 eframe = "0.29"
 anyhow.workspace = true
 starknet-types-core.workspace = true

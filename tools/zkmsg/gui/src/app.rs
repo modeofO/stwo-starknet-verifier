@@ -518,6 +518,7 @@ impl eframe::App for ZkmsgApp {
                     ui.selectable_value(&mut session.tab, Tab::Status, "Status");
                     ui.selectable_value(&mut session.tab, Tab::Compose, "Compose");
                     ui.selectable_value(&mut session.tab, Tab::Inbox, "Inbox");
+                    ui.selectable_value(&mut session.tab, Tab::Pair, "Pair");
                 }
                 if let Some(active_name) = &active_name {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 
 use zkmsg_core::config::Home;
 use zkmsg_daemon::auth::{load_or_create_token, token_path};
+use zkmsg_daemon::pair::{pairing_uri, write_pair_file};
 use zkmsg_daemon::reads::LiveReads;
 use zkmsg_daemon::runner::PipelineRunner;
 use zkmsg_daemon::server::{self, AppState};
@@ -23,23 +24,30 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 struct Args {
     addr: String,
     home: PathBuf,
+    emit_pair_file: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
     let mut addr = std::env::var("ZKMSG_DAEMON_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let mut home: Option<PathBuf> = None;
+    let mut emit_pair_file = std::env::var_os("ZKMSG_DAEMON_EMIT_PAIR_FILE").map(PathBuf::from);
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--addr" => addr = args.next().context("--addr needs a value")?,
             "--home" => home = Some(PathBuf::from(args.next().context("--home needs a value")?)),
+            "--emit-pair-file" => {
+                emit_pair_file =
+                    Some(PathBuf::from(args.next().context("--emit-pair-file needs a value")?));
+            }
             "-h" | "--help" => {
                 println!(
                     "zkmsgd — zkmsg companion daemon\n\n\
-                     USAGE:\n  zkmsgd [--addr HOST:PORT] [--home DIR]\n\n\
+                     USAGE:\n  zkmsgd [--addr HOST:PORT] [--home DIR] [--emit-pair-file PATH]\n\n\
                      Defaults: --addr {DEFAULT_ADDR}, --home ~/.zkmsg (its current profile).\n\
-                     Env: ZKMSG_DAEMON_ADDR overrides --addr.\n"
+                     --emit-pair-file writes a .zkmsgpair file (the pairing URI, 0600) and keeps running.\n\
+                     Env: ZKMSG_DAEMON_ADDR overrides --addr; ZKMSG_DAEMON_EMIT_PAIR_FILE sets --emit-pair-file.\n"
                 );
                 std::process::exit(0);
             }
@@ -54,7 +62,7 @@ fn parse_args() -> Result<Args> {
             PathBuf::from(base).join(".zkmsg")
         }
     };
-    Ok(Args { addr, home })
+    Ok(Args { addr, home, emit_pair_file })
 }
 
 fn main() -> Result<()> {
@@ -80,6 +88,14 @@ fn main() -> Result<()> {
 
     print_startup(&args.addr, &token, created, &token_path(&app.home.dir).display().to_string());
 
+    // Emit the pairing file when asked. It carries the bearer token, so it is
+    // written 0600 — the same care as the token file. The daemon keeps running.
+    if let Some(path) = &args.emit_pair_file {
+        write_pair_file(path, &args.addr, &token)
+            .with_context(|| format!("writing pairing file {}", path.display()))?;
+        println!("  wrote pairing file {} (0600) — AirDrop it to the phone", path.display());
+    }
+
     // Thread per request: an SSE stream holds its thread for the life of the
     // stream, so a fixed pool would starve. Pipeline RUNS are still serialized
     // by the run_lock inside `spawn_run`.
@@ -102,7 +118,11 @@ fn print_startup(addr: &str, token: &str, created: bool, token_file: &str) {
         println!("\n  PAIRING (shown once)");
         println!("  base URL : http://{addr}");
         println!("  token    : {token}");
-        println!("  Enter both on the phone to pair. The token is stored at {token_file} (0600).");
+        // The pair URI carries the token, so it prints only in this shown-once
+        // block. Copy it to pair without typing; or write it with
+        // --emit-pair-file and AirDrop the file.
+        println!("  pair URI : {}", pairing_uri(addr, token));
+        println!("  Enter both on the phone, or copy the pair URI. The token is stored at {token_file} (0600).");
     } else {
         println!("  token: reusing {token_file} (delete it and restart to re-pair)");
     }

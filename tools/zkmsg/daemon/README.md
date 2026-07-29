@@ -36,13 +36,17 @@ zkmsgd --home ~/.zkmsg/.zkmsg-alice   # a specific profile
 `--addr`.
 
 At first start the daemon mints a bearer token, stores it at
-`<home>/daemon-token` (mode 0600), and prints it once with the pairing URL:
+`<home>/daemon-token` (mode 0600), and prints it once with the pairing lines:
 
 ```
   PAIRING (shown once)
-  base URL : http://127.0.0.1:8787/v1
+  base URL : http://127.0.0.1:8787
   token    : 043a28624bb2d63b8...
+  pair URI : zkmsg://pair?url=http%3A%2F%2F127.0.0.1%3A8787&token=043a28624bb2d63b8...
 ```
+
+The base URL is the host root. The phone adds the `/v1` prefix, so the paired
+URL must not carry it.
 
 ## Pair a phone
 
@@ -62,6 +66,25 @@ At first start the daemon mints a bearer token, stores it at
 
 To re-pair, delete `<home>/daemon-token` and restart. The daemon mints a new
 token. The old token stops working.
+
+### Emit a pairing link or file
+
+The `pair URI` line in the banner pairs the phone without hand-typing. Copy it
+and open it on the phone. The URI is `zkmsg://pair?url=<base URL>&token=<token>`,
+with the base URL percent-encoded.
+
+`--emit-pair-file <path>` writes the same URI to a file and keeps the daemon
+running. The file gets extension `.zkmsgpair`. AirDrop it to the phone.
+
+```
+zkmsgd --addr 100.x.y.z:8787 --emit-pair-file ~/Desktop/phone.zkmsgpair
+```
+
+The file holds the bearer token, so the daemon writes it mode 0600 — the same
+care as the token file. `ZKMSG_DAEMON_EMIT_PAIR_FILE` sets the same path.
+
+The desktop GUI has a "Pair" tab that builds the same link. It reads the token
+from `<home>/daemon-token`, so start the daemon once first to mint the token.
 
 ## Security posture
 

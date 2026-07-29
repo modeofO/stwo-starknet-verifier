@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod hub;
+pub mod pair;
 pub mod reads;
 pub mod runner;
 pub mod server;
