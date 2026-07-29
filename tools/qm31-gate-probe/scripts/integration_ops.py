@@ -57,7 +57,13 @@ ARTIFACT = (
 GATEWAY_COMPILED_CLASS_HASH = 0x2758889B6F6C9C0568B2E0FAA35AE49B654AB7C88F960624C70CE57276D08B6
 PROBE_DEPLOY_SALT = 0x716D3331  # 'qm31'
 
-keys = json.loads((pathlib.Path.home() / ".config/qm31-integration/keys.json").read_text())
+# ZKMSG_KEYS selects the identity: the campaign account by default, or a
+# second one (e.g. a message recipient, which needs its own address because
+# the store permits one registration per caller).
+_keyfile = os.environ.get(
+    "ZKMSG_KEYS", str(pathlib.Path.home() / ".config/qm31-integration/keys.json")
+)
+keys = json.loads(pathlib.Path(_keyfile).read_text())
 PRIV = int(keys["stark_private_key"], 16)
 PUB = int(keys["stark_public_key"], 16)
 ACCOUNT = int(keys["l2_account_address"], 16)

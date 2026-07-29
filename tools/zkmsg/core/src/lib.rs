@@ -10,6 +10,7 @@ pub mod inbox;
 pub mod pack;
 pub mod pipeline;
 pub mod profiles;
+pub mod send;
 pub mod setup;
 pub mod state;
 pub mod tree;
