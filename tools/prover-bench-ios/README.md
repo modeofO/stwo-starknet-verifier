@@ -67,7 +67,8 @@ xcrun devicectl device copy from --device <device-udid> \
     --source tmp/bench_felts.json --destination phone_felts.json
 ```
 
-Notes: a free personal team works, but needs
-`-allowProvisioningDeviceRegistration` on the first build for a new device.
+Notes: the extended-virtual-addressing entitlement needs a paid developer
+team (Xcode refuses it for personal teams as of 2026-09), and the first build
+for a new device needs `-allowProvisioningDeviceRegistration`.
 Targeting an iOS version newer than the release SDK requires the matching
 Xcode beta (`DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer`).

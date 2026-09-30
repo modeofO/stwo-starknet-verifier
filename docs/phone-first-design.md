@@ -227,7 +227,9 @@ Default iOS caps a process near ~7 GB of mappings: measured
 `mmap size=33554432 errno=12 (ENOMEM) live_mb=6848 maps=337` with 45 GB free
 disk. prove (5.8 GB) fits under it; wrap (14.4 GB) does not. The fix is the
 **`com.apple.developer.kernel.extended-virtual-addressing` entitlement**
-(signs fine on a free personal team) — with it, wrap runs to completion.
+(signed on a free personal team in July; as of 2026-09 Xcode refuses it for
+personal teams, so a paid developer team is required) — with it, wrap runs to
+completion.
 Note `increased-memory-limit` is NOT needed: footprint never approaches the
 jetsam ceiling.
 

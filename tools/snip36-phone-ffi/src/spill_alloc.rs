@@ -35,16 +35,16 @@ static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Returns the peak concurrent spilled bytes observed so far.
 #[unsafe(no_mangle)]
-pub extern "C" fn zkmsg_peak_spill_bytes() -> u64 {
+pub extern "C" fn snip36_peak_spill_bytes() -> u64 {
     PEAK_BYTES.load(Ordering::Relaxed) as u64
 }
 
-/// Allocations at or above this size are spilled. 256 KiB rather than 4 MiB:
-/// the SNIP-36 prover (virtual OS + recursive prove) keeps ~2.6 GB in 256 KiB–
-/// 4 MiB buffers, which at 4 MiB stayed in phys_footprint (measured 2.88 GB vs
-/// 283 MB). The same value is used by snip36_phone_ffi, deliberately: both
-/// libraries are built by one nightly, so the app links ONE copy of this
-/// allocator — whichever archive comes first — and it must suit both.
+/// Allocations at or above this size are spilled. 256 KiB also catches the
+/// virtual OS run's and the recursive prover's mid-size buffers (~2.6 GB that
+/// 4 MiB left in phys_footprint), while small structures stay on the system
+/// allocator.
+// Must equal privacy-prove-cairo-bridge's threshold: the app links one copy of
+// this allocator for both libraries (see the comment there).
 const SPILL_THRESHOLD: usize = 256 << 10;
 
 /// Conservative lower bound on the page size; real page size is queried at
@@ -237,4 +237,9 @@ unsafe impl GlobalAlloc for SpillAlloc {
         }
         unsafe { System.dealloc(ptr, layout) }
     }
+}
+
+/// Current live spilled bytes, for profiling.
+pub fn live_spill_bytes() -> usize {
+    LIVE_BYTES.load(Ordering::Relaxed)
 }
