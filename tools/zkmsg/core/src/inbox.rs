@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
 use crate::chain::{Chain, bytearray_decode, felt_to_u64, snkeccak};
+use crate::config::store_deploy_block;
 use crate::crypto::{commitment, decrypt, ecdh_shared_x};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,11 +19,12 @@ pub struct ReceivedMessage {
     pub text: String,
 }
 
-/// Scans all MessageSent events and returns the ones addressed to
+/// Scans all MessageSent events (from the store's deploy block, see
+/// `config::store_deploy_block`) and returns the ones addressed to
 /// `scan_priv`, decrypted.
 pub fn scan(chain: &Chain, store: &str, scan_priv: &Felt) -> Result<Vec<ReceivedMessage>> {
     let key0 = format!("{:#x}", snkeccak("MessageSent"));
-    let events = chain.events(store, &key0, 0)?;
+    let events = chain.events(store, &key0, store_deploy_block(store))?;
 
     let mut received = vec![];
     for (keys, data) in events {

@@ -172,6 +172,7 @@ pub fn prepare_send(
     handle: &str,
     text: &str,
 ) -> Result<SendState> {
+    crate::config::ensure_lane1_send_store(&config.store)?;
     let chain = Chain::new(&config.rpc_url, &config.account);
     let (recipient_pub, recipient_leaf) = resolve_recipient(&chain, &config.store, handle)?;
 

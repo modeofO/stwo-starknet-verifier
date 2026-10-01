@@ -15,9 +15,67 @@ pub const SEPOLIA_REGISTRY: &str =
     "0x0194f44002b4af71e58ba7d30667ed565f1d420d3fb1e7c578de35170309c6aa";
 /// MessageStore v3 — deployed 2026-07-05 (docs/zkmsg-deployment.md),
 /// class 0x04dc67c0…5745, pinned to the live registry + the
-/// messagezk_scan circuit route.
-pub const SEPOLIA_STORE_DEFAULT: &str =
+/// messagezk_scan circuit route. Legacy: kept read-only for inbox history
+/// (`zkmsg inbox --legacy`), and still the store the lane-1 send pipeline
+/// targets.
+pub const SEPOLIA_STORE_V3: &str =
     "0x02d66a02b2efdddb5282bf7d7931cbb7a724f191478843b1fccbf3b9729e91b7";
+pub const SEPOLIA_STORE_V3_DEPLOY_BLOCK: u64 = 11_624_399;
+
+/// MessageStoreSnip36 (contracts/messagezk_store_snip36) — the home store.
+/// Same registration/tree/event interface as v3, but `send_message` takes
+/// no fact: the tx must carry SNIP-36 proof_facts from ZkmsgSendProver.
+pub const SEPOLIA_STORE_SNIP36: &str =
+    "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f";
+pub const SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK: u64 = 15_850_710;
+/// ZkmsgSendProver — the contract proven in the virtual OS for a SNIP-36 send.
+pub const SEPOLIA_SNIP36_SEND_PROVER: &str =
+    "0x012b85a4b5e6918eb6f18a07fddc1667d67beaac0ab647928105b8ccf7ee5346";
+
+/// The store a fresh profile is configured with.
+pub const SEPOLIA_STORE_DEFAULT: &str = SEPOLIA_STORE_SNIP36;
+
+/// Address equality as felts (tolerates leading zeros / case).
+pub fn same_address(a: &str, b: &str) -> bool {
+    match (Felt::from_hex(a), Felt::from_hex(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// First block worth scanning for `store`'s events: the deploy block of a
+/// known store, else 0. From-genesis getEvents 500s on publicnode.
+pub fn store_deploy_block(store: &str) -> u64 {
+    if same_address(store, SEPOLIA_STORE_SNIP36) {
+        SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK
+    } else if same_address(store, SEPOLIA_STORE_V3) {
+        SEPOLIA_STORE_V3_DEPLOY_BLOCK
+    } else {
+        0
+    }
+}
+
+/// Whether `store` is the SNIP-36 store (its `send_message` needs
+/// proof_facts the lane-1 pipeline cannot produce).
+pub fn is_snip36_store(store: &str) -> bool {
+    same_address(store, SEPOLIA_STORE_SNIP36)
+}
+
+/// Refuses a desktop send against the SNIP-36 store with a pointer to the
+/// route that can do it.
+pub fn ensure_lane1_send_store(store: &str) -> Result<()> {
+    if is_snip36_store(store) {
+        bail!(
+            "sending to the SNIP-36 store ({store}) is not supported from desktop yet: its \
+             send_message needs SNIP-36 proof_facts (virtual-OS proof of ZkmsgSendProver), \
+             which the lane-1 fact-registry pipeline cannot produce. Send from the iOS app \
+             (phone-only SNIP-36 route) or the `snip36` CLI in snip-36-prover-backend. To send \
+             on the legacy v3 store instead, set \"store\" in config.json to {SEPOLIA_STORE_V3} \
+             (requires a v3 registration)."
+        );
+    }
+    Ok(())
+}
 pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.com";
 
 /// STRK token (same address on Sepolia and mainnet) — the fee/transfer
@@ -188,5 +246,19 @@ mod tests {
         let c: Config = serde_json::from_str(old).unwrap();
         assert!(!c.burner);
         assert!(c.reply_handle.is_none());
+    }
+
+    #[test]
+    fn store_routing() {
+        assert_eq!(Config::default_sepolia(Path::new("/r")).store, SEPOLIA_STORE_SNIP36);
+        // Leading-zero / case differences still match.
+        assert_eq!(
+            store_deploy_block("0x2B9C6F617B3197DFED76401C32AA3B4B597EBDD01A7EBA4B5657236BC8084F"),
+            SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK,
+        );
+        assert_eq!(store_deploy_block(SEPOLIA_STORE_V3), SEPOLIA_STORE_V3_DEPLOY_BLOCK);
+        assert_eq!(store_deploy_block("0x123"), 0);
+        assert!(ensure_lane1_send_store(SEPOLIA_STORE_SNIP36).is_err());
+        assert!(ensure_lane1_send_store(SEPOLIA_STORE_V3).is_ok());
     }
 }

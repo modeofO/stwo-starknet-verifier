@@ -441,7 +441,7 @@ fn live_store_route_is_pinned_and_registry_validates_shipped_fact() {
     use serde_json::json;
     use zkmsg_core::chain::{snkeccak, Chain};
     use zkmsg_core::config::{
-        INNER_ROOT, PROGRAM_HASH, SEPOLIA_REGISTRY, SEPOLIA_RPC_DEFAULT, SEPOLIA_STORE_DEFAULT,
+        INNER_ROOT, PROGRAM_HASH, SEPOLIA_REGISTRY, SEPOLIA_RPC_DEFAULT, SEPOLIA_STORE_V3,
     };
 
     let chain = Chain::new(SEPOLIA_RPC_DEFAULT, "unused-for-read-only");
@@ -467,7 +467,7 @@ fn live_store_route_is_pinned_and_registry_validates_shipped_fact() {
     };
 
     // verification_route() -> (registry, program_hash, [8 inner_root words]).
-    let route = call(SEPOLIA_STORE_DEFAULT, "verification_route", vec![]);
+    let route = call(SEPOLIA_STORE_V3, "verification_route", vec![]);
     assert_eq!(route[0], Felt::from_hex(SEPOLIA_REGISTRY).unwrap(), "registry re-pointed");
     assert_eq!(route[1], Felt::from_hex(PROGRAM_HASH).unwrap(), "program hash changed");
     // route[2] is the span length (8); words follow.

@@ -89,6 +89,7 @@ impl<'a> Pipeline<'a> {
         state: &mut SendState,
         sink: &mut dyn FnMut(PipelineEvent),
     ) -> Result<()> {
+        crate::config::ensure_lane1_send_store(&self.config.store)?;
         fs::create_dir_all(self.workdir(state))?;
         while let Some(index) = state.next_pending() {
             let kind = state.steps[index].kind.clone();

@@ -1,7 +1,9 @@
 //! zkmsg — messagezk on lane 1, natively. A private message costs one
 //! locally-proven ZK statement (sender+recipient membership, ephemeral
 //! ECDH, commitment), verified on Starknet Sepolia through the live
-//! `StwoFactRegistry`, then published to MessageStore v3.
+//! `StwoFactRegistry`, then published to MessageStore v3. Fresh profiles
+//! default to the SNIP-36 store (register/inbox/status work; send is
+//! phone-only for now — see config::ensure_lane1_send_store).
 //!
 //! Spec: docs/superpowers/specs/2026-07-05-zkmsg-lane1-port-design.md.
 
@@ -60,13 +62,16 @@ enum Command {
         /// sncast account name to send transactions from.
         #[arg(long, default_value = "funded-deployer")]
         account: String,
-        /// MessageStore v3 address (defaults to the baked-in deployment).
+        /// MessageStore address (defaults to the SNIP-36 store; pass the v3
+        /// address to keep sending on the legacy lane-1 route).
         #[arg(long)]
         store: Option<String>,
     },
     /// Register a handle on-chain (one tx).
     Register { handle: String },
     /// Prove + verify + publish a private message (~50 STRK on Sepolia).
+    /// Lane-1 route: only works when the configured store is the legacy v3
+    /// store; the SNIP-36 store is sent to from the phone / `snip36` CLI.
     Send {
         handle: String,
         text: String,
@@ -77,7 +82,11 @@ enum Command {
     /// Resume an interrupted send at its first incomplete step.
     Resume { id: String },
     /// Scan MessageSent events and decrypt the ones addressed to you.
-    Inbox,
+    Inbox {
+        /// Also scan the legacy MessageStore v3 (read-only history).
+        #[arg(long)]
+        legacy: bool,
+    },
     /// Config, balance, projected cost, deployed addresses.
     Status,
     /// Internal: write the milestone-1 synthetic-tree args file.
@@ -95,7 +104,7 @@ fn main() -> Result<()> {
         Command::Register { handle } => cmd_register(&home, &handle),
         Command::Send { handle, text, force } => cmd_send(&home, &handle, &text, force),
         Command::Resume { id } => cmd_resume(&home, &id),
-        Command::Inbox => cmd_inbox(&home),
+        Command::Inbox { legacy } => cmd_inbox(&home, legacy),
         Command::Status => cmd_status(&home),
         Command::DevArgs { out } => cmd_dev_args(&out),
     }
@@ -133,6 +142,7 @@ fn cmd_send(home: &Home, handle: &str, text: &str, force: bool) -> Result<()> {
     let config = home.load_config()?;
     let keys = home.load_keys()?;
     ensure!(!config.store.is_empty(), "no store address in config.json");
+    zkmsg_core::config::ensure_lane1_send_store(&config.store)?;
     let sender_leaf = keys.leaf_index.context("not registered — run `zkmsg register`")?;
 
     if !force {
@@ -183,13 +193,26 @@ fn cli_sink(id: &str) -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) + '_ {
     }
 }
 
-fn cmd_inbox(home: &Home) -> Result<()> {
+fn cmd_inbox(home: &Home, legacy: bool) -> Result<()> {
+    use zkmsg_core::config::{SEPOLIA_STORE_V3, same_address};
     let config = home.load_config()?;
     let keys = home.load_keys()?;
     ensure!(!config.store.is_empty(), "no store address in config.json");
     let chain = Chain::new(&config.rpc_url, &config.account);
+    let scan_priv = keys.scan_priv_felt()?;
 
-    let messages = inbox::scan(&chain, &config.store, &keys.scan_priv_felt()?)?;
+    let mut messages = vec![];
+    if legacy && !same_address(&config.store, SEPOLIA_STORE_V3) {
+        let history = inbox::scan(&chain, SEPOLIA_STORE_V3, &scan_priv)?;
+        if !history.is_empty() {
+            println!("-- legacy v3 store ({} message(s)) --", history.len());
+            for m in &history {
+                println!("#{:<4} {}  {}", m.nonce, &m.commitment[..18], m.text);
+            }
+            println!("-- home store --");
+        }
+    }
+    messages.extend(inbox::scan(&chain, &config.store, &scan_priv)?);
     if messages.is_empty() {
         println!("inbox empty (no envelopes match your scan key)");
         return Ok(());
@@ -207,8 +230,17 @@ fn cmd_status(home: &Home) -> Result<()> {
     println!("rpc      : {}", report.rpc);
     println!("account  : {}", report.account);
     println!("registry : {} (live lane-1)", report.registry);
+    let route = if report.store.is_empty() {
+        ""
+    } else if zkmsg_core::config::is_snip36_store(&report.store) {
+        " (SNIP-36; desktop send unsupported)"
+    } else if zkmsg_core::config::same_address(&report.store, zkmsg_core::config::SEPOLIA_STORE_V3) {
+        " (legacy v3, lane-1)"
+    } else {
+        ""
+    };
     println!(
-        "store    : {}",
+        "store    : {}{route}",
         if report.store.is_empty() { "(not deployed)" } else { &report.store },
     );
     if let Some(scan_pub) = &report.scan_pub {
