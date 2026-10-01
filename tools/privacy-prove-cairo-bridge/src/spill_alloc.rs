@@ -24,7 +24,7 @@
 //! pure-RAM proving is ~30% faster when memory is plentiful).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicI8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicI8, AtomicUsize, Ordering};
 
 /// Live spilled bytes and mapping count, for diagnosing VM ceilings.
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -163,6 +163,63 @@ fn report_failure(stage: &str, size: usize, err: i32) {
     }
 }
 
+// Data protection. The spill holds the prover's memory, witness included
+// (the sender's scan private key among it), so on iOS every spill file must be
+// class A (NSFileProtectionComplete): its key is evicted shortly after the
+// device locks. The app creates the spill directory as class A and new files
+// should inherit that; this checks each file rather than trusting it, upgrades
+// one that came out weaker, and refuses to spill into one it cannot upgrade.
+// The class each file was born with is recorded for the app to report.
+#[cfg(target_os = "ios")]
+const F_GETPROTECTIONCLASS: libc::c_int = 63;
+#[cfg(target_os = "ios")]
+const F_SETPROTECTIONCLASS: libc::c_int = 64;
+#[cfg(target_os = "ios")]
+const PROTECTION_CLASS_A: libc::c_int = 1;
+
+/// Class the first spill file was born with; -1 before any spill (or off iOS).
+static INHERITED_CLASS: AtomicI64 = AtomicI64::new(-1);
+/// Spill files whose inherited class was weaker than A and had to be set.
+static UPGRADED_FILES: AtomicUsize = AtomicUsize::new(0);
+
+/// Inherited class of the first spill file of this process (-1: none yet).
+#[unsafe(no_mangle)]
+pub extern "C" fn zkmsg_spill_inherited_class() -> i64 {
+    INHERITED_CLASS.load(Ordering::Relaxed)
+}
+
+/// How many spill files had to be upgraded to class A.
+#[unsafe(no_mangle)]
+pub extern "C" fn zkmsg_spill_upgraded_files() -> u64 {
+    UPGRADED_FILES.load(Ordering::Relaxed) as u64
+}
+
+#[cfg(target_os = "ios")]
+fn protect(fd: libc::c_int, size: usize) -> bool {
+    unsafe {
+        let born = libc::fcntl(fd, F_GETPROTECTIONCLASS);
+        let _ = INHERITED_CLASS.compare_exchange(
+            -1, born as i64, Ordering::Relaxed, Ordering::Relaxed);
+        if born == PROTECTION_CLASS_A {
+            return true;
+        }
+        UPGRADED_FILES.fetch_add(1, Ordering::Relaxed);
+        if libc::fcntl(fd, F_SETPROTECTIONCLASS, PROTECTION_CLASS_A) != 0
+            || libc::fcntl(fd, F_GETPROTECTIONCLASS) != PROTECTION_CLASS_A
+        {
+            report_failure("protection", size, *libc::__error());
+            return false;
+        }
+        true
+    }
+}
+
+/// No data protection classes off iOS (the Mac CLI and examples).
+#[cfg(not(target_os = "ios"))]
+fn protect(_fd: libc::c_int, _size: usize) -> bool {
+    true
+}
+
 fn spill_mmap(size: usize) -> *mut u8 {
     let mut template = [0u8; libc::PATH_MAX as usize];
     if !build_template(&mut template) {
@@ -177,6 +234,10 @@ fn spill_mmap(size: usize) -> *mut u8 {
         // Anonymous on disk from birth: the name disappears immediately, the
         // file lives as long as the mapping.
         libc::unlink(template.as_ptr() as *const libc::c_char);
+        if !protect(fd, size) {
+            libc::close(fd);
+            return std::ptr::null_mut();
+        }
         let len = page_ceil(size);
         if libc::ftruncate(fd, len as libc::off_t) != 0 {
             report_failure("ftruncate", len, *libc::__error());
