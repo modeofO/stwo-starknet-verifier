@@ -238,7 +238,7 @@ pub const GAS_POLICY: GasPolicy =
 
 impl GasPolicy {
     pub fn bounds(&self, (l1, l2, l1_data): (u128, u128, u128)) -> Bounds {
-        let scale = |p: u128| p * self.price_percent / 100;
+        let scale = |p: u128| p.saturating_mul(self.price_percent) / 100;
         Bounds {
             l1_gas: ResourceBounds { max_amount: self.l1_gas, max_price_per_unit: scale(l1) },
             l2_gas: ResourceBounds { max_amount: self.l2_gas, max_price_per_unit: scale(l2) },
@@ -253,8 +253,8 @@ impl GasPolicy {
 pub fn fee_ceiling_fri(bounds: &Bounds) -> u128 {
     [bounds.l1_gas, bounds.l2_gas, bounds.l1_data_gas]
         .iter()
-        .map(|b| b.max_amount as u128 * b.max_price_per_unit)
-        .sum()
+        .map(|b| (b.max_amount as u128).saturating_mul(b.max_price_per_unit))
+        .fold(0u128, u128::saturating_add)
 }
 
 // --- the executor -----------------------------------------------------------
@@ -446,22 +446,26 @@ impl<'a> VirtualSender<'a> {
         let total = state.steps.len();
         sink(PipelineEvent::StepStarted { index, total, kind: StepKind::Publish });
 
-        // A hash saved by an earlier attempt is settled before anything new is
-        // signed: landed means done, in flight means wait for it.
+        // A hash saved by an earlier attempt is settled before anything is
+        // signed. Landed or still in flight: wait for it. Reverted: the fee
+        // is spent and the send is over. Only an explicit drop (never
+        // received, or rejected before execution) falls through, and then to
+        // the IDENTICAL transaction (saved nonce + bounds), which can land at
+        // most once however often it is resubmitted.
         if let Some(saved) = state.steps[index].tx_hash.clone() {
             let hash = Felt::from_hex(&saved)?;
             let status = self.gateway.status(&hash)?;
             if status.is_reverted() {
+                self.retire(state)?;
                 bail!(
                     "publish {saved} reverted ({}); its fee is spent — send again",
                     status.revert_reason.as_deref().unwrap_or("no reason")
                 );
             }
-            if status.is_accepted() || status.is_in_flight() {
+            if !status.is_dropped() || !self.rpc_agrees_dropped(&hash) {
                 self.gateway.await_acceptance(&hash, PUBLISH_POLL, PUBLISH_TIMEOUT)?;
                 return self.finish(state, index, saved, sink);
             }
-            // NOT_RECEIVED: the gateway dropped it. Fall through and resubmit.
         }
 
         let root = Felt::from_hex(&state.expected_merkle_root)?;
@@ -479,45 +483,96 @@ impl<'a> VirtualSender<'a> {
             &fs::read_to_string(self.proof_path(state)).context("reading the saved proof")?,
         )?;
         let facts = proof.facts()?;
+        let content = hex::decode(&state.ciphertext_hex)?;
+        // The saved proof must still attest exactly this send (a swapped or
+        // corrupted file would be signed over and burn the fee).
+        let expected = message_hash(
+            &self.route,
+            Felt::from_hex(&state.expected_commitment)?,
+            Felt::from_hex(&state.expected_ephemeral_pubkey)?,
+            root,
+            content_hash(&content),
+        );
+        check_facts(&facts, expected, state.base_block.context("state has no base block")?)?;
+
         let mut calldata = vec![
             Felt::from_hex(&state.expected_commitment)?,
             Felt::from_hex(&state.expected_ephemeral_pubkey)?,
             root,
         ];
-        for word in bytearray_calldata(&hex::decode(&state.ciphertext_hex)?) {
+        for word in bytearray_calldata(&content) {
             calldata.push(Felt::from_hex(&word)?);
         }
         let call = Call::new(self.route.store, "send_message", calldata);
-        let bounds = GAS_POLICY.bounds(self.chain.gas_prices()?);
         let attachment = ProofAttachment { proof: &proof.proof, proof_facts: &facts };
 
-        let mut nonce = self.nonce(None)?;
+        let (mut nonce, bounds) = match (&state.publish_nonce, state.publish_bounds) {
+            (Some(nonce), Some(bounds)) => (Felt::from_hex(nonce)?, bounds),
+            _ => (self.nonce(None)?, GAS_POLICY.bounds(self.chain.gas_prices()?)),
+        };
         for attempt in 0..PUBLISH_ATTEMPTS {
             let last = attempt + 1 == PUBLISH_ATTEMPTS;
-            match self.gateway.invoke(&self.signer, std::slice::from_ref(&call), nonce, bounds, Some(&attachment)) {
-                Ok(hash) => {
-                    let hex = felt_hex(&hash);
-                    state.record_submission(index, hex.clone());
-                    state.save(self.home)?;
+            let signed =
+                self.gateway.sign_invoke(&self.signer, std::slice::from_ref(&call), nonce, bounds, Some(&attachment))?;
+            let hex = felt_hex(&signed.hash);
+            // Recorded BEFORE the POST: whatever happens to the request, a
+            // resume knows the one hash this send may have produced.
+            state.record_submission(index, hex.clone());
+            state.publish_nonce = Some(felt_hex(&nonce));
+            state.publish_bounds = Some(bounds);
+            state.save(self.home)?;
+
+            let rejected = match self.gateway.submit(&signed) {
+                Ok(()) => {
                     sink(PipelineEvent::TxSubmitted { kind: StepKind::Publish, tx_hash: hex.clone() });
-                    self.gateway.await_acceptance(&hash, PUBLISH_POLL, PUBLISH_TIMEOUT)?;
+                    self.gateway.await_acceptance(&signed.hash, PUBLISH_POLL, PUBLISH_TIMEOUT)?;
                     return self.finish(state, index, hex, sink);
                 }
-                Err(e) => {
-                    let gateway = e.downcast_ref::<GatewayError>();
-                    if !last && gateway.is_some_and(GatewayError::too_recent) {
-                        std::thread::sleep(TOO_RECENT_WAIT);
-                        continue;
-                    }
-                    if let (false, Some(expected)) = (last, gateway.and_then(GatewayError::expected_nonce)) {
-                        nonce = Felt::from(expected);
-                        continue;
-                    }
-                    return Err(e);
-                }
+                Err(e) => match e.downcast_ref::<GatewayError>() {
+                    Some(g @ GatewayError::Rejected { .. }) => (g.clone(), e),
+                    // Timeout, 5xx, a hash mismatch: the gateway may hold the
+                    // transaction. Stop; the saved hash is polled on resume.
+                    _ => return Err(e),
+                },
+            };
+            let (gateway, err) = rejected;
+            if !last && gateway.too_recent() {
+                // Same transaction again once the base block is old enough.
+                std::thread::sleep(TOO_RECENT_WAIT);
+                continue;
             }
+            if let (false, Some(expected)) = (last, gateway.expected_nonce()) {
+                // The nonce moved. If it moved because THIS send landed (an
+                // earlier attempt the gateway did take), finish instead of
+                // paying again under the next nonce.
+                let status = self.gateway.status(&signed.hash)?;
+                if !status.is_dropped() || !self.rpc_agrees_dropped(&signed.hash) {
+                    self.gateway.await_acceptance(&signed.hash, PUBLISH_POLL, PUBLISH_TIMEOUT)?;
+                    return self.finish(state, index, hex, sink);
+                }
+                ensure!(
+                    Felt::from(expected) != nonce,
+                    "gateway rejected nonce {} but expects the same one",
+                    felt_hex(&nonce)
+                );
+                nonce = Felt::from(expected);
+                continue;
+            }
+            return Err(err);
         }
         bail!("publish retries exhausted")
+    }
+
+    /// Second opinion before anything is resubmitted under a new nonce: the
+    /// feeder can lag, so a transaction counts as dropped only if the RPC
+    /// doesn't know it either. Any doubt (an RPC error included) says "not
+    /// dropped", which waits instead of paying twice.
+    fn rpc_agrees_dropped(&self, hash: &Felt) -> bool {
+        match self.chain.rpc("starknet_getTransactionStatus", json!([felt_hex(hash)])) {
+            Ok(v) => matches!(v["finality_status"].as_str(), Some("REJECTED")),
+            // TXN_HASH_NOT_FOUND (code 29) is the RPC's "never seen it".
+            Err(e) => format!("{e:#}").contains("\"code\":29"),
+        }
     }
 
     fn finish(
@@ -579,10 +634,14 @@ impl<'a> VirtualSender<'a> {
             stdin.write_all(request.to_string().as_bytes())?;
         }
         drop(request);
-        let output = child.wait_with_output()?;
+        let output = child.wait_with_output();
+        // The spill files hold the prover's memory, witness included: gone
+        // whatever happened.
+        let _ = fs::remove_dir_all(&spill);
+        let output = output?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail: Vec<&str> = stderr.lines().rev().take(15).collect();
+            let tail: Vec<String> = stderr.lines().rev().take(8).map(redact_felts).collect();
             bail!(
                 "snip36-prove failed ({}):\n{}",
                 output.status,
@@ -676,6 +735,26 @@ impl<'a> VirtualSender<'a> {
         let low = out.first().context("balance_of shape")?;
         Ok(u128::from_str_radix(felt_hex(low).trim_start_matches("0x"), 16)?)
     }
+}
+
+/// Masks long hex runs in a prover log line: if the prover ever echoed its
+/// request, the witness (scan private key) must not reach the UI.
+fn redact_felts(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = rest.find("0x") {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos + 2..];
+        let len = tail.chars().take_while(char::is_ascii_hexdigit).count();
+        if len >= 16 {
+            out.push_str("0x…");
+        } else {
+            out.push_str(&rest[pos..pos + 2 + len]);
+        }
+        rest = &tail[len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn strk(fri: u128) -> String {
@@ -776,6 +855,15 @@ mod tests {
         );
         assert_eq!(&out[9..], &path[..]);
         assert!(prove_send_calldata_v2(Felt::ONE, &sealed, Felt::ONE, Felt::ONE, Felt::ONE, 0, &path[..19]).is_err());
+    }
+
+    #[test]
+    fn prover_errors_never_show_long_hex() {
+        assert_eq!(
+            redact_felts("bad calldata 0x5f3a9c1e2b4d6f8a0c1e3a5b7d9f1e2d at 0x12"),
+            "bad calldata 0x… at 0x12"
+        );
+        assert_eq!(redact_felts("no hex here"), "no hex here");
     }
 
     #[test]

@@ -149,6 +149,31 @@ impl Keys {
     }
 }
 
+/// Writes `bytes` to `path` atomically: a temp file in the same directory
+/// (created with `mode`, so a secret is never briefly world-readable),
+/// fsynced, then renamed over `path`.
+pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    let dir = path.parent().context("path has no parent")?;
+    let name = path.file_name().context("path has no file name")?.to_string_lossy();
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = options.open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
 /// The keys.json form of a KEM seed: `0x` + 128 lowercase hex digits.
 pub fn kem_seed_hex(seed: &[u8; crate::crypto::KEM_SEED_LEN]) -> String {
     format!("0x{}", hex::encode(seed))
@@ -187,8 +212,7 @@ impl Home {
 
     pub fn save_config(&self, config: &Config) -> Result<()> {
         fs::create_dir_all(&self.dir)?;
-        fs::write(self.config_path(), serde_json::to_string_pretty(config)?)?;
-        Ok(())
+        write_atomic(&self.config_path(), serde_json::to_string_pretty(config)?.as_bytes(), 0o644)
     }
 
     pub fn load_keys(&self) -> Result<Keys> {
@@ -204,27 +228,34 @@ impl Home {
             bail!("{} already exists; refusing to overwrite scan keys", self.keys_path().display());
         }
         fs::create_dir_all(&self.dir)?;
-        fs::write(self.keys_path(), serde_json::to_string_pretty(keys)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(self.keys_path(), fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        write_atomic(&self.keys_path(), serde_json::to_string_pretty(keys)?.as_bytes(), 0o600)
     }
 
     /// Updates mutable key metadata (handle/leaf index after registration).
+    /// Atomic and owner-only: the scan key and KEM seed in this file are
+    /// irreplaceable, so it is never left truncated.
     pub fn update_keys(&self, keys: &Keys) -> Result<()> {
-        fs::write(self.keys_path(), serde_json::to_string_pretty(keys)?)?;
-        Ok(())
+        write_atomic(&self.keys_path(), serde_json::to_string_pretty(keys)?.as_bytes(), 0o600)
     }
 
     /// Loads keys, adding a fresh ML-KEM seed first if the profile predates
     /// v2. The seed is written before it is returned, so a key the chain
     /// might learn (via `register`) is never one that only lived in memory.
+    ///
+    /// Refused for a profile that holds a handle but no seed: on the v2
+    /// store that registration committed to a seed this file has lost (an
+    /// older build rewrote keys.json without it), and minting another would
+    /// only hide that. `migrate_store` clears the handle first.
     pub fn ensure_kem_seed(&self) -> Result<Keys> {
         let mut keys = self.load_keys()?;
         if keys.kem_seed.is_none() {
+            if let Some(handle) = &keys.handle {
+                bail!(
+                    "keys.json holds the handle '{handle}' but no kem_seed — refusing to mint a new \
+                     one (restore the seed from a backup, or `zkmsg migrate-store` if '{handle}' is \
+                     an older store's registration)"
+                );
+            }
             keys.kem_seed = Some(kem_seed_hex(&crate::crypto::kem_seed_gen()));
             self.update_keys(&keys)?;
         }
@@ -264,6 +295,13 @@ mod tests {
         assert_eq!(bare.kem_seed_bytes().unwrap(), seeded.kem_seed_bytes().unwrap());
         assert_eq!(home.ensure_kem_seed().unwrap().kem_seed, seeded.kem_seed);
         assert_eq!(home.load_keys().unwrap().kem_seed, seeded.kem_seed);
+
+        // A registered profile whose seed went missing is refused, not re-seeded.
+        let lost = Keys { handle: Some("carol".into()), kem_seed: None, ..home.load_keys().unwrap() };
+        home.update_keys(&lost).unwrap();
+        assert!(home.ensure_kem_seed().is_err());
+        assert!(home.load_keys().unwrap().kem_seed.is_none());
+        home.update_keys(&seeded).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

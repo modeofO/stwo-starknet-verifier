@@ -21,6 +21,10 @@ use crate::invoke_v3::{Bounds, Call, InvokeV3, Signer, execute_calldata};
 pub const SEPOLIA_GATEWAY: &str = "https://alpha-sepolia.starknet.io/gateway";
 pub const SEPOLIA_FEEDER: &str = "https://feeder.alpha-sepolia.starknet.io/feeder_gateway";
 
+/// How long a just-submitted transaction may read as NOT_RECEIVED before it
+/// counts as dropped (feeder replicas lag the gateway).
+const DROP_GRACE: Duration = Duration::from_secs(90);
+
 /// Why the gateway turned a request down. Kept typed (and reachable through
 /// `anyhow::Error::downcast_ref`) so the caller can retry on the two
 /// rejections that tell it what to do next.
@@ -55,7 +59,13 @@ impl GatewayError {
         if !code.contains("INVALID_TRANSACTION_NONCE") {
             return None;
         }
-        let rest = &message[message.find("Expected: ")? + "Expected: ".len()..];
+        let rest = message[message.find("Expected: ")? + "Expected: ".len()..].trim_start();
+        // Decimal on the gateways seen so far; accept hex too rather than
+        // read "0x5" as 0.
+        if let Some(hex) = rest.strip_prefix("0x") {
+            let digits: String = hex.chars().take_while(char::is_ascii_hexdigit).collect();
+            return u64::from_str_radix(&digits, 16).ok();
+        }
         rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
     }
 
@@ -81,9 +91,12 @@ impl TxStatus {
     pub fn is_reverted(&self) -> bool {
         self.execution == "REVERTED"
     }
-    /// The gateway took it and it is waiting for a block.
-    pub fn is_in_flight(&self) -> bool {
-        self.finality == "RECEIVED"
+    /// The gateway does not have it: never received, or rejected before
+    /// execution (no fee). Only these make a resubmission safe. Anything
+    /// else that is not accepted or reverted — RECEIVED, a pre-confirmed
+    /// state, a status this code doesn't know — is waited on.
+    pub fn is_dropped(&self) -> bool {
+        matches!(self.finality.as_str(), "NOT_RECEIVED" | "REJECTED")
     }
 }
 
@@ -93,6 +106,13 @@ impl TxStatus {
 pub struct ProofAttachment<'a> {
     pub proof: &'a str,
     pub proof_facts: &'a [Felt],
+}
+
+/// An INVOKE v3 signed and ready to submit. Kept whole so a retry resubmits
+/// the identical transaction (same hash, so it can only ever land once).
+pub struct SignedInvoke {
+    pub hash: Felt,
+    body: Value,
 }
 
 pub struct Gateway {
@@ -110,16 +130,16 @@ impl Gateway {
         }
     }
 
-    /// Signs and submits one INVOKE v3 with `attachment`'s facts in the hash.
-    /// Returns the hash, after checking the gateway echoes the one we signed.
-    pub fn invoke(
+    /// Signs one INVOKE v3 with `attachment`'s facts in the hash. Nothing is
+    /// sent: the caller records the hash first, then `submit`s.
+    pub fn sign_invoke(
         &self,
         signer: &Signer,
         calls: &[Call],
         nonce: Felt,
         bounds: Bounds,
         attachment: Option<&ProofAttachment<'_>>,
-    ) -> Result<Felt> {
+    ) -> Result<SignedInvoke> {
         let calldata = execute_calldata(calls);
         let proof_facts = attachment.map(|a| a.proof_facts).unwrap_or(&[]);
         let hash = InvokeV3 {
@@ -152,18 +172,25 @@ impl Gateway {
             body["proof_facts"] = json!(a.proof_facts.iter().map(felt_hex).collect::<Vec<_>>());
         }
 
-        let reply = self.post("add_transaction", &body)?;
+        Ok(SignedInvoke { hash, body })
+    }
+
+    /// Submits a signed invoke, checking the gateway echoes the hash we
+    /// signed. An `Err` that is not a `GatewayError::Rejected` says nothing
+    /// about whether the gateway kept the transaction: poll the hash.
+    pub fn submit(&self, signed: &SignedInvoke) -> Result<()> {
+        let reply = self.post("add_transaction", &signed.body)?;
         let echoed = reply["transaction_hash"]
             .as_str()
             .with_context(|| format!("no transaction_hash in gateway reply: {reply}"))?;
-        if Felt::from_hex(echoed)? != hash {
+        if Felt::from_hex(echoed).ok() != Some(signed.hash) {
             return Err(GatewayError::HashMismatch {
-                signed: felt_hex(&hash),
+                signed: felt_hex(&signed.hash),
                 echoed: echoed.to_string(),
             }
             .into());
         }
-        Ok(hash)
+        Ok(())
     }
 
     pub fn status(&self, hash: &Felt) -> Result<TxStatus> {
@@ -187,11 +214,17 @@ impl Gateway {
     }
 
     /// Polls until accepted. A revert is an error, and is final: the fee is
-    /// spent, so a caller must not resubmit blindly.
+    /// spent, so a caller must not resubmit blindly. A transaction still
+    /// reported dropped after `DROP_GRACE` (feeders can lag the gateway) is
+    /// an error too; the caller may then resubmit the identical transaction.
     pub fn await_acceptance(&self, hash: &Felt, poll: Duration, timeout: Duration) -> Result<TxStatus> {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
         loop {
             let status = self.status(hash)?;
+            if status.is_dropped() && started.elapsed() > DROP_GRACE {
+                bail!("tx {} was dropped by the gateway ({})", felt_hex(hash), status.finality);
+            }
             if status.is_reverted() {
                 return Err(GatewayError::Reverted {
                     hash: felt_hex(hash),
@@ -267,7 +300,19 @@ mod tests {
             "Invalid transaction nonce of contract at address 0x12. Account nonce: 0x5; got: 0x4. Expected: 5",
         );
         assert_eq!(e.expected_nonce(), Some(5));
+        let hex = rejected("StarknetErrorCode.INVALID_TRANSACTION_NONCE", "... Expected: 0x1a.");
+        assert_eq!(hex.expected_nonce(), Some(26));
         assert_eq!(rejected("StarknetErrorCode.VALIDATE_FAILURE", "Expected: 5").expected_nonce(), None);
+    }
+
+    #[test]
+    fn only_explicit_drops_allow_resubmission() {
+        let status = |f: &str| TxStatus { finality: f.into(), execution: String::new(), revert_reason: None };
+        assert!(status("NOT_RECEIVED").is_dropped());
+        assert!(status("REJECTED").is_dropped());
+        for waiting in ["RECEIVED", "PRE_CONFIRMED", "CANDIDATE", "UNKNOWN"] {
+            assert!(!status(waiting).is_dropped(), "{waiting} must be waited on");
+        }
     }
 
     #[test]

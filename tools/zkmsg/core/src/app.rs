@@ -115,12 +115,12 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
         "{} is not the v2 store — `zkmsg migrate-store` first",
         config.store
     );
+    if let Some(existing) = &home.load_keys()?.handle {
+        bail!("already registered as '{existing}'");
+    }
     // Registration publishes the ML-KEM key too; an older profile gets its
     // seed now, written to keys.json before anything reaches the chain.
     let mut keys = home.ensure_kem_seed()?;
-    if let Some(existing) = &keys.handle {
-        bail!("already registered as '{existing}'");
-    }
     let ek = keys.kem_keypair()?.1;
     let digest = kem_digest(&ek);
 
@@ -129,11 +129,14 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let ours = |user: &Member| {
         Some(user.scan_pub) == keys.scan_pub_felt().ok() && user.kem_digest == digest
     };
-    let already = chain
-        .call(&config.store, "get_user", &[felt_hex(&handle_felt)])
-        .ok()
-        .and_then(|u| Member::parse(&u).ok())
-        .filter(|u| ours(u));
+    // Only the store's own "unknown handle" means unregistered; any other
+    // failure (RPC down, timeout) stops here rather than paying for a
+    // register that may already have landed.
+    let already = match chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)]) {
+        Ok(u) => Some(Member::parse(&u)?).filter(|u| ours(u)),
+        Err(e) if is_unknown_handle(&format!("{e:#}")) => None,
+        Err(e) => return Err(e.context("checking whether the handle is registered")),
+    };
     let tx_hash = if already.is_none() {
         let mut calldata = vec![felt_hex(&handle_felt), keys.scan_pub.clone()];
         calldata.extend(bytearray_calldata(&ek));
@@ -157,6 +160,12 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     })
 }
 
+/// The store's `get_user` revert for an unregistered handle. sncast reports
+/// the reason hex-encoded (`0x756e6b…` = 'unknown handle'); match both forms.
+fn is_unknown_handle(error: &str) -> bool {
+    error.contains("unknown handle") || error.contains(&format!("0x{}", hex::encode("unknown handle")))
+}
+
 /// A registered member as `get_user` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
@@ -176,7 +185,7 @@ impl Member {
 
     pub fn from_felts(user: &[Felt]) -> Result<Self> {
         ensure!(user.len() == 4, "get_user returned {} felts, expected 4", user.len());
-        Ok(Self { scan_pub: user[1], kem_digest: user[2], leaf_index: felt_to_u64(&user[3])? as u32 })
+        Ok(Self { scan_pub: user[1], kem_digest: user[2], leaf_index: u32::try_from(felt_to_u64(&user[3])?).context("leaf index")? })
     }
 }
 
@@ -211,12 +220,16 @@ pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
         pending.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", "),
     );
 
-    let mut keys = home.ensure_kem_seed()?;
+    // One write: the old store's handle out, a seed in if there isn't one.
+    let mut keys = home.load_keys()?;
     let migration = StoreMigration {
         previous_store: config.store.clone(),
         previous_handle: keys.handle.take(),
     };
     keys.leaf_index = None;
+    if keys.kem_seed.is_none() {
+        keys.kem_seed = Some(crate::config::kem_seed_hex(&crate::crypto::kem_seed_gen()));
+    }
     home.update_keys(&keys)?;
     config.store = crate::config::SEPOLIA_STORE_V2.to_string();
     home.save_config(&config)?;
@@ -300,6 +313,15 @@ pub fn account_balance_strk(chain: &Chain, config: &Config) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recognises_the_unknown_handle_revert() {
+        // Verbatim from sncast 0.61 against the v2 store, 2026-10-01.
+        assert!(is_unknown_handle(
+            r#"sncast error: "An error occurred in the called contract = ContractErrorData { revert_error: Message(\"0x756e6b6e6f776e2068616e646c65\") }""#
+        ));
+        assert!(!is_unknown_handle("rpc starknet_call: connection refused"));
+    }
+
     #[test]
     fn short_string_matches_cairo() {
         assert_eq!(short_string_felt("zkmsg").unwrap(),

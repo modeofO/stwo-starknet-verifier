@@ -47,6 +47,14 @@ pub struct SendState {
     pub steps: Vec<StepRecord>,
     /// The block the send was prepared and proven on.
     pub base_block: Option<u64>,
+    /// The nonce and fee bounds of the publish transaction recorded on the
+    /// Publish step, saved with its hash BEFORE it is submitted: a retry
+    /// re-signs exactly the same transaction (same hash), so however often
+    /// it is resubmitted it can only land once.
+    #[serde(default)]
+    pub publish_nonce: Option<String>,
+    #[serde(default)]
+    pub publish_bounds: Option<crate::invoke_v3::Bounds>,
 }
 
 impl SendState {
@@ -70,6 +78,8 @@ impl SendState {
             expected_merkle_root: expected.2,
             steps,
             base_block: Some(base_block),
+            publish_nonce: None,
+            publish_bounds: None,
         }
     }
 
@@ -98,10 +108,11 @@ impl SendState {
         home.sends_dir().join(id)
     }
 
+    /// Atomic (temp file + fsync + rename): a crash mid-write must never
+    /// leave a truncated state that loses a recorded transaction hash.
     pub fn save(&self, home: &Home) -> Result<()> {
         fs::create_dir_all(home.sends_dir())?;
-        fs::write(Self::path(home, &self.id), serde_json::to_string_pretty(self)?)?;
-        Ok(())
+        crate::config::write_atomic(&Self::path(home, &self.id), serde_json::to_string_pretty(self)?.as_bytes(), 0o600)
     }
 
     pub fn load(home: &Home, id: &str) -> Result<Self> {

@@ -28,7 +28,7 @@ use starknet_types_core::felt::Felt;
 use crate::chain::{felt_hex, snkeccak};
 
 /// One resource's fee ceiling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ResourceBounds {
     pub max_amount: u64,
     pub max_price_per_unit: u128,
@@ -55,7 +55,7 @@ impl ResourceBounds {
 }
 
 /// The three resources priced separately since Starknet 0.13.4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Bounds {
     pub l1_gas: ResourceBounds,
     pub l2_gas: ResourceBounds,
