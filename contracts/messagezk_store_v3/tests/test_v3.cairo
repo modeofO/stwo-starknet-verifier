@@ -366,3 +366,25 @@ fn root_history_window() {
     register_as(store, 0x1000 + 63, 0x2000 + 63, BOB_SCAN_PUB, bob_kem_pubkey(), BOB_M_COMMIT);
     assert(!store.is_known_root(ROOT), 'root kept too long');
 }
+
+// --- a real proof --------------------------------------------------------------
+
+/// The facts of the first real v3 proof carry the message hash the store
+/// recomputes from the published send.
+#[test]
+fn message_hash_matches_the_mac_proof() {
+    let facts = crate::mac_proof::proof_facts();
+    assert_eq!(facts.len(), 9);
+    assert_eq!(*facts.at(0), PROOF_VERSION_V1);
+    assert_eq!(*facts.at(1), VIRTUAL_SNOS);
+    assert_eq!(*facts.at(3), VIRTUAL_OS_OUTPUT_VERSION);
+    assert_eq!(*facts.at(7), 1);
+    let payload = send_payload(
+        crate::mac_proof::STORE,
+        crate::mac_proof::COMMITMENT,
+        crate::mac_proof::EPHEMERAL_PUBKEY,
+        crate::mac_proof::MERKLE_ROOT,
+        crate::mac_proof::CONTENT_HASH,
+    );
+    assert_eq!(message_hash(crate::mac_proof::PROVER, 0, payload.span()), *facts.at(8));
+}

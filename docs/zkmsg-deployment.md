@@ -246,3 +246,54 @@ publish; the virtual OS ran at the prepare block. The proof was 317,092
 base64 bytes. The prove note reads "spill class A". The content was 1,136
 bytes. The publish transaction was signed and saved before the POST
 (nonce 0x8), per the double-pay fix.
+
+## zkmsg v3: hash-based membership, SNIP-36 route (Sepolia alpha, 2026-10-01)
+
+Design: `docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`.
+Code: `contracts/messagezk_store_v3` (Scarb 2.18), branch `pq-v3`. Declared
+and deployed from `deployer` via zan.
+
+| What | Value |
+|---|---|
+| `MessageStoreV3` | `0x0103de677e966a8a72669551093f0f5342621e635531fec146c4b04c5f5d3d9d` |
+| store class hash | `0x0726c71cc88be208ac9b2033b1f68764facf278a45df8b5563bffffe7513f82d` |
+| store deploy block | **15952418** (scan start) |
+| `ZkmsgSendProverV3` | `0x03d4da714c3bb315fe54017d2556face941836c2d5dfa9cc0b6852b94c0b4f30` |
+| prover class hash | `0x01ad0a16a941298103c36be0e3014bbd768acf7755c55a91bb543f2dfbb9d333` |
+| prover deploy block | 15952394 |
+| root history | 64 |
+
+| tx | hash | block | fee |
+|---|---|---|---|
+| declare prover | `0x0177e9904bcb02e1b4ae991c7a05db5ff06dfee77a635561370ac19ec113b898` | 15952387 | 1.49 STRK |
+| deploy prover | `0x015696af63a883ea191cace529911f280d961f40d095f4b5e8189ea19c9dc08e` | 15952394 | 0.03 STRK |
+| declare store | `0x01c4a0f38b4dd55ab3bf20383b20dfedb6961d4dbafd980708c4d8d0c3c3dab8` | 15952411 | 9.50 STRK |
+| deploy store (pinned to the prover) | `0x06d5dc5f7bd7b73e226a094c8ce06e6e153a4520b3f5416a43e2ae16ebbc2981` | 15952418 | 0.04 STRK |
+
+Total 11.05 STRK. `prover()` returns the prover.
+
+ABI (pinned in the spec):
+- `register(handle, scan_pubkey, kem_pubkey: ByteArray, m_commit)`
+- `UserRegistered` data `[handle, scan_pubkey, leaf_index, m_commit, kem_pubkey...]`
+- `get_user(handle) -> (owner, scan_pubkey, kem_digest, m_commit, leaf_index)`
+- `get_m_commit(owner)`
+- `prove_send(store, content_hash, commitment, ephemeral_pubkey, merkle_root,
+  sender_scan_pub, sender_kem_digest, member_secret, sender_leaf_index,
+  sender_path)`
+
+### First v3 send (Mac prove)
+
+Test identity `mode` (leaf 0, owner `deployer`): the scan key from
+`.zkmsg-mode`, plus a fresh KEM seed and member secret (keys in
+`.prover/v3-test-keys/`, gitignored).
+
+- Register tx `0x03a4838356b7784d0d8979c8bfb21093ec3a426359a199ac76909bd0246cc1a2`:
+  0.365 STRK, 18.1M L2 gas. `get_user` returns the expected `m_commit`.
+- Self-send, built with `v2_cli send3` and proved with `prove_cli`:
+  - 142,983 steps (ec_op 3, poseidon 163; v2 was 142,905: one EC op fewer,
+    a few more Poseidon calls);
+  - 16 s on the Mac, 321 MB footprint.
+- Publish tx `0x0468b1a4f7db737f5d2a4d6ec15b2c566b072d3c0159524a7f1c8ded914bfd64`:
+  1.565 STRK, 78.0M L2 gas.
+- `v2_cli open` decrypts it. The facts are pinned in
+  `contracts/messagezk_store_v3/tests/mac_proof.cairo`.
