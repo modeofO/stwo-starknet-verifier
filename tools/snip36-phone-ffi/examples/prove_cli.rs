@@ -1,7 +1,7 @@
 //! Host check of the exact code path the phone runs:
 //! `prove_cli <request.json> <out_prefix>` writes `<out_prefix>.proof` (base64) and
 //! `<out_prefix>.proof_facts` in the layout `snip36 submit` reads.
-//! Bench: also prints the process's storage I/O (the cost that dominates on a phone).
+//! Also prints the process's storage I/O (the cost that dominates on a phone).
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

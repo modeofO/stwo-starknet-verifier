@@ -33,14 +33,6 @@ static LIVE_MAPS: AtomicUsize = AtomicUsize::new(0);
 /// Peak live spill, readable from the host app for reporting.
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-/// Bench: peak live spill since the last `take_window_peak_bytes`.
-static WINDOW_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// Bench: returns the peak live spill since the previous call and restarts the window.
-pub fn take_window_peak_bytes() -> usize {
-    WINDOW_PEAK_BYTES.swap(LIVE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed)
-}
-
 /// Returns the peak concurrent spilled bytes observed so far.
 #[unsafe(no_mangle)]
 pub extern "C" fn snip36_peak_spill_bytes() -> u64 {
@@ -268,7 +260,6 @@ fn spill_mmap(size: usize) -> *mut u8 {
         let live = LIVE_BYTES.fetch_add(len, Ordering::Relaxed) + len;
         LIVE_MAPS.fetch_add(1, Ordering::Relaxed);
         PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-        WINDOW_PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
         ptr as *mut u8
     }
 }
@@ -310,6 +301,7 @@ unsafe impl GlobalAlloc for SpillAlloc {
 }
 
 /// Current live spilled bytes, for profiling.
+#[cfg(feature = "profiling")]
 pub fn live_spill_bytes() -> usize {
     LIVE_BYTES.load(Ordering::Relaxed)
 }

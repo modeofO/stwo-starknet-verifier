@@ -68,8 +68,94 @@ The phone needs the `com.apple.developer.kernel.extended-virtual-addressing`
 entitlement (paid developer team): without it iOS refuses mappings past
 ~6.75 GB.
 
-Those numbers are the unpatched stack. [`memory-opt/`](memory-opt/README.md)
-patches stwo, stwo-circuits and proving-utils to cut peak spill to ~3.1 GiB
-with a byte-identical proof; build with `memory-opt/setup.sh` instead of the
-steps above. The optimizations are on by default and `SNIP36_OPTIMIZE=0` turns
-them off.
+Those numbers are the unpatched stack, which is what the desktop builds.
+
+## Phone build (memory-optimized)
+
+The iOS app links a separately built, patched proving stack. The desktop does
+not: its build (`.prover/sequencer`, above) stays as it is.
+
+**Why phone only.** The phone prover is paging-bound: the iPhone 14 Pro spends
+most of a send faulting spilled pages in and out, not computing.
+[`memory-opt/`](memory-opt/README.md) patches stwo and proving-utils so the
+prover stops holding data it never reads again. Peak spill drops from ~13 GiB to
+~3.1–3.3 GiB, and the proof is byte-identical. That costs recomputation: on a
+Mac, which has the RAM to keep everything resident, it is ~35% slower, so the
+desktop keeps the unpatched stack.
+
+| | prove + publish |
+|---|---|
+| iPhone 14 Pro, unpatched | 261 s |
+| iPhone 14 Pro, memory-optimized | 76 s |
+
+(Mac, spill on: peak spill 13.1 → 3.1 GiB, wall 9.4 → 13.5 s.)
+
+**Layout.** Everything is gitignored under the main checkout's `.prover/`
+(also when you work from a git worktree):
+
+- `.prover/patched-phone/{stwo,proving-utils}`: upstream checkouts at the
+  revisions pinned in `memory-opt/setup.sh`, with `stwo.patch` and
+  `proving-utils.patch` applied;
+- `.prover/sequencer-phone`: sequencer at `e6b6fd2` (PRIVACY-0.14.3-RC.2) with
+  `sequencer.patch` (adds this crate to the workspace and `[patch]`es stwo and
+  proving-utils to `../patched-phone`), plus a copy of this crate;
+- `.prover/sequencer_venv`: shared with the desktop build, created only if missing.
+
+**Build.**
+
+```sh
+tools/snip36-phone-ffi/memory-opt/setup.sh          # = ios
+# -> .prover/sequencer-phone/target/aarch64-apple-ios/release/libsnip36_phone_ffi.a
+```
+
+`setup.sh [prepare|ios|mac|both]` clones whatever is missing, applies the
+patches and copies this crate into `sequencer-phone`, then builds. It is safe to
+re-run: it never resets, cleans or deletes. A checkout is moved to its pinned
+revision only if its working tree is clean; a patch already applied is left
+alone; a patch applied by an earlier run is reversed before its new version
+goes on; copying this crate updates files but never removes extra ones (such as
+a local `src/bin`). If something conflicts it stops and says what. It never
+touches `.prover/sequencer`. `prepare` stops before building; after it, the
+build is the usual command run in `.prover/sequencer-phone`:
+
+```sh
+cd .prover/sequencer-phone
+PATH=$PWD/../sequencer_venv/bin:$PATH RUSTC_WRAPPER= \
+  cargo +nightly-2026-01-15 build --release --target aarch64-apple-ios -p snip36_phone_ffi --lib
+```
+
+Point zkmsg-ios `App/project.yml` (`LIBRARY_SEARCH_PATHS`) at
+`.prover/sequencer-phone/target/aarch64-apple-ios/release`.
+
+**Switches.** The optimizations are compile-time constants in the patched
+stwo (`crates/stwo/src/prover/memopt.rs`, read by privacy_prove too). Nothing
+reads or sets an environment variable at run time. They are on by default;
+building with `SNIP36_MEMOPT=0` in the environment compiles them out (upstream
+behavior, same proof bytes). Cargo rebuilds stwo and its dependents when that
+variable changes, so keep the baseline in its own target dir.
+
+**A/B.**
+
+```sh
+cd .prover/sequencer-phone
+export PATH=$PWD/../sequencer_venv/bin:$PATH RUSTC_WRAPPER=
+B="cargo +nightly-2026-01-15 build --release"
+# phone
+$B --target aarch64-apple-ios -p snip36_phone_ffi --lib
+SNIP36_MEMOPT=0 CARGO_TARGET_DIR=target-baseline $B --target aarch64-apple-ios -p snip36_phone_ffi --lib
+# Mac: prove one fresh request both ways, compare, verify
+$B -p snip36_phone_ffi --example prove_cli --example verify_cli
+SNIP36_MEMOPT=0 CARGO_TARGET_DIR=target-baseline $B -p snip36_phone_ffi --example prove_cli
+ZKMSG_SPILL_DIR=/tmp/spill target/release/examples/prove_cli request.json opt
+ZKMSG_SPILL_DIR=/tmp/spill target-baseline/release/examples/prove_cli request.json base
+cmp opt.proof base.proof && target/release/examples/verify_cli opt
+```
+
+For the phone, link one library or the other and compare the
+`snip36 prove finished … prove_ms=… peak_spill_mib=…` log line. `peak_spill_mib`
+comes from this library's copy of the spill allocator; the app links one
+allocator for both prover libraries, so on the phone it may read 0. A request
+must use a recent block: public RPCs keep storage proofs for only a few blocks.
+
+Development only: `--features profiling` turns on `SNIP36_LIVE_PROFILE=<file>`
+(live spill sampled every 100 ms). It is off in normal builds.

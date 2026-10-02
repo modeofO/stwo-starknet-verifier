@@ -1,5 +1,5 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 8e92f4bf1f..c41a04fdd6 100644
+index 8e92f4bf1..99da50893 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -4,6 +4,7 @@
@@ -10,64 +10,21 @@ index 8e92f4bf1f..c41a04fdd6 100644
    "crates/apollo_base_layer_tests",
    "crates/apollo_batcher",
    "crates/apollo_batcher_config",
-@@ -447,3 +448,24 @@ strip = "none"
+@@ -447,3 +448,17 @@ strip = "none"
  as_conversions = "warn"
  await_holding_lock = "warn"
  await_holding_refcell_ref = "warn"
 +
-+# Memory-optimized proving stack: upstream checkouts with tools/snip36-phone-ffi/memory-opt/*.patch applied.
++# zkmsg phone build only (.prover/sequencer-phone): the memory-optimized proving stack, i.e.
++# upstream checkouts in .prover/patched-phone with tools/snip36-phone-ffi/memory-opt/*.patch
++# applied. The desktop build (.prover/sequencer) does not have this section.
 +[patch."https://github.com/starkware-libs/proving-utils"]
-+cairo-program-runner-lib = { path = "../patched/proving-utils/crates/cairo-program-runner-lib" }
-+privacy-circuit-verify = { path = "../patched/proving-utils/crates/privacy_circuit_verify" }
-+privacy-prove = { path = "../patched/proving-utils/crates/privacy_prove" }
-+
-+[patch."https://github.com/starkware-libs/stwo-circuits"]
-+circuit-cairo-verifier = { path = "../patched/stwo-circuits/crates/cairo_verifier" }
-+circuit-common = { path = "../patched/stwo-circuits/crates/circuit_common" }
-+circuit-prover = { path = "../patched/stwo-circuits/crates/circuit_prover" }
-+circuit-serialize = { path = "../patched/stwo-circuits/crates/circuit_serialize" }
-+circuit-verifier = { path = "../patched/stwo-circuits/crates/circuit_verifier" }
-+circuits = { path = "../patched/stwo-circuits/crates/circuits" }
-+circuits-stark-verifier = { path = "../patched/stwo-circuits/crates/stark_verifier" }
++cairo-program-runner-lib = { path = "../patched-phone/proving-utils/crates/cairo-program-runner-lib" }
++privacy-circuit-verify = { path = "../patched-phone/proving-utils/crates/privacy_circuit_verify" }
++privacy-prove = { path = "../patched-phone/proving-utils/crates/privacy_prove" }
 +
 +[patch."https://github.com/starkware-libs/stwo"]
-+stwo = { path = "../patched/stwo/crates/stwo" }
-+stwo-air-utils = { path = "../patched/stwo/crates/air-utils" }
-+stwo-air-utils-derive = { path = "../patched/stwo/crates/air-utils-derive" }
-+stwo-constraint-framework = { path = "../patched/stwo/crates/constraint-framework" }
-diff --git a/crates/starknet_transaction_prover/src/running/runner.rs b/crates/starknet_transaction_prover/src/running/runner.rs
-index fde6ce96fe..928984b672 100644
---- a/crates/starknet_transaction_prover/src/running/runner.rs
-+++ b/crates/starknet_transaction_prover/src/running/runner.rs
-@@ -302,15 +302,18 @@ where
-         // Execute virtual block to get execution data including L2 to L1 messages.
-         // Execute in a blocking thread pool to avoid blocking the async runtime.
-         // The RPC state reader uses request::blocking which would block the tokio runtime.
-+        let stage = std::time::Instant::now();
-         let execution_data = tokio::task::spawn_blocking(move || {
-             virtual_block_executor.execute(block_id, contract_class_manager, txs_with_hashes)
-         })
-         .await??;
-+        info!(stage_ms = %stage.elapsed().as_millis(), "bench stage: execute virtual block");
- 
-         // Extract L2 to L1 messages from execution data.
-         let l2_to_l1_messages = execution_data.l2_to_l1_messages.clone();
- 
-         // Create OS hints from execution data.
-+        let stage = std::time::Instant::now();
-         let os_hints = Self::create_virtual_os_hints(
-             execution_data,
-             &classes_provider,
-@@ -319,9 +322,12 @@ where
-             txs_for_hints,
-         )
-         .await?;
-+        info!(stage_ms = %stage.elapsed().as_millis(), "bench stage: create OS hints");
- 
-         // Run virtual OS to get Cairo PIE.
-+        let stage = std::time::Instant::now();
-         let output = run_virtual_os(os_hints)?;
-+        info!(stage_ms = %stage.elapsed().as_millis(), "bench stage: run virtual OS");
- 
-         // Log execution resources.
-         let resources = &output.cairo_pie.execution_resources;
++stwo = { path = "../patched-phone/stwo/crates/stwo" }
++stwo-air-utils = { path = "../patched-phone/stwo/crates/air-utils" }
++stwo-air-utils-derive = { path = "../patched-phone/stwo/crates/air-utils-derive" }
++stwo-constraint-framework = { path = "../patched-phone/stwo/crates/constraint-framework" }

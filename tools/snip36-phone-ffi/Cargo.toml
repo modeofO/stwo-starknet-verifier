@@ -13,6 +13,10 @@ crate-type = ["staticlib", "rlib"]
 name = "snip36-prove"
 path = "src/bin/snip36-prove.rs"
 
+[features]
+# Development only: SNIP36_LIVE_PROFILE=<file> samples live spill every 100 ms.
+profiling = []
+
 [dependencies]
 blockifier_reexecution.workspace = true
 libc = "0.2"
@@ -22,3 +26,6 @@ starknet_transaction_prover = { workspace = true, features = ["stwo_proving"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+starknet_proof_verifier.workspace = true

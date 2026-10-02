@@ -320,6 +320,54 @@ index a7a27e6..5d050ba 100644
      fn zeros(length: usize) -> Self {
          let data = vec![PackedBaseField::zeroed(); length.div_ceil(N_LANES)];
          Self { data, length }
+diff --git a/crates/stwo/src/prover/memopt.rs b/crates/stwo/src/prover/memopt.rs
+new file mode 100644
+index 0000000..b2d5a15
+--- /dev/null
++++ b/crates/stwo/src/prover/memopt.rs
+@@ -0,0 +1,42 @@
++//! Memory optimizations for the zkmsg phone prover (SNIP-36 transaction proofs).
++//!
++//! Fixed at compile time: there are no runtime switches, environment reads, or
++//! `set_var`. All of them are on unless the crate is built with `SNIP36_MEMOPT=0` in
++//! the build environment, which gives the upstream behavior for an A/B comparison
++//! (`cargo` rebuilds this crate when that variable changes). The proof bytes are the
++//! same either way.
++
++/// Whether the optimizations are compiled in.
++pub const ENABLED: bool = !is_zero(option_env!("SNIP36_MEMOPT"));
++
++const fn is_zero(v: Option<&str>) -> bool {
++    match v {
++        Some(s) => {
++            let b = s.as_bytes();
++            b.len() == 1 && b[0] == b'0'
++        }
++        None => false,
++    }
++}
++
++/// Build each preprocessed tree inside the proof that uses it, instead of holding both
++/// from setup on.
++pub const LAZY_TREES: bool = ENABLED;
++/// Free the base column pool between the Cairo and the circuit proof.
++pub const CLEAR_POOL: bool = ENABLED;
++/// Gather decommitted values in parallel (each read may be a page fault).
++pub const PAR_DECOMMIT: bool = ENABLED;
++/// After hashing, keep only the first 2/blowup of each extended column.
++pub const TRUNCATE_LDE: bool = ENABLED;
++/// Extend and hash columns a chunk at a time.
++pub const STREAM_COMMIT: bool = ENABLED;
++/// Chunks of 16 columns extended per streaming batch.
++pub const STREAM_CHUNKS: usize = 1;
++/// Commit one bit-reversed block (a trace-size coset) at a time.
++pub const BLOCK_COMMIT: bool = ENABLED;
++/// Bottom Merkle layers not stored; queried subtrees are rebuilt at decommit.
++pub const MERKLE_DROP: usize = if ENABLED { 4 } else { 0 };
++/// Drop the coefficients of truncated columns; interpolate them from the kept prefix.
++pub const DROP_COEFFS: bool = ENABLED;
++/// After constraint evaluation, cut truncated columns to their first 1/blowup.
++pub const SHRINK_AFTER_COMPOSITION: bool = ENABLED;
 diff --git a/crates/stwo/src/prover/mempool.rs b/crates/stwo/src/prover/mempool.rs
 index 7b16b7b..6103a7f 100644
 --- a/crates/stwo/src/prover/mempool.rs
@@ -345,10 +393,18 @@ index 7b16b7b..6103a7f 100644
      /// matches.
      pub fn give_back(&self, log_size: u32, buf: Col<B, BaseField>) {
 diff --git a/crates/stwo/src/prover/mod.rs b/crates/stwo/src/prover/mod.rs
-index 377f2c6..1220c61 100644
+index 377f2c6..6bbbe40 100644
 --- a/crates/stwo/src/prover/mod.rs
 +++ b/crates/stwo/src/prover/mod.rs
-@@ -68,6 +68,8 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
+@@ -21,6 +21,7 @@ pub mod fri;
+ pub mod line;
+ pub mod lookups;
+ pub mod mempool;
++pub mod memopt;
+ pub mod poly;
+ pub mod secure_column;
+ pub mod vcs;
+@@ -68,6 +69,8 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
          commitment_scheme.config.fri_config.log_blowup_factor,
      );
      span1.exit();
@@ -358,9 +414,18 @@ index 377f2c6..1220c61 100644
      // Commit on the Composition Polynomial by splitting its coeffs to two polynomialsof degree
      // half the size of the original polynomial, and commit on each half separately.
 diff --git a/crates/stwo/src/prover/pcs/mod.rs b/crates/stwo/src/prover/pcs/mod.rs
-index 9b04df7..57f999a 100644
+index 9b04df7..63a4e45 100644
 --- a/crates/stwo/src/prover/pcs/mod.rs
 +++ b/crates/stwo/src/prover/pcs/mod.rs
+@@ -2,7 +2,7 @@ use hashbrown::HashMap;
+ use itertools::Itertools;
+ #[cfg(feature = "parallel")]
+ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+-use tracing::{info, span, Level};
++use tracing::{debug, info, span, Level};
+ 
+ use crate::core::channel::{Channel, MerkleChannel};
+ use crate::core::circle::CirclePoint;
 @@ -26,6 +26,7 @@ use crate::prover::pcs::quotient_ops::compute_fri_quotients;
  use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
  use crate::prover::poly::twiddles::TwiddleTree;
@@ -376,7 +441,7 @@ index 9b04df7..57f999a 100644
 +    /// Bench: once the composition polynomial is evaluated, columns whose coefficients were
 +    /// dropped are only read on their first 2^n values (FRI quotients, coefficient recovery).
 +    pub fn bench_shrink_after_composition(&mut self) {
-+        if !std::env::var("BENCH_SHRINK_AFTER_COMPOSITION").is_ok_and(|v| v == "1") {
++        if !crate::prover::memopt::SHRINK_AFTER_COMPOSITION {
 +            return;
 +        }
 +        use crate::prover::backend::Column as _;
@@ -426,35 +491,37 @@ index 9b04df7..57f999a 100644
                  })
                  .collect_vec()
          };
-@@ -226,6 +255,27 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
+@@ -226,6 +255,29 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
  
          let columns = self.evaluations();
          print_column_size_histogram::<B, MC>(&columns);
-+        // Bench: per-tree memory at the point every tree is still alive.
-+        use crate::prover::backend::Column as _;
-+        for (i, tree) in self.trees.iter().enumerate() {
-+            let evals: usize = tree.polynomials.iter().map(|p| p.evals.values.len() * 4).sum();
-+            let coeffs: usize = tree
-+                .polynomials
-+                .iter()
-+                .map(|p| p.coeffs.as_ref().map_or(0, |c| c.coeffs.len() * 4))
-+                .sum();
-+            let max_log = tree.polynomials.iter().map(|p| p.evals.domain.log_size()).max().unwrap_or(0);
-+            info!(
-+                tree = i,
-+                n_columns = tree.polynomials.len(),
-+                eval_mib = evals >> 20,
-+                coeff_mib = coeffs >> 20,
-+                max_eval_log_size = max_log,
-+                owned = matches!(tree, MaybeOwned::Owned(_)),
-+                "bench tree memory"
-+            );
++        // Diagnostics: per-tree memory at the point every tree is still alive (debug level only).
++        if tracing::enabled!(Level::DEBUG) {
++            use crate::prover::backend::Column as _;
++            for (i, tree) in self.trees.iter().enumerate() {
++                let evals: usize = tree.polynomials.iter().map(|p| p.evals.values.len() * 4).sum();
++                let coeffs: usize = tree
++                    .polynomials
++                    .iter()
++                    .map(|p| p.coeffs.as_ref().map_or(0, |c| c.coeffs.len() * 4))
++                    .sum();
++                let max_log = tree.polynomials.iter().map(|p| p.evals.domain.log_size()).max().unwrap_or(0);
++                debug!(
++                    tree = i,
++                    n_columns = tree.polynomials.len(),
++                    eval_mib = evals >> 20,
++                    coeff_mib = coeffs >> 20,
++                    max_eval_log_size = max_log,
++                    owned = matches!(tree, MaybeOwned::Owned(_)),
++                    "bench tree memory"
++                );
++            }
++            debug!(pool_idle_mib = self.base_column_pool.held_bytes() >> 20, "bench pool at sampling");
 +        }
-+        info!(pool_idle_mib = self.base_column_pool.held_bytes() >> 20, "bench pool at sampling");
          // Compute oods quotients for boundary constraints on the sampled points.
          let quotients = compute_fri_quotients(
              &columns,
-@@ -276,7 +326,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
+@@ -276,7 +328,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
              .trees
              .as_ref()
              .zip_eq(query_positions_tree)
@@ -465,7 +532,7 @@ index 9b04df7..57f999a 100644
              .0
              .into_iter()
              .map(|(v, x)| (v, x.decommitment, x.aux))
-@@ -287,7 +339,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
+@@ -287,7 +341,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
              if let MaybeOwned::Owned(tree) = tree {
                  for poly in tree.polynomials.drain(..) {
                      let log_size = poly.evals.domain.log_size();
@@ -476,13 +543,13 @@ index 9b04df7..57f999a 100644
                  }
              }
          }
-@@ -356,6 +410,66 @@ pub struct CommitmentTreeProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
+@@ -356,6 +412,66 @@ pub struct CommitmentTreeProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
      pub commitment: MerkleProverLifted<B, MC::H>,
  }
  
-+/// Bench: how many bottom Merkle layers each committed tree frees (`BENCH_MERKLE_DROP`).
++/// Bench: how many bottom Merkle layers each committed tree frees (`memopt::MERKLE_DROP`).
 +fn bench_merkle_drop() -> usize {
-+    std::env::var("BENCH_MERKLE_DROP").map_or(0, |v| v.parse().unwrap())
++    crate::prover::memopt::MERKLE_DROP
 +}
 +
 +/// Bench: how many leading (bit-reversed) values of an extended column of the given log size are
@@ -490,7 +557,7 @@ index 9b04df7..57f999a 100644
 +fn bench_keep_len(log_size: u32, log_blowup_factor: u32) -> usize {
 +    // Small columns stay whole: CPU fallbacks copy them at full length, and they are a
 +    // negligible share of memory.
-+    if std::env::var("BENCH_TRUNCATE_LDE").is_ok_and(|v| v == "1")
++    if crate::prover::memopt::TRUNCATE_LDE
 +        && log_blowup_factor >= 1
 +        && log_size >= 16
 +    {
@@ -509,7 +576,7 @@ index 9b04df7..57f999a 100644
 +    if poly.coeffs.is_some() && keep < poly.evals.domain.size() {
 +        poly.evals.values.bench_truncate(keep);
 +        // The kept prefix determines the coefficients (see `bench_recover_coeffs`).
-+        if std::env::var("BENCH_DROP_COEFFS").is_ok_and(|v| v == "1") {
++        if crate::prover::memopt::DROP_COEFFS {
 +            poly.coeffs = None;
 +        }
 +    }
@@ -543,11 +610,11 @@ index 9b04df7..57f999a 100644
  impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
      pub fn new(
          polynomials: ColumnVec<CircleCoefficients<B>>,
-@@ -365,6 +479,71 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
+@@ -365,6 +481,71 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
          lifting_log_size: Option<u32>,
          base_column_pool: &BaseColumnPool<B>,
      ) -> Self {
-+        if std::env::var("BENCH_BLOCK_COMMIT").is_ok_and(|v| v == "1")
++        if crate::prover::memopt::BLOCK_COMMIT
 +            && store_polynomials_coefficients
 +            && !polynomials.is_empty()
 +        {
@@ -572,7 +639,7 @@ index 9b04df7..57f999a 100644
 +                &keep_lens,
 +                n_skipped,
 +            ) {
-+                let drop_coeffs = std::env::var("BENCH_DROP_COEFFS").is_ok_and(|v| v == "1");
++                let drop_coeffs = crate::prover::memopt::DROP_COEFFS;
 +                let mut coeffs = polynomials.into_iter().map(Some).collect_vec();
 +                let mut extended: Vec<Option<Poly<B>>> = (0..coeffs.len()).map(|_| None).collect();
 +                for (&i, values) in order.iter().zip(kept) {
@@ -593,7 +660,7 @@ index 9b04df7..57f999a 100644
 +            }
 +            info!("bench block commit unsupported for this tree; falling back");
 +        }
-+        if std::env::var("BENCH_STREAM_COMMIT").is_ok_and(|v| v == "1") && !polynomials.is_empty()
++        if crate::prover::memopt::STREAM_COMMIT && !polynomials.is_empty()
 +        {
 +            let min_log_size = polynomials.iter().map(|p| p.log_size()).min().unwrap();
 +            let max_log_size = polynomials.iter().map(|p| p.log_size()).max().unwrap();
@@ -615,7 +682,7 @@ index 9b04df7..57f999a 100644
          let span = span!(Level::INFO, "Extension").entered();
          let polynomials = B::evaluate_polynomials(
              polynomials,
-@@ -391,12 +570,87 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
+@@ -391,12 +572,85 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
              0,
          );
  
@@ -646,9 +713,7 @@ index 9b04df7..57f999a 100644
 +    ) -> Self {
 +        const CHUNK: usize = 16;
 +        let _span = span!(Level::INFO, "StreamCommit").entered();
-+        let chunks_per_batch: usize = std::env::var("BENCH_STREAM_CHUNKS")
-+            .ok()
-+            .map_or(1, |v| v.parse().unwrap());
++        let chunks_per_batch: usize = crate::prover::memopt::STREAM_CHUNKS;
 +        let n_columns = polynomials.len();
 +        // Same (stable) order as `MerkleProverLifted::commit`.
 +        let order = (0..n_columns)
@@ -865,7 +930,7 @@ index a6f0a1e..50adae1 100644
  
  pub trait PackLeavesOps: ColumnOps<BaseField> {
 diff --git a/crates/stwo/src/prover/vcs_lifted/prover.rs b/crates/stwo/src/prover/vcs_lifted/prover.rs
-index 946718d..01de2f3 100644
+index 946718d..f41dbba 100644
 --- a/crates/stwo/src/prover/vcs_lifted/prover.rs
 +++ b/crates/stwo/src/prover/vcs_lifted/prover.rs
 @@ -76,6 +76,17 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
@@ -913,7 +978,7 @@ index 946718d..01de2f3 100644
 +        // Bench: under memory pressure every `at` is a page fault; gathering columns in
 +        // parallel keeps many reads in flight instead of one.
 +        #[cfg(feature = "parallel")]
-+        if std::env::var("BENCH_PAR_DECOMMIT").is_ok_and(|v| v == "1") {
++        if crate::prover::memopt::PAR_DECOMMIT {
 +            use rayon::prelude::*;
 +            queried_values = columns.par_iter().map(gather).collect();
 +        } else {
