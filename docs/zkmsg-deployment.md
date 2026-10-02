@@ -297,3 +297,18 @@ Test identity `mode` (leaf 0, owner `deployer`): the scan key from
   1.565 STRK, 78.0M L2 gas.
 - `v2_cli open` decrypts it. The facts are pinned in
   `contracts/messagezk_store_v3/tests/mac_proof.cairo`.
+
+### First phone v3 registration and phone↔desktop sends (iPhone 14 Pro, 2026-10-01)
+
+The phone ran zkmsg-ios `pq-v3` at ce2b36b with the memory-optimized prover
+(`.prover/sequencer-phone`). Its original profile kept its scan key and
+KEM seed from v2 and gained a member secret on launch.
+
+| | tx | result |
+|---|---|---|
+| register `mode2` (leaf 2) from the phone's own account | `0x02e2d9a48f1e1c915bca1b782ee64122d49196ac8ce9d9d6695e8f1dac099c90` | 0.196 STRK, 9.68M L2 gas. `get_user` gives the expected `m_commit`, and the event ek's digest equals the stored `kem_digest` |
+| phone `mode2` → `carol` | `0x0341df049fcc3c9f52ed3faf140dfb3ec6a604b504170902837bbd5fead2bc66` | 73 s from the prove block to the publish block, 1.543 STRK, prove note "spill class A". carol's desktop inbox decrypts "v3 test 22:31" |
+| desktop `carol` → `mode2` | `0x045f7346b6e85c9461df1d5e11f0ec27115bf017f7b063c76918c378a43b60aa` | 34 s, 1.544 STRK. The phone Inbox decrypts it |
+
+Membership in both sends was proved by knowledge of `m`, with no EC step,
+and the scan private key was not in the witness.
