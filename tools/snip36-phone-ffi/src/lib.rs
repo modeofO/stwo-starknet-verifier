@@ -25,22 +25,111 @@ use starknet_transaction_prover::proving::virtual_snos_prover::RpcVirtualSnosPro
 
 static LOG_INIT: Once = Once::new();
 
-fn init_logging(log_path: Option<&str>) {
-    LOG_INIT.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::new(
-            "warn,starknet_transaction_prover=info,privacy_prove=info",
-        );
-        let builder = tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false);
-        match log_path.and_then(|p| std::fs::File::create(p).ok()) {
-            Some(file) => builder.with_writer(std::sync::Mutex::new(file)).init(),
-            None => builder.init(),
+/// Bench: on every span enter/exit, writes `ms dir live_spill_mib,peak_since_last_event_mib depth name`.
+struct SpillSpans {
+    out: std::sync::Mutex<std::fs::File>,
+    t0: Instant,
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpillSpans
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        self.mark(id, &ctx, '>');
+    }
+    fn on_exit(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        self.mark(id, &ctx, '<');
+    }
+}
+
+impl SpillSpans {
+    fn mark<S>(&self, id: &tracing::span::Id, ctx: &tracing_subscriber::layer::Context<'_, S>, dir: char)
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        use std::io::Write;
+        if let Some(span) = ctx.span(id) {
+            let depth = span.scope().count();
+            let mut out = self.out.lock().unwrap();
+            let _ = writeln!(
+                out,
+                "{} {} {},{} {} {}",
+                self.t0.elapsed().as_millis(),
+                dir,
+                spill_alloc::live_spill_bytes() >> 20,
+                spill_alloc::take_window_peak_bytes() >> 20,
+                depth,
+                span.name()
+            );
         }
+    }
+}
+
+fn init_logging(log_path: Option<&str>) {
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    LOG_INIT.call_once(|| {
+        let directives = std::env::var("SNIP36_LOG").unwrap_or_else(|_| {
+            "warn,starknet_transaction_prover=info,privacy_prove=info".to_string()
+        });
+        let writer = match log_path.and_then(|p| std::fs::File::create(p).ok()) {
+            Some(file) => BoxMakeWriter::new(std::sync::Mutex::new(file)),
+            None => BoxMakeWriter::new(std::io::stderr),
+        };
+        let fmt = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(writer)
+            .with_filter(tracing_subscriber::EnvFilter::new(directives));
+        let spans = std::env::var("SNIP36_SPAN_PROFILE").ok().map(|path| {
+            SpillSpans {
+                out: std::sync::Mutex::new(std::fs::File::create(path).unwrap()),
+                t0: Instant::now(),
+            }
+            .with_filter(tracing_subscriber::EnvFilter::new(
+                "warn,stwo=info,stwo_cairo_prover=info,circuit_prover=info,privacy_prove=info,starknet_transaction_prover=info",
+            ))
+        });
+        tracing_subscriber::registry().with(fmt).with(spans).init();
     });
 }
 
 /// Proves one request end to end. Blocking; run it off the main thread.
+/// Memory optimizations in the patched proving stack (see `memory-opt/README.md`). Peak spill
+/// drops from ~13 GiB to ~3 GiB, with a byte-identical proof, for ~35% more CPU time.
+const OPTIMIZATIONS: [(&str, &str); 10] = [
+    ("BENCH_LAZY_TREES", "1"),
+    ("BENCH_CLEAR_POOL", "1"),
+    ("BENCH_PAR_DECOMMIT", "1"),
+    ("BENCH_TRUNCATE_LDE", "1"),
+    ("BENCH_STREAM_COMMIT", "1"),
+    ("BENCH_STREAM_CHUNKS", "1"),
+    ("BENCH_BLOCK_COMMIT", "1"),
+    ("BENCH_MERKLE_DROP", "4"),
+    ("BENCH_DROP_COEFFS", "1"),
+    ("BENCH_SHRINK_AFTER_COMPOSITION", "1"),
+];
+
+/// Turns the optimizations on unless `SNIP36_OPTIMIZE=0`; a flag already set in the
+/// environment keeps its value. Returns whether they are on.
+fn enable_optimizations() -> bool {
+    if std::env::var("SNIP36_OPTIMIZE").is_ok_and(|v| v == "0") {
+        return false;
+    }
+    for (key, value) in OPTIMIZATIONS {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+    true
+}
+
 pub fn prove_request(request: &Value) -> Result<Value, String> {
+    let optimized = enable_optimizations();
     init_logging(request.get("log_path").and_then(Value::as_str));
+    tracing::info!(optimized, "snip36 prover memory optimizations");
 
     let rpc_url = request["rpc_url"].as_str().ok_or("missing rpc_url")?.to_string();
     let chain_id = ChainId::from(request["chain_id"].as_str().unwrap_or("SN_SEPOLIA").to_string());
@@ -90,6 +179,14 @@ pub fn prove_request(request: &Value) -> Result<Value, String> {
     let mut out = serde_json::to_value(&result).map_err(|e| format!("serialize: {e}"))?;
     out["timings_ms"] = json!({ "precompute": precompute_ms, "run_and_prove": prove_ms });
     out["peak_spill_bytes"] = json!(spill_alloc::snip36_peak_spill_bytes());
+    out["optimized"] = json!(optimized);
+    tracing::info!(
+        precompute_ms,
+        prove_ms,
+        peak_spill_mib = spill_alloc::snip36_peak_spill_bytes() >> 20,
+        optimized,
+        "snip36 prove finished"
+    );
     Ok(out)
 }
 
