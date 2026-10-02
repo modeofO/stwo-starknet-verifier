@@ -1,0 +1,39 @@
+# Weekly watch for new tags on the StarkWare repos the zkmsg prover is built
+# from (sequencer, stwo, stwo-cairo, proving-utils). New tags open or update
+# one issue labelled `upstream-release`, which GitHub notifies like any other
+# issue. See .github/upstream-watch/check.py.
+name: upstream-watch
+
+on:
+  schedule:
+    - cron: "0 15 * * 1"   # Mondays 15:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write   # commit the updated seen.json
+  issues: write     # open or comment on the upstream-release issue
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new upstream tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/upstream-watch/check.py
+
+      - name: Record seen tags
+        run: |
+          if ! git diff --quiet -- .github/upstream-watch/seen.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898273+github-actions[bot]@users.noreply.github.com"
+            git add .github/upstream-watch/seen.json
+            git commit -m "upstream-watch: record new StarkWare tags"
+            git push
+          fi
