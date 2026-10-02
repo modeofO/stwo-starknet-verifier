@@ -67,8 +67,6 @@ pub struct SetupState {
     pub fund_mode: FundMode,
     #[serde(default)]
     pub burner: bool,
-    #[serde(default)]
-    pub reply_handle: Option<String>,
     /// The new account's address, filled once CreateAccount runs.
     pub address: Option<String>,
     pub steps: Vec<SetupStep>,
@@ -100,7 +98,6 @@ impl SetupState {
             source_account,
             fund_mode: FundMode::Transfer,
             burner: false,
-            reply_handle: None,
             address: None,
             steps,
         }
@@ -115,12 +112,10 @@ impl SetupState {
         handle: String,
         account_name: String,
         fund_strk: u64,
-        reply_handle: Option<String>,
     ) -> Self {
         let mut s = Self::new_plan(profile_name, handle, account_name, fund_strk, String::new());
         s.fund_mode = FundMode::External;
         s.burner = true;
-        s.reply_handle = reply_handle;
         s
     }
 
@@ -328,7 +323,6 @@ impl SetupRunner<'_> {
             // config — idempotent, local-only.
             let mut config = home.load_config()?;
             config.burner = true;
-            config.reply_handle = state.reply_handle.clone();
             home.save_config(&config)?;
         }
         Ok((None, note))
@@ -358,31 +352,23 @@ pub fn burner_name() -> String {
 }
 
 /// Static fallback when the live gas-price read fails.
-pub const FALLBACK_FUNDING_STRK: u64 = 80;
+pub const FALLBACK_FUNDING_STRK: u64 = 10;
 
-/// Expected ACTUAL l2 gas spent before phase 2 submits: one stage tx
-/// (~28M measured) + phase 1 (~865M measured, max 873.8M) + publish
-/// (~3.3M), rounded up per leg.
-const ACTUAL_L2_BEFORE_PHASE2: u128 = 935_000_000;
-/// create + deploy + register fees, generously (measured 0.35 STRK total).
+/// create + deploy + register fees, generously (measured: deploy ~0.1,
+/// v2 register 0.18 STRK).
 const FLAT_SETUP_FRI: u128 = 1_000_000_000_000_000_000;
 const FRI_PER_STRK: u128 = 1_000_000_000_000_000_000;
 
 /// Recommended funding for one send from a fresh account, in whole STRK,
 /// from live (l1, l2, l1_data) gas prices in fri.
 ///
-/// The binding constraint is sequential worst-case-bounds validation
-/// (carol's 2026-07-08 stall): after phase 1's ACTUAL fee lands, the
-/// account must still hold phase 2's BOUNDS PRODUCT (amounts x 1.5x
-/// prices, mirroring `pipeline::bounds_for`). +10% margin, ceil.
+/// The binding constraint is validation against the publish's whole fee
+/// ceiling (`virtual_send::GAS_POLICY`: amounts × 1.5× prices), not the
+/// ~1.6 STRK a send ends up costing: the account must hold the ceiling when
+/// the gateway checks it. Plus setup fees, +10% margin, ceil.
 pub fn recommended_funding_strk(prices: (u128, u128, u128)) -> u64 {
-    let (l1_price, l2_price, l1_data_price) = prices;
-    let actuals = ACTUAL_L2_BEFORE_PHASE2 * l2_price;
-    let phase2_bound = 100 * (l1_price * 3 / 2)
-        + crate::pipeline::L2_GAS_BOUND_PHASE2 as u128 * (l2_price * 3 / 2)
-        + 32_768 * (l1_data_price * 3 / 2);
-    let total_fri = actuals + phase2_bound + FLAT_SETUP_FRI;
-    let with_margin = total_fri * 11 / 10;
+    let ceiling = crate::virtual_send::fee_ceiling_fri(&crate::virtual_send::GAS_POLICY.bounds(prices));
+    let with_margin = (ceiling + FLAT_SETUP_FRI) * 11 / 10;
     with_margin.div_ceil(FRI_PER_STRK) as u64
 }
 
@@ -457,9 +443,8 @@ mod tests {
         }"#;
         let s: SetupState = serde_json::from_str(carol_era).unwrap();
         assert_eq!(s.fund_mode, FundMode::Transfer);
-        // The carol-era JSON also predates the burner/reply_handle fields.
+        // The carol-era JSON also predates the burner field.
         assert!(!s.burner);
-        assert!(s.reply_handle.is_none());
         // And it round-trips with the field present.
         let json = serde_json::to_string(&s).unwrap();
         let s2: SetupState = serde_json::from_str(&json).unwrap();
@@ -475,12 +460,12 @@ mod tests {
     #[test]
     fn recommended_funding_tracks_l2_price() {
         // Pure-l2 price points (l1/data zero to keep arithmetic exact).
-        // 20 Gfri: actuals 935M*20e9 = 1.87e19 fri; phase2 bound 1e9*30e9 = 3.0e19;
-        // + 1 STRK flat = 4.97e19; *1.1 = 5.467e19 -> ceil 55 STRK.
-        assert_eq!(recommended_funding_strk((0, 20_000_000_000, 0)), 55);
-        // carol's spike, 43.9 Gfri: 4.10465e19 + 6.585e19 + 0.1e19 = 10.78965e19;
-        // *1.1 = 11.868615e19 -> ceil 119 STRK.
-        assert_eq!(recommended_funding_strk((0, 43_900_000_000, 0)), 119);
+        // 20 Gfri: ceiling 120M * 30e9 = 3.6e18; + 1 STRK flat = 4.6e18;
+        // *1.1 = 5.06e18 -> ceil 6 STRK.
+        assert_eq!(recommended_funding_strk((0, 20_000_000_000, 0)), 6);
+        // carol's 2026-07 spike, 43.9 Gfri: 120M * 65.85e9 = 7.902e18 + 1e18
+        // = 8.902e18; *1.1 = 9.7922e18 -> ceil 10 STRK.
+        assert_eq!(recommended_funding_strk((0, 43_900_000_000, 0)), 10);
         // Monotonic in l2 price.
         assert!(
             recommended_funding_strk((0, 50_000_000_000, 0))
@@ -507,11 +492,10 @@ mod tests {
     fn burner_plan_is_external_and_flagged() {
         let s = SetupState::new_plan_external_burner(
             "burner-ab12cd".into(), "burner-ab12cd".into(),
-            "zkmsg-burner-ab12cd".into(), 80, Some("alice".into()),
+            "zkmsg-burner-ab12cd".into(), 80,
         );
         assert_eq!(s.fund_mode, FundMode::External);
         assert!(s.burner);
-        assert_eq!(s.reply_handle.as_deref(), Some("alice"));
         assert!(s.source_account.is_empty());
         assert_eq!(s.steps.len(), 5);
     }

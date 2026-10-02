@@ -27,7 +27,7 @@ git apply "$REPO_ROOT/tools/proving-utils-bridge.patch"
 # Drop in the bridge crate.
 mkdir -p crates/privacy_prove_cairo_bridge/src
 cp "$REPO_ROOT/tools/privacy-prove-cairo-bridge/Cargo.toml" crates/privacy_prove_cairo_bridge/
-cp "$REPO_ROOT/tools/privacy-prove-cairo-bridge/src/main.rs" crates/privacy_prove_cairo_bridge/src/
+cp "$REPO_ROOT"/tools/privacy-prove-cairo-bridge/src/*.rs crates/privacy_prove_cairo_bridge/src/
 
 cargo build --release -p privacy-prove-cairo-bridge
 echo

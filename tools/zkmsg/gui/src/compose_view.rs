@@ -1,9 +1,9 @@
 //! Compose tab: recipient resolve, byte counter, the STRK-cost confirm
 //! dialog, and the live send-progress checklist. State lives on
 //! `ProfileSession`; this module renders it and drives the worker handoff —
-//! resolve runs in the background, Confirm kicks off `prepare_send` in
-//! the background, and once that returns a plan `worker::spawn_send`
-//! takes over (also background) feeding `SendFlow::apply`.
+//! resolve runs in the background, and Confirm starts one worker that
+//! prepares, proves and publishes (`worker::spawn_virtual_send`), feeding
+//! `SendFlow::apply`.
 //!
 //! Both `resolve_recipient` and the send itself do chain RPC, so neither
 //! may run on the UI thread — see worker.rs's threading rule.
@@ -12,36 +12,27 @@ use eframe::egui;
 
 use zkmsg_core::chain::felt_hex;
 use zkmsg_core::config::Home;
+use zkmsg_core::pipeline::PipelineEvent;
 use zkmsg_core::state::{SendState, StepKind};
 
 use crate::send_flow::{SendFlow, StepStatus};
 use crate::session::ProfileSession;
-use crate::worker::{self, PrepareWorkerMsg, ResolveWorkerMsg, WorkerMsg};
+use crate::worker::{self, ResolveWorkerMsg, WorkerMsg};
 
 const BYTE_SOFT_CAP: usize = 1_000;
-/// Display-only estimate (docs/lane1-results.md measured lane-1 Sepolia
-/// cost) — NOT what gates the spend; the pipeline's own gas bounds are
-/// the real enforcement. This is what the confirm dialog and cost line
-/// show the user before they commit.
-const ESTIMATED_COST_STRK: u32 = 48;
+/// Display-only estimates — NOT what gates the spend; the publish's own gas
+/// bounds are the real enforcement. The measured send, and the fee ceiling
+/// the account must hold for it (virtual_send::GAS_POLICY at 2026-09 prices).
+const VIRTUAL_COST_STRK: &str = "1.6";
+const VIRTUAL_CEILING_STRK: &str = "4";
 
 impl ProfileSession {
-    pub(crate) fn poll_compose_worker(&mut self, ctx: &egui::Context) {
+    pub(crate) fn poll_compose_worker(&mut self) {
         if let Some(rx) = &self.compose_resolve_rx {
             if let Ok(ResolveWorkerMsg::Resolved(result)) = rx.try_recv() {
                 self.compose_resolving = false;
                 self.compose_resolve_rx = None;
                 self.compose_resolved = Some(result);
-            }
-        }
-        if let Some(rx) = &self.compose_prepare_rx {
-            if let Ok(PrepareWorkerMsg::Prepared(result)) = rx.try_recv() {
-                self.compose_preparing = false;
-                self.compose_prepare_rx = None;
-                match result {
-                    Ok(state) => self.start_send(state, ctx),
-                    Err(e) => self.last_error = Some(e),
-                }
             }
         }
     }
@@ -51,6 +42,9 @@ impl ProfileSession {
         let Ok(msg) = rx.try_recv() else { return };
         match msg {
             WorkerMsg::Progress(event) => {
+                if let PipelineEvent::Checkpointed { id } = &event {
+                    self.send_state_id = Some(id.clone());
+                }
                 if let Some(flow) = &mut self.send_flow {
                     flow.apply(event);
                 }
@@ -145,33 +139,26 @@ impl ProfileSession {
         };
         ui.colored_label(counter_color, format!("{n_bytes} / {BYTE_SOFT_CAP} bytes"));
 
-        if let Some(reply) = self.config.as_ref().filter(|c| c.burner).and_then(|c| c.reply_handle.clone()) {
-            ui.checkbox(
-                &mut self.compose_reveal_from,
-                format!("reveal my handle ('{reply}') to the recipient (encrypted from-line)"),
-            );
-        }
-
         ui.separator();
+        let cost = self.cost_line();
         let balance_line = match self.status.as_ref().and_then(|r| r.balance_strk) {
-            Some(strk) => format!("send costs ~{ESTIMATED_COST_STRK} STRK · balance ~{strk} STRK"),
-            None => format!(
-                "send costs ~{ESTIMATED_COST_STRK} STRK · balance unknown (see Status tab)"
-            ),
+            Some(strk) => format!("{cost} · balance ~{strk} STRK"),
+            None => format!("{cost} · balance unknown (see Status tab)"),
         };
         ui.label(balance_line);
 
         let can_send = matches!(self.compose_resolved, Some(Ok(_)))
             && !self.compose_text.trim().is_empty()
-            && !self.compose_preparing
+            && !self.work_in_flight()
+            && self.is_virtual_route()
             && !locked;
         ui.add_enabled_ui(can_send, |ui| {
             if ui.button("Send").clicked() {
                 self.compose_show_confirm = true;
             }
         });
-        if self.compose_preparing {
-            ui.label("preparing send (root + merkle paths + encrypt)…");
+        if !self.is_virtual_route() {
+            ui.label("this profile's store is retired — move it to the v2 store on the Status tab");
         }
         if locked {
             ui.label("a profile setup is running — sending is paused until it finishes");
@@ -203,7 +190,7 @@ impl ProfileSession {
             .show(ctx, |ui| {
                 ui.label(format!(
                     "Publish this message to {recipient}? This spends \
-                     ~{ESTIMATED_COST_STRK} STRK on Sepolia and cannot be undone."
+                     ~{VIRTUAL_COST_STRK} STRK on Sepolia and cannot be undone."
                 ));
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
@@ -214,7 +201,7 @@ impl ProfileSession {
                     ui.add_enabled_ui(!locked, |ui| {
                         if ui.button("Confirm").clicked() {
                             self.compose_show_confirm = false;
-                            self.start_prepare(ctx);
+                            self.start_send(ctx);
                         }
                     });
                 });
@@ -224,58 +211,46 @@ impl ProfileSession {
         }
     }
 
-    fn start_prepare(&mut self, ctx: &egui::Context) {
-        let Some(sender_leaf) = self.keys.as_ref().and_then(|k| k.leaf_index) else {
+    fn is_virtual_route(&self) -> bool {
+        self.config.as_ref().is_some_and(zkmsg_core::app::on_current_store)
+    }
+
+    fn cost_line(&self) -> String {
+        format!(
+            "send costs ~{VIRTUAL_COST_STRK} STRK (one transaction; the account must hold \
+             ~{VIRTUAL_CEILING_STRK} STRK of fee ceiling)"
+        )
+    }
+
+    /// Prepare, prove and publish run as one worker (the witness never
+    /// leaves memory), so there is no separate prepare window — the
+    /// checklist opens at once on the fixed three-step plan.
+    fn start_send(&mut self, ctx: &egui::Context) {
+        if self.keys.as_ref().and_then(|k| k.leaf_index).is_none() {
             self.last_error = Some("not registered".to_string());
             return;
-        };
-        self.compose_preparing = true;
+        }
+        if self.work_in_flight() {
+            self.last_error = Some("a send is already running".to_string());
+            return;
+        }
         self.last_error = None;
-        let text = match self
-            .config
-            .as_ref()
-            .filter(|c| c.burner && self.compose_reveal_from)
-            .and_then(|c| c.reply_handle.as_deref())
-        {
-            Some(reply) => crate::fromline::apply_from_line(&self.compose_text, reply),
-            None => self.compose_text.clone(),
-        };
-        self.compose_prepare_rx = Some(worker::spawn_prepare(
+        self.send_state_id = None;
+        self.send_flow = Some(SendFlow::virtual_plan());
+        self.send_rx = Some(worker::spawn_virtual_send(
             self.home_dir(),
-            sender_leaf,
             self.compose_handle.trim().to_string(),
-            text,
+            self.compose_text.clone(),
             ctx.clone(),
         ));
     }
 
-    /// True while a send is being prepared OR its pipeline is running —
-    /// the window during which NO other send (compose or resume) may
-    /// start, or two paid pipelines would run concurrently (double-spend).
-    /// Note `compose_preparing` covers the prepare RPC window where
-    /// `send_rx` is still `None`.
+    /// True while a send runs — the window during which NO other send
+    /// (compose or resume) may start, or two paid sends would race the same
+    /// account (double-spend). Prepare runs inside the send worker, so
+    /// `send_rx` covers it.
     pub(crate) fn work_in_flight(&self) -> bool {
-        crate::session::work_in_flight_flags(self.compose_preparing, self.send_rx.is_some())
-    }
-
-    fn start_send(&mut self, state: SendState, ctx: &egui::Context) {
-        // A resume clicked during our prepare window may have already
-        // started a send by the time prepare completes and lands here —
-        // drop this freshly-prepared state rather than spawn a second
-        // concurrent pipeline (the checkpoint is saved; the user can
-        // re-send).
-        if self.send_rx.is_some() {
-            self.last_error = Some("a send is already running".to_string());
-            return;
-        }
-        let Some(config) = self.config.clone() else {
-            self.last_error = Some("no config loaded".to_string());
-            return;
-        };
-        self.send_state_id = Some(state.id.clone());
-        self.send_flow = Some(SendFlow::from_state(&state));
-        self.send_rx =
-            Some(worker::spawn_send(Home::new(self.home_dir()), config, state, ctx.clone()));
+        self.send_rx.is_some()
     }
 
     /// Loads `id`'s checkpoint, builds a fresh `SendFlow` from it, and
@@ -319,8 +294,6 @@ impl ProfileSession {
         self.compose_resolved = None;
         self.compose_resolve_rx = None;
         self.compose_show_confirm = false;
-        self.compose_preparing = false;
-        self.compose_prepare_rx = None;
         self.send_flow = None;
         self.send_rx = None;
         self.send_state_id = None;
@@ -333,22 +306,14 @@ impl ProfileSession {
         // `self.send_flow` across the whole render.
         let Some(flow) = self.send_flow.clone() else { return };
 
-        if let Some(fact) = &flow.fact {
-            ui.colored_label(
-                egui::Color32::from_rgb(60, 180, 60),
-                format!("published — fact {fact}"),
-            );
+        if flow.published {
+            ui.colored_label(egui::Color32::from_rgb(60, 180, 60), "published");
             ui.separator();
         }
         if let Some(err) = &flow.error {
             ui.colored_label(egui::Color32::RED, err.as_str());
             ui.separator();
         }
-
-        let wrap_running = flow
-            .steps
-            .iter()
-            .any(|s| matches!(s.kind, StepKind::Wrap) && s.status == StepStatus::Running);
 
         for step in &flow.steps {
             ui.horizontal(|ui| {
@@ -372,25 +337,36 @@ impl ProfileSession {
                 }
             });
         }
-        if wrap_running {
-            ui.label("wrap uses ~25 GB RAM");
+        if flow.steps.iter().any(|s| s.kind == StepKind::Prove && s.status == StepStatus::Running) {
+            ui.label("proving takes ~20 s on an M-series Mac");
         }
 
         let has_failed = flow.steps.iter().any(|s| s.status == StepStatus::Failed);
-        let is_done = flow.fact.is_some();
+        let is_done = flow.published;
 
         ui.separator();
-        if has_failed && !locked && ui.button("Resume").clicked() {
+        // A failed send resumes from its saved state when there is one. A
+        // send that failed before its proof was saved has none (the
+        // witness is never written down): it goes back to the form, message
+        // intact, to be sent again.
+        let resumable = self.send_state_id.as_deref().is_some_and(|id| {
+            SendState::path(&Home::new(self.home_dir()), id).exists()
+        });
+        if has_failed && !locked && resumable && ui.button("Resume").clicked() {
             if let Some(id) = self.send_state_id.clone() {
                 self.resume_send(&id, ctx);
             }
+        }
+        if has_failed && !resumable && ui.button("Back to message").clicked() {
+            self.send_flow = None;
+            self.send_state_id = None;
         }
         if is_done && ui.button("Compose another").clicked() {
             self.reset_compose();
         }
         if is_done
             && self.config.as_ref().is_some_and(|c| c.burner)
-            && ui.button("Sweep & archive this burner…").clicked()
+            && ui.button("Archive this burner…").clicked()
         {
             self.retire_offer = true;
         }
@@ -399,13 +375,9 @@ impl ProfileSession {
 
 fn step_label(kind: &StepKind) -> String {
     match kind {
-        StepKind::Prove => "prove".to_string(),
-        StepKind::Wrap => "wrap".to_string(),
-        StepKind::Pack => "pack".to_string(),
-        StepKind::Stage { offset } => format!("stage @ {offset}"),
-        StepKind::Phase1 => "verify phase 1".to_string(),
-        StepKind::Phase2 => "verify phase 2".to_string(),
-        StepKind::SendMessage => "send message".to_string(),
+        StepKind::Prove => "prove (virtual OS, on this machine)".to_string(),
+        StepKind::Prepare => "prepare (tree, paths, nonce at one block)".to_string(),
+        StepKind::Publish => "publish (one transaction, proof attached)".to_string(),
     }
 }
 

@@ -169,3 +169,80 @@ line is an unauthenticated plaintext claim.
 
 See `tools/zkmsg/README.md` (quickstart). The deployed store address is
 baked into `zkmsg init`'s defaults.
+
+## zkmsg v2: hybrid ML-KEM-768 + ECDH, SNIP-36 route (Sepolia alpha, 2026-10-01)
+
+Design: `docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`.
+Code: `contracts/messagezk_store_pq` (Scarb 2.18, sierra 1.8), branch `pq-v2`.
+Declared and deployed from account `deployer`
+(`0x6f3eee3cc01225d84e31c1696411afb129201a60ea44c06f96e0e422d8fa1ce`) via
+`https://api.zan.top/public/starknet-sepolia/rpc/v0_10`.
+
+| What | Value |
+|---|---|
+| `MessageStoreV2PQ` | `0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8` |
+| store class hash | `0x0181e2549f10fe48772038b5940951acd93dd7910f53286030883bde27d0c5be` |
+| store deploy block | **15947092** (scan start) |
+| `ZkmsgSendProverV2` | `0x02d993bd9e1229367fe9643151fdb7b2fb9fe06b28e6ff0d2f1d451894182d79` |
+| prover class hash | `0x07c8b5fb5fd93955698f1818bfad816f24ca26aa0ae851b6a1492d8b74fa864e` |
+| prover deploy block | 15947067 |
+| root history | 64 |
+
+| tx | hash | block | fee |
+|---|---|---|---|
+| declare prover | `0x04e23d7b37714bc34d596c74fa4ed432179568d8c72607803ff23ae977a9a8ad` | 15947061 | 1.58 STRK |
+| deploy prover | `0x010f9f637203027b154a752e6234a85ff232daf95a417e3e01b695b32dabe165` | 15947067 | 0.03 STRK |
+| declare store | `0x07d0d891f0c2894c1d679ce72e9ed255560097dacb85252402263422c76ff3da` | 15947082 | 9.19 STRK |
+| deploy store (pinned to the prover) | `0x0776b67f9bb80da2cd34775d641b494cdcab33e63d7b5de5fa60b3db72caefc6` | 15947092 | 0.04 STRK |
+
+Total 10.83 STRK. Checked after deploy: `prover()` returns the prover
+address, the root is 0, and `n_messages` is 0. No users are registered yet.
+Every identity must register again with `register(handle, scan_pubkey,
+kem_pubkey)`; the v1 store (`0x002b9c6f…8084f`) is no longer read.
+
+### First v2 send (Mac prove, 2026-10-01)
+
+Test identity `mode`: scan key from the desktop `.zkmsg-mode` keys, a fresh
+ML-KEM seed, registered from `deployer` at leaf 0. The register tx
+`0x02d8e350e7662c8dcc58e4158d8d1c88498b06053e9192d34750c0d5310e4a0c` cost
+0.36 STRK and 17.6M L2 gas. `get_user('mode')` returns the same
+`kem_digest` as the client computes from the `ek` in the event.
+
+The message went from `mode` to itself, built with
+`cargo run -p zkmsg-core --example v2_cli -- send`. It was proved with
+snip36-phone-ffi's `prove_cli` on the Mac and published with `snip36 submit`:
+
+| | v2 | v1 (2026-09-29) |
+|---|---|---|
+| virtual OS steps | 142,905 (ec_op 4, poseidon 151) | ~148k |
+| Mac prove wall | 19 s (precompute 1.2 s + run and prove 16.9 s), footprint 335 MB, spill 13.8 GB | 15–16 s |
+| publish tx | `0x135dec2b9689f390761d086a5b750e74468385c8287c9fcdec12dfd9d17612b`, SUCCEEDED | |
+| fee | 1.60 STRK, 78.0M L2 gas, 384 L1 data gas | 1.60 STRK, 77M L2 gas |
+| content | 1,167 bytes (kem_ct 1088 ‖ nonce 12 ‖ 51 ‖ tag 16) | |
+
+`v2_cli open` with `mode`'s keys decrypts the event. A different scan key
+gives "not ours". The proof's facts are pinned in
+`contracts/messagezk_store_pq/tests/mac_proof.cairo`.
+
+The v1 prover's ~148k steps already included two Merkle paths and an ECDH.
+Dropping one path and the ECDH saves only ~5k steps, because the virtual
+OS's fixed cost dominates. The fee is the same, so the extra 1088 bytes of
+`kem_ct` are negligible.
+
+### First phone v2 registration and send (iPhone 14 Pro, 2026-10-01)
+
+zkmsg-ios `pq-v2` at 332fbf4. The phone's original profile kept its scan
+key and gained a KEM seed on launch.
+
+| | tx | result |
+|---|---|---|
+| register `mode2` (leaf 2) from the phone's own account | `0x4ab780bcff07a5d60d81c6801242db16b777df0d73a4f63faabe18652fd4c95` | 0.185 STRK, 9.15M L2 gas, 2,368 data gas. The event ek's digest (`v2_cli digest`) equals the stored `kem_digest` |
+| desktop `carol` → `mode2` | `0x757d2f311f088aac984372a91e23152239f2dadfc11682439337154770099e3` | 1.559 STRK, 77.6M L2 gas. The phone Inbox decrypts it |
+| phone `mode2` → `carol` | `0x1c6f7006110ed5ca4623d9c40ea7edf77af953597766e07b2326a363ec57e5b` | 1.554 STRK, 77.5M L2 gas, 352 data gas. carol's desktop inbox decrypts "new store test 21:11" |
+
+Phone send: proved against block 15950141 and published in block 15950293.
+The chain time between those two blocks is 261 s, which covers prove and
+publish; the virtual OS ran at the prepare block. The proof was 317,092
+base64 bytes. The prove note reads "spill class A". The content was 1,136
+bytes. The publish transaction was signed and saved before the POST
+(nonce 0x8), per the double-pay fix.

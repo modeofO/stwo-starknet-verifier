@@ -1,0 +1,171 @@
+diff --git a/crates/privacy_prove/src/lib.rs b/crates/privacy_prove/src/lib.rs
+index d2c3ac5..179487f 100644
+--- a/crates/privacy_prove/src/lib.rs
++++ b/crates/privacy_prove/src/lib.rs
+@@ -48,7 +48,7 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTra
+ use stwo_cairo_prover::prover::{prove_cairo, prove_cairo_with_precompute};
+ use stwo_cairo_prover::witness::preprocessed_trace::gen_trace;
+ use tempfile::NamedTempFile;
+-use tracing::{Level, info, span};
++use tracing::{Level, debug, info, span};
+ 
+ use crate::consts::{
+     CAIRO_PROVER_PARAMS, CAIRO_RUN_CONFIG, CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
+@@ -58,9 +58,10 @@ pub struct RecursiveProverPrecomputes {
+     pub base_column_pool: BaseColumnPool<SimdBackend>,
+     pub twiddles: TwiddleTree<SimdBackend>,
+     pub cairo_preprocessed_trace: Arc<PreProcessedTrace>,
+-    pub cairo_preprocessed_tree: CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>,
++    /// None with `stwo::prover::memopt::LAZY_TREES`: built per proof, right before it is needed.
++    pub cairo_preprocessed_tree: Option<CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>>,
+     pub cairo_verifier_config: CairoVerifierConfig,
+-    pub circuit_preprocessed_tree: CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>,
++    pub circuit_preprocessed_tree: Option<CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>>,
+     pub preprocessed_circuit: PreprocessedCircuit,
+     pub circuit_config: CircuitConfig,
+     pub proof_config: ProofConfig,
+@@ -150,32 +151,20 @@ pub fn prepare_recursive_prover_precomputes()
+             .preprocessed_trace
+             .to_preprocessed_trace(),
+     );
+-    let cairo_preprocessed_trace_polys =
+-        SimdBackend::interpolate_columns(gen_trace(cairo_preprocessed_trace.clone()), &twiddles);
+-    let cairo_preprocessed_tree = CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
+-        cairo_preprocessed_trace_polys,
+-        CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
+-        &twiddles,
+-        CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
+-        Some(cairo_lifting_log_size),
+-        &base_column_pool,
+-    );
++    let lazy = lazy_trees();
++    let cairo_preprocessed_tree = (!lazy).then(|| {
++        build_cairo_preprocessed_tree(&cairo_preprocessed_trace, &twiddles, &base_column_pool)
++    });
+ 
+     info!("Prepare the circuit prover preprocessed trace and tree");
+-    let circuit_preprocessed_trace = preprocessed_circuit
+-        .preprocessed_trace
+-        .get_trace::<SimdBackend>();
+-    let circuit_preprocessed_trace_polys =
+-        SimdBackend::interpolate_columns(circuit_preprocessed_trace, &twiddles);
+-    let circuit_preprocessed_tree =
+-        CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
+-            circuit_preprocessed_trace_polys,
+-            CIRCUIT_FRI_CONFIG.log_blowup_factor,
++    let circuit_preprocessed_tree = (!lazy).then(|| {
++        build_circuit_preprocessed_tree(
++            &preprocessed_circuit,
++            &circuit_config,
+             &twiddles,
+-            CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
+-            circuit_config.config.lifting_log_size,
+             &base_column_pool,
+-        );
++        )
++    });
+ 
+     Ok(Arc::new(RecursiveProverPrecomputes {
+         base_column_pool,
+@@ -190,6 +179,49 @@ pub fn prepare_recursive_prover_precomputes()
+     }))
+ }
+ 
++/// Memory optimization, fixed at compile time (`stwo::prover::memopt`): build each preprocessed
++/// tree inside the proof that uses it (owned, so its buffers go back to the pool), instead of
++/// holding both from setup on.
++fn lazy_trees() -> bool {
++    stwo::prover::memopt::LAZY_TREES
++}
++
++fn build_cairo_preprocessed_tree(
++    trace: &Arc<PreProcessedTrace>,
++    twiddles: &TwiddleTree<SimdBackend>,
++    pool: &BaseColumnPool<SimdBackend>,
++) -> CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel> {
++    let _span = span!(Level::INFO, "build cairo preprocessed tree").entered();
++    let polys = SimdBackend::interpolate_columns(gen_trace(trace.clone()), twiddles);
++    CommitmentTreeProver::new(
++        polys,
++        CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
++        twiddles,
++        CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
++        CAIRO_PROVER_PARAMS.pcs_config.lifting_log_size,
++        pool,
++    )
++}
++
++fn build_circuit_preprocessed_tree(
++    preprocessed_circuit: &PreprocessedCircuit,
++    circuit_config: &CircuitConfig,
++    twiddles: &TwiddleTree<SimdBackend>,
++    pool: &BaseColumnPool<SimdBackend>,
++) -> CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel> {
++    let _span = span!(Level::INFO, "build circuit preprocessed tree").entered();
++    let trace = preprocessed_circuit.preprocessed_trace.get_trace::<SimdBackend>();
++    let polys = SimdBackend::interpolate_columns(trace, twiddles);
++    CommitmentTreeProver::new(
++        polys,
++        CIRCUIT_FRI_CONFIG.log_blowup_factor,
++        twiddles,
++        CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
++        circuit_config.config.lifting_log_size,
++        pool,
++    )
++}
++
+ pub fn privacy_recursive_prove(
+     pie: CairoPie,
+     precomputes: Arc<RecursiveProverPrecomputes>,
+@@ -204,10 +236,25 @@ pub fn privacy_recursive_prove(
+         &precomputes.base_column_pool,
+         &precomputes.twiddles,
+         precomputes.cairo_preprocessed_trace.clone(),
+-        MaybeOwned::Borrowed(&precomputes.cairo_preprocessed_tree),
++        match &precomputes.cairo_preprocessed_tree {
++            Some(tree) => MaybeOwned::Borrowed(tree),
++            None => MaybeOwned::Owned(build_cairo_preprocessed_tree(
++                &precomputes.cairo_preprocessed_trace,
++                &precomputes.twiddles,
++                &precomputes.base_column_pool,
++            )),
++        },
+         prover_input,
+         CAIRO_PROVER_PARAMS,
+     )?;
++    debug!(
++        pool_idle_mib = precomputes.base_column_pool.held_bytes() >> 20,
++        "bench pool after cairo proof"
++    );
++    if stwo::prover::memopt::CLEAR_POOL {
++        precomputes.base_column_pool.clear();
++        debug!("bench pool cleared");
++    }
+     // TODO(Leo): remove once we have the log sizes from prepare_cairo_proof_for_circuit_verifier.
+     let FlatClaim {
+         component_enable_bits,
+@@ -248,11 +295,23 @@ pub fn privacy_recursive_prove(
+         &precomputes.base_column_pool,
+         &precomputes.twiddles,
+         &precomputes.preprocessed_circuit,
+-        MaybeOwned::Borrowed(&precomputes.circuit_preprocessed_tree),
++        match &precomputes.circuit_preprocessed_tree {
++            Some(tree) => MaybeOwned::Borrowed(tree),
++            None => MaybeOwned::Owned(build_circuit_preprocessed_tree(
++                &precomputes.preprocessed_circuit,
++                &precomputes.circuit_config,
++                &precomputes.twiddles,
++                &precomputes.base_column_pool,
++            )),
++        },
+         context_values,
+         precomputes.circuit_config.config,
+     )?;
+ 
++    debug!(
++        pool_idle_mib = precomputes.base_column_pool.held_bytes() >> 20,
++        "bench pool after circuit proof"
++    );
+     info!("Prepare the circuit proof for the circuit verifier");
+     let (proof_qm31s, _public_data) =
+         prepare_circuit_proof_for_circuit_verifier(circuit_proof, &precomputes.proof_config);

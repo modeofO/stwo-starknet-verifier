@@ -1,0 +1,34 @@
+name: ProverBench
+options:
+  bundleIdPrefix: dev.frontboat
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.9"
+targets:
+  ProverBench:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      - path: Resources
+        buildPhase: resources
+    entitlements:
+      path: ProverBench.entitlements
+      properties:
+        com.apple.developer.kernel.extended-virtual-addressing: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.frontboat.zkmsg-prover-bench
+        TARGETED_DEVICE_FAMILY: "1"
+        OTHER_LDFLAGS: ["-lprivacy_prove_cairo_bridge"]
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]":
+          - "$(SRCROOT)/../../.prover/proving-utils/target/aarch64-apple-ios/release"
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]":
+          - "$(SRCROOT)/../../.prover/proving-utils/target/aarch64-apple-ios-sim/release"
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_CFBundleDisplayName: "zkmsg bench"

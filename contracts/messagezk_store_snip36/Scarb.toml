@@ -1,0 +1,30 @@
+[package]
+license = "Apache-2.0"
+name = "messagezk_store_snip36"
+version = "0.1.0"
+edition = "2024_07"
+
+# MessageStore on the SNIP-36 route: a send is ONE transaction whose proof the
+# sequencer verifies natively (in-protocol S-two verification of a virtual-OS
+# run), so there is no fact registry and no on-chain STARK verifier — and so no
+# qm31 libfuncs, which only sepolia-integration allows. The registry, Merkle
+# tree, root history and events are MessageStoreV3's (../messagezk_store),
+# unchanged (src/merkle.cairo is a verbatim copy), so the phone's sync and
+# inbox scan read both stores alike.
+
+[dependencies]
+starknet = "2.18.0"
+
+[[target.starknet-contract]]
+sierra = true
+allowed-libfuncs-list.name = "audited"
+
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]

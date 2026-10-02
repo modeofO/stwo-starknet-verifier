@@ -1,0 +1,56 @@
+{
+  "transaction_hash": "0x25299873d823d907949a0731a32a343dde38be27c525cd6860b7a6eb8d1f952",
+  "version": "0x3",
+  "signature": [
+    "0x5a4d1c91edb6417f04ea03f22fb6d1339f839c61c8edfd45dfbb3e544acf1cc",
+    "0x1dedac6cac6376fa7b3e7de753962c0b1d175ca78f6b5465a83535f652295bc"
+  ],
+  "nonce": "0x6",
+  "nonce_data_availability_mode": 0,
+  "fee_data_availability_mode": 0,
+  "resource_bounds": {
+    "L1_GAS": {
+      "max_amount": "0x0",
+      "max_price_per_unit": "0xab4fc715fc19"
+    },
+    "L2_GAS": {
+      "max_amount": "0x7270e00",
+      "max_price_per_unit": "0x71831f99a"
+    },
+    "L1_DATA_GAS": {
+      "max_amount": "0x1000",
+      "max_price_per_unit": "0xb11149c0ed"
+    }
+  },
+  "tip": "0x0",
+  "paymaster_data": [],
+  "sender_address": "0x5617d58d9b27418f398240b6e328014b5f35309cf7b22139a650573d7d1cf70",
+  "calldata": [
+    "0x1",
+    "0x2b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f",
+    "0x12ead94ae9d3f9d2bdb6b847cf255f1f398193a1f88884a0ae8e18f24a037b6",
+    "0x7",
+    "0x16c93304805211bb489318f6742a64d580b686a817ee26cd3aa83afff66a8ba",
+    "0x3565d18eb03dfe3d4e63826365f7f3e199212f13641ee7c6c891d1d62d3c17f",
+    "0x158f7c72d62d24d919016eedeaa242bb71a8012f5e04b310cf33175f838e47f",
+    "0x1",
+    "0xffae1d14cb2d70c640d2ab66aa8912847d869b9353c4eacebb895ecb818d92",
+    "0x102125cac8ca7c0ea2e51c6373634ddf",
+    "0x10"
+  ],
+  "account_deployment_data": [],
+  "proof_facts": [
+    "0x50524f4f4631",
+    "0x5649525455414c5f534e4f53",
+    "0x53f6c9fcfd31d27279ff7d7e422b44623550a732b59fe193354a7316a96daa1",
+    "0x5649525455414c5f534e4f5330",
+    "0xf297d0",
+    "0x7d4959f88036c14f3ff3419e9eff7179f17cfd9caf7b3d5f23de722c1e029eb",
+    "0x57ed4d5e20d617d8cc087a5882eae4f71d005172326be6439b2e1fd8b4dc57",
+    "0x1",
+    "0x656564b1f4ed78d8e18c679dfa6cfd9d4bd53e5dce68c43d5e3c8b0e4b6a9ea"
+  ],
+  "type": "INVOKE_FUNCTION",
+  "_note": "Sepolia-alpha SNIP-36 send_message (phone, MessageStoreSnip36 v1), from the feeder's get_transaction with `proof` stripped. transaction_hash is the sequencer's: the proof_facts-extended INVOKE v3 hash must reproduce it.",
+  "_block_number": 15898761
+}

@@ -1,0 +1,1103 @@
+diff --git a/crates/stwo/src/prover/backend/cpu/mod.rs b/crates/stwo/src/prover/backend/cpu/mod.rs
+index a35b6c9..c3419ee 100644
+--- a/crates/stwo/src/prover/backend/cpu/mod.rs
++++ b/crates/stwo/src/prover/backend/cpu/mod.rs
+@@ -40,6 +40,11 @@ impl<T: Debug + Clone + Default + Send + Sync> ColumnOps<T> for CpuBackend {
+ }
+ 
+ impl<T: Debug + Clone + Default + Send + Sync> Column<T> for Vec<T> {
++    fn bench_truncate(&mut self, len: usize) {
++        self.truncate(len);
++        self.shrink_to_fit();
++    }
++
+     fn zeros(len: usize) -> Self {
+         vec![T::default(); len]
+     }
+diff --git a/crates/stwo/src/prover/backend/mod.rs b/crates/stwo/src/prover/backend/mod.rs
+index 0d46d7f..f0c5bf5 100644
+--- a/crates/stwo/src/prover/backend/mod.rs
++++ b/crates/stwo/src/prover/backend/mod.rs
+@@ -63,4 +63,8 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
+     fn set(&mut self, index: usize, value: T);
+     /// Splits the column into two halves.
+     fn split_at_mid(self) -> (Self, Self);
++    /// Bench: keeps only the first `len` elements and releases the rest.
++    fn bench_truncate(&mut self, _len: usize) {
++        unimplemented!("bench_truncate")
++    }
+ }
+diff --git a/crates/stwo/src/prover/backend/simd/blake2s_lifted.rs b/crates/stwo/src/prover/backend/simd/blake2s_lifted.rs
+index 2922fd3..fa1d621 100644
+--- a/crates/stwo/src/prover/backend/simd/blake2s_lifted.rs
++++ b/crates/stwo/src/prover/backend/simd/blake2s_lifted.rs
+@@ -22,11 +22,15 @@ use crate::parallel_iter;
+ use crate::prover::backend::simd::blake2s::{
+     compress_finalize, compress_unfinalized, transpose_msgs, untranspose_states, INITIAL_STATE,
+ };
++use crate::core::poly::circle::CanonicCoset;
++use crate::prover::backend::simd::circle::bench_evaluate_block;
+ use crate::prover::backend::simd::column::BaseColumn;
++use crate::prover::poly::circle::CircleCoefficients;
++use crate::prover::poly::twiddles::TwiddleTree;
+ use crate::prover::backend::simd::m31::{reduce_to_m31_simd, PackedBaseField, N_LANES};
+ use crate::prover::backend::simd::utils::transpose_packed_leaf;
+ use crate::prover::backend::{Col, Column, CpuBackend};
+-use crate::prover::vcs_lifted::ops::{MerkleOpsLifted, PackLeavesOps};
++use crate::prover::vcs_lifted::ops::{LeafStream, MerkleOpsLifted, PackLeavesOps};
+ 
+ const N_FELTS_IN_BLAKE_MESSAGE: usize = 16;
+ const N_FELTS_IN_BLAKE_STATE: usize = 8;
+@@ -261,6 +265,212 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
+         });
+         res
+     }
++
++    fn leaf_stream(
++        min_log_size: u32,
++        max_log_size: u32,
++    ) -> Option<Box<dyn LeafStream<Self, Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>> {
++        if min_log_size < LOG_N_LANES {
++            return None;
++        }
++        Some(Box::new(SimdLeafStream::<IS_M31_OUTPUT>::new(
++            max_log_size - LOG_N_LANES,
++        )))
++    }
++
++    fn bench_block_leaves(
++        sorted_coeffs: &[&CircleCoefficients<SimdBackend>],
++        log_blowup_factor: u32,
++        twiddles: &TwiddleTree<SimdBackend>,
++        lifting_log_size: u32,
++        keep_lens: &[usize],
++        n_skipped_layers: u32,
++    ) -> Option<(Vec<BaseColumn>, Vec<Blake2sHash>)> {
++        // Lifting maps leaf block j onto block j of every column, so each block is committed on
++        // its own with block-local states; every column block must fill at least one packed row.
++        // Each block's leaves are whole subtrees, so the skipped layers are built per block.
++        if sorted_coeffs.is_empty()
++            || sorted_coeffs[0].log_size() < LOG_N_LANES
++            || lifting_log_size - log_blowup_factor < n_skipped_layers
++        {
++            return None;
++        }
++        let n_columns = sorted_coeffs.len();
++        let max_log_size = sorted_coeffs.last().unwrap().log_size();
++        let mut kept: Vec<BaseColumn> = keep_lens
++            .iter()
++            .map(|&len| unsafe { BaseColumn::uninitialized(len) })
++            .collect();
++        let block_nodes = 1usize << (lifting_log_size - log_blowup_factor - n_skipped_layers);
++        // Safety: every block of `res` is written below.
++        let mut res: Vec<Blake2sHash> =
++            unsafe { uninit_vec(1 << (lifting_log_size - n_skipped_layers)) };
++        let last_chunk_index = (n_columns - 1) / N_FELTS_IN_BLAKE_MESSAGE * N_FELTS_IN_BLAKE_MESSAGE;
++        for block in 0..1usize << log_blowup_factor {
++            let mut evaluate = |range: std::ops::Range<usize>| -> Vec<BaseColumn> {
++                let values: Vec<BaseColumn> = sorted_coeffs[range.clone()]
++                    .par_iter()
++                    .map(|coeffs| {
++                        let domain =
++                            CanonicCoset::new(coeffs.log_size() + log_blowup_factor).circle_domain();
++                        bench_evaluate_block(coeffs, domain, twiddles, block)
++                    })
++                    .collect();
++                for (k, values) in range.zip(&values) {
++                    let packed = values.data.len();
++                    if (block + 1) * packed <= kept[k].data.len() {
++                        kept[k].data[block * packed..(block + 1) * packed]
++                            .copy_from_slice(&values.data);
++                    }
++                }
++                values
++            };
++            let mut stream =
++                Box::new(SimdLeafStream::<IS_M31_OUTPUT>::new(max_log_size - LOG_N_LANES));
++            for start in (0..last_chunk_index).step_by(N_FELTS_IN_BLAKE_MESSAGE) {
++                let values = evaluate(start..start + N_FELTS_IN_BLAKE_MESSAGE);
++                stream.absorb_chunk(&values.iter().collect_vec());
++            }
++            let values = evaluate(last_chunk_index..n_columns);
++            let leaves = stream.finalize(
++                &values.iter().collect_vec(),
++                lifting_log_size - log_blowup_factor,
++            );
++            let nodes = (0..n_skipped_layers).fold(leaves, |layer, _| {
++                <SimdBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_next_layer(&layer)
++            });
++            res[block * block_nodes..(block + 1) * block_nodes].copy_from_slice(&nodes);
++        }
++        Some((kept, res))
++    }
++}
++
++/// Bench: `build_leaves` split into per-chunk steps. Hashing is row-wise and lifting maps lifted
++/// row `i` to source row `i >> ratio`, so absorbing each 16-column chunk at its own size and
++/// lifting the states later yields the same leaves as lifting every chunk to its window's size.
++struct SimdLeafStream<const IS_M31_OUTPUT: bool> {
++    prev_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]>,
++    next_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]>,
++    /// Packed log size of the rows in `prev_layer_states`.
++    prev_log_size: u32,
++    max_log_size: u32,
++    byte_count: u64,
++}
++
++impl<const IS_M31_OUTPUT: bool> SimdLeafStream<IS_M31_OUTPUT> {
++    #[allow(clippy::uninit_vec)]
++    fn new(max_log_size: u32) -> Self {
++        // Safety: rows are only read after being written; row 0 is the only row read while
++        // `prev_log_size == 0`.
++        let mut prev_layer_states = unsafe { uninit_vec(1 << max_log_size) };
++        prev_layer_states[0] = INITIAL_STATE;
++        Self {
++            prev_layer_states,
++            next_layer_states: unsafe { uninit_vec(1 << max_log_size) },
++            prev_log_size: 0,
++            max_log_size,
++            byte_count: 0,
++        }
++    }
++}
++
++impl<const IS_M31_OUTPUT: bool> LeafStream<SimdBackend, Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>
++    for SimdLeafStream<IS_M31_OUTPUT>
++{
++    fn absorb_chunk(&mut self, columns: &[&BaseColumn]) {
++        assert_eq!(columns.len(), N_FELTS_IN_BLAKE_MESSAGE);
++        let chunk_log_size = columns.last().unwrap().data.len().ilog2();
++        assert!(chunk_log_size >= self.prev_log_size);
++        self.byte_count += N_BYTES_IN_BLAKE_MESSAGE;
++        let byte_count = self.byte_count;
++        let msgs_at = |i: usize| -> [u32x16; N_FELTS_IN_BLAKE_MESSAGE] {
++            std::array::from_fn(|j| {
++                let column = columns[j];
++                let log_ratio = chunk_log_size - column.data.len().ilog2();
++                to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i)
++            })
++        };
++        let log_ratio = chunk_log_size - self.prev_log_size;
++        if log_ratio == 0 {
++            self.prev_layer_states[..1 << chunk_log_size]
++                .par_iter_mut()
++                .enumerate()
++                .for_each(|(i, state)| *state = compress_unfinalized(*state, msgs_at(i), byte_count));
++            return;
++        }
++        let prev_layer_states = &self.prev_layer_states;
++        self.next_layer_states[..1 << chunk_log_size]
++            .par_iter_mut()
++            .enumerate()
++            .for_each(|(i, state)| {
++                let prev_state = std::array::from_fn(|j| {
++                    to_lifted_simd(prev_layer_states[i >> log_ratio][j], log_ratio, i)
++                });
++                *state = compress_unfinalized(prev_state, msgs_at(i), byte_count);
++            });
++        std::mem::swap(&mut self.prev_layer_states, &mut self.next_layer_states);
++        self.prev_log_size = chunk_log_size;
++    }
++
++    #[allow(clippy::uninit_vec)]
++    fn finalize(self: Box<Self>, columns: &[&BaseColumn], lifting_log_size: u32) -> Vec<Blake2sHash> {
++        let Self {
++            prev_layer_states,
++            mut next_layer_states,
++            prev_log_size,
++            max_log_size,
++            byte_count,
++        } = *self;
++        assert!(!columns.is_empty() && columns.len() <= N_FELTS_IN_BLAKE_MESSAGE);
++        assert_eq!(columns.last().unwrap().data.len().ilog2(), max_log_size);
++        let byte_count = byte_count + (columns.len() * N_BYTES_FELT) as u64;
++        let log_ratio = max_log_size - prev_log_size;
++        next_layer_states[..1 << max_log_size]
++            .par_iter_mut()
++            .enumerate()
++            .for_each(|(i, state)| {
++                let prev_state = std::array::from_fn(|j| {
++                    to_lifted_simd(prev_layer_states[i >> log_ratio][j], log_ratio, i)
++                });
++                let mut msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = unsafe { std::mem::zeroed() };
++                for (j, column) in columns.iter().enumerate() {
++                    let log_ratio = max_log_size - column.data.len().ilog2();
++                    msgs[j] = to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i);
++                }
++                *state = compress_finalize(prev_state, msgs, byte_count);
++            });
++        drop(prev_layer_states);
++
++        let lifting_log_size_packed = lifting_log_size - LOG_N_LANES;
++        let mut res: Vec<Blake2sHash> =
++            unsafe { uninit_vec(1 << (lifting_log_size_packed + LOG_N_HASHES_PER_SIMD_STATE)) };
++        let mut transposed_states = if lifting_log_size_packed == max_log_size {
++            next_layer_states
++        } else {
++            let mut buf: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
++                unsafe { uninit_vec(1 << lifting_log_size_packed) };
++            let log_ratio = lifting_log_size_packed - max_log_size;
++            buf.par_iter_mut().enumerate().for_each(|(i, dest)| {
++                let packed = next_layer_states[i >> log_ratio];
++                *dest = std::array::from_fn(|j| to_lifted_simd(packed[j], log_ratio, i));
++            });
++            buf
++        };
++        transposed_states
++            .par_iter_mut()
++            .zip(res.par_chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE))
++            .for_each(|(state, dst)| {
++                let untransposed = if IS_M31_OUTPUT {
++                    let tmp = untranspose_states(*state);
++                    std::array::from_fn(|i| reduce_to_m31_simd(tmp[i]))
++                } else {
++                    untranspose_states(*state)
++                };
++                let dst: &mut [Blake2sHash; 16] = dst.try_into().unwrap();
++                *dst = unsafe { transmute::<[u32x16; 8], [Blake2sHash; 16]>(untransposed) };
++            });
++        res
++    }
+ }
+ 
+ impl PackLeavesOps for SimdBackend {
+diff --git a/crates/stwo/src/prover/backend/simd/circle.rs b/crates/stwo/src/prover/backend/simd/circle.rs
+index cd26f94..0705ffb 100644
+--- a/crates/stwo/src/prover/backend/simd/circle.rs
++++ b/crates/stwo/src/prover/backend/simd/circle.rs
+@@ -900,3 +900,37 @@ mod tests {
+             });
+     }
+ }
++
++/// Bench: block `block` of the bit-reversed evaluation of `poly` on `domain`, i.e. the evaluation
++/// on one subdomain coset of the polynomial's size (what `evaluate_into` writes per iteration).
++pub fn bench_evaluate_block(
++    poly: &CircleCoefficients<SimdBackend>,
++    domain: CircleDomain,
++    twiddles: &TwiddleTree<SimdBackend>,
++    block: usize,
++) -> BaseColumn {
++    let fft_log_size = poly.log_size();
++    let block_size = 1usize << fft_log_size;
++    if fft_log_size < MIN_FFT_LOG_SIZE {
++        let full = SimdBackend::evaluate(poly, domain, twiddles).values.to_cpu();
++        return full[block * block_size..(block + 1) * block_size].iter().copied().collect();
++    }
++    let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
++    let block_twiddles = (0..(fft_log_size - 1))
++        .map(|layer_i| {
++            &line_twiddles[layer_i as usize]
++                [block << (fft_log_size - 2 - layer_i)..(block + 1) << (fft_log_size - 2 - layer_i)]
++        })
++        .collect::<Vec<_>>();
++    // SAFETY: the FFT writes every value.
++    let mut out = unsafe { BaseColumn::uninitialized(block_size) };
++    unsafe {
++        rfft::fft(
++            transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
++            transmute::<*mut PackedBaseField, *mut u32>(out.data.as_mut_ptr()),
++            &block_twiddles,
++            fft_log_size as usize,
++        );
++    }
++    out
++}
+diff --git a/crates/stwo/src/prover/backend/simd/column.rs b/crates/stwo/src/prover/backend/simd/column.rs
+index a7a27e6..5d050ba 100644
+--- a/crates/stwo/src/prover/backend/simd/column.rs
++++ b/crates/stwo/src/prover/backend/simd/column.rs
+@@ -80,6 +80,12 @@ unsafe impl Send for BaseColumn {}
+ unsafe impl Sync for BaseColumn {}
+ 
+ impl Column<BaseField> for BaseColumn {
++    fn bench_truncate(&mut self, len: usize) {
++        self.data.truncate(len.div_ceil(N_LANES));
++        self.data.shrink_to_fit();
++        self.length = len;
++    }
++
+     fn zeros(length: usize) -> Self {
+         let data = vec![PackedBaseField::zeroed(); length.div_ceil(N_LANES)];
+         Self { data, length }
+diff --git a/crates/stwo/src/prover/memopt.rs b/crates/stwo/src/prover/memopt.rs
+new file mode 100644
+index 0000000..b2d5a15
+--- /dev/null
++++ b/crates/stwo/src/prover/memopt.rs
+@@ -0,0 +1,42 @@
++//! Memory optimizations for the zkmsg phone prover (SNIP-36 transaction proofs).
++//!
++//! Fixed at compile time: there are no runtime switches, environment reads, or
++//! `set_var`. All of them are on unless the crate is built with `SNIP36_MEMOPT=0` in
++//! the build environment, which gives the upstream behavior for an A/B comparison
++//! (`cargo` rebuilds this crate when that variable changes). The proof bytes are the
++//! same either way.
++
++/// Whether the optimizations are compiled in.
++pub const ENABLED: bool = !is_zero(option_env!("SNIP36_MEMOPT"));
++
++const fn is_zero(v: Option<&str>) -> bool {
++    match v {
++        Some(s) => {
++            let b = s.as_bytes();
++            b.len() == 1 && b[0] == b'0'
++        }
++        None => false,
++    }
++}
++
++/// Build each preprocessed tree inside the proof that uses it, instead of holding both
++/// from setup on.
++pub const LAZY_TREES: bool = ENABLED;
++/// Free the base column pool between the Cairo and the circuit proof.
++pub const CLEAR_POOL: bool = ENABLED;
++/// Gather decommitted values in parallel (each read may be a page fault).
++pub const PAR_DECOMMIT: bool = ENABLED;
++/// After hashing, keep only the first 2/blowup of each extended column.
++pub const TRUNCATE_LDE: bool = ENABLED;
++/// Extend and hash columns a chunk at a time.
++pub const STREAM_COMMIT: bool = ENABLED;
++/// Chunks of 16 columns extended per streaming batch.
++pub const STREAM_CHUNKS: usize = 1;
++/// Commit one bit-reversed block (a trace-size coset) at a time.
++pub const BLOCK_COMMIT: bool = ENABLED;
++/// Bottom Merkle layers not stored; queried subtrees are rebuilt at decommit.
++pub const MERKLE_DROP: usize = if ENABLED { 4 } else { 0 };
++/// Drop the coefficients of truncated columns; interpolate them from the kept prefix.
++pub const DROP_COEFFS: bool = ENABLED;
++/// After constraint evaluation, cut truncated columns to their first 1/blowup.
++pub const SHRINK_AFTER_COMPOSITION: bool = ENABLED;
+diff --git a/crates/stwo/src/prover/mempool.rs b/crates/stwo/src/prover/mempool.rs
+index 7b16b7b..6103a7f 100644
+--- a/crates/stwo/src/prover/mempool.rs
++++ b/crates/stwo/src/prover/mempool.rs
+@@ -54,6 +54,19 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
+             .unwrap_or_else(|| unsafe { Col::<B, BaseField>::uninitialized(1 << log_size) })
+     }
+ 
++    /// Bench: bytes held by idle buffers.
++    pub fn held_bytes(&self) -> usize {
++        self.pools
++            .iter()
++            .map(|e| e.value().iter().map(|c| c.len() * 4).sum::<usize>())
++            .sum()
++    }
++
++    /// Bench: frees every idle buffer.
++    pub fn clear(&self) {
++        self.pools.clear();
++    }
++
+     /// Returns a buffer to the pool. The caller is responsible for ensuring the buffer's log_size
+     /// matches.
+     pub fn give_back(&self, log_size: u32, buf: Col<B, BaseField>) {
+diff --git a/crates/stwo/src/prover/mod.rs b/crates/stwo/src/prover/mod.rs
+index 377f2c6..6bbbe40 100644
+--- a/crates/stwo/src/prover/mod.rs
++++ b/crates/stwo/src/prover/mod.rs
+@@ -21,6 +21,7 @@ pub mod fri;
+ pub mod line;
+ pub mod lookups;
+ pub mod mempool;
++pub mod memopt;
+ pub mod poly;
+ pub mod secure_column;
+ pub mod vcs;
+@@ -68,6 +69,8 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
+         commitment_scheme.config.fri_config.log_blowup_factor,
+     );
+     span1.exit();
++    drop(trace);
++    commitment_scheme.bench_shrink_after_composition();
+ 
+     // Commit on the Composition Polynomial by splitting its coeffs to two polynomialsof degree
+     // half the size of the original polynomial, and commit on each half separately.
+diff --git a/crates/stwo/src/prover/pcs/mod.rs b/crates/stwo/src/prover/pcs/mod.rs
+index 9b04df7..63a4e45 100644
+--- a/crates/stwo/src/prover/pcs/mod.rs
++++ b/crates/stwo/src/prover/pcs/mod.rs
+@@ -2,7 +2,7 @@ use hashbrown::HashMap;
+ use itertools::Itertools;
+ #[cfg(feature = "parallel")]
+ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+-use tracing::{info, span, Level};
++use tracing::{debug, info, span, Level};
+ 
+ use crate::core::channel::{Channel, MerkleChannel};
+ use crate::core::circle::CirclePoint;
+@@ -26,6 +26,7 @@ use crate::prover::pcs::quotient_ops::compute_fri_quotients;
+ use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
+ use crate::prover::poly::twiddles::TwiddleTree;
+ use crate::prover::poly::BitReversedOrder;
++use crate::prover::vcs_lifted::ops::LeafStream;
+ use crate::prover::vcs_lifted::prover::MerkleProverLifted;
+ 
+ pub mod quotient_ops;
+@@ -172,6 +173,26 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
+         weights_dashmap
+     }
+ 
++    /// Bench: once the composition polynomial is evaluated, columns whose coefficients were
++    /// dropped are only read on their first 2^n values (FRI quotients, coefficient recovery).
++    pub fn bench_shrink_after_composition(&mut self) {
++        if !crate::prover::memopt::SHRINK_AFTER_COMPOSITION {
++            return;
++        }
++        use crate::prover::backend::Column as _;
++        let log_blowup_factor = self.config.fri_config.log_blowup_factor;
++        for tree in self.trees.iter_mut() {
++            if let MaybeOwned::Owned(tree) = tree {
++                for poly in tree.polynomials.iter_mut().filter(|poly| poly.coeffs.is_none()) {
++                    let keep = poly.evals.domain.size() >> log_blowup_factor;
++                    if poly.evals.values.len() > keep {
++                        poly.evals.values.bench_truncate(keep);
++                    }
++                }
++            }
++        }
++    }
++
+     pub fn prove_values(
+         mut self,
+         sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+@@ -194,15 +215,23 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
+ 
+         // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
+         // of point samples.
++        let twiddles = self.twiddles;
++        let log_blowup_factor = self.config.fri_config.log_blowup_factor;
+         let eval_at_points = |(poly, points): (&Poly<B>, &Vec<CirclePoint<SecureField>>)| {
++            let recovered = (poly.coeffs.is_none() && weights_hash_map.is_none())
++                .then(|| bench_recover_coeffs(poly, twiddles, log_blowup_factor));
+             points
+                 .iter()
+-                .map(|&point| PointSample {
+-                    point,
+-                    value: poly.eval_at_point(
+-                        point.repeated_double(lifting_log_size - poly.evals.domain.log_size()),
+-                        weights_hash_map.as_ref(),
+-                    ),
++                .map(|&point| {
++                    let lifted_point =
++                        point.repeated_double(lifting_log_size - poly.evals.domain.log_size());
++                    PointSample {
++                        point,
++                        value: match &recovered {
++                            Some(coeffs) => coeffs.eval_at_point(lifted_point),
++                            None => poly.eval_at_point(lifted_point, weights_hash_map.as_ref()),
++                        },
++                    }
+                 })
+                 .collect_vec()
+         };
+@@ -226,6 +255,29 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
+ 
+         let columns = self.evaluations();
+         print_column_size_histogram::<B, MC>(&columns);
++        // Diagnostics: per-tree memory at the point every tree is still alive (debug level only).
++        if tracing::enabled!(Level::DEBUG) {
++            use crate::prover::backend::Column as _;
++            for (i, tree) in self.trees.iter().enumerate() {
++                let evals: usize = tree.polynomials.iter().map(|p| p.evals.values.len() * 4).sum();
++                let coeffs: usize = tree
++                    .polynomials
++                    .iter()
++                    .map(|p| p.coeffs.as_ref().map_or(0, |c| c.coeffs.len() * 4))
++                    .sum();
++                let max_log = tree.polynomials.iter().map(|p| p.evals.domain.log_size()).max().unwrap_or(0);
++                debug!(
++                    tree = i,
++                    n_columns = tree.polynomials.len(),
++                    eval_mib = evals >> 20,
++                    coeff_mib = coeffs >> 20,
++                    max_eval_log_size = max_log,
++                    owned = matches!(tree, MaybeOwned::Owned(_)),
++                    "bench tree memory"
++                );
++            }
++            debug!(pool_idle_mib = self.base_column_pool.held_bytes() >> 20, "bench pool at sampling");
++        }
+         // Compute oods quotients for boundary constraints on the sampled points.
+         let quotients = compute_fri_quotients(
+             &columns,
+@@ -276,7 +328,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
+             .trees
+             .as_ref()
+             .zip_eq(query_positions_tree)
+-            .map(|(tree, query_positions)| tree.decommit(query_positions))
++            .map(|(tree, query_positions)| {
++                tree.decommit(query_positions, self.twiddles, self.config.fri_config.log_blowup_factor)
++            })
+             .0
+             .into_iter()
+             .map(|(v, x)| (v, x.decommitment, x.aux))
+@@ -287,7 +341,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
+             if let MaybeOwned::Owned(tree) = tree {
+                 for poly in tree.polynomials.drain(..) {
+                     let log_size = poly.evals.domain.log_size();
+-                    self.base_column_pool.give_back(log_size, poly.evals.values);
++                    if crate::prover::backend::Column::len(&poly.evals.values) == poly.evals.domain.size() {
++                        self.base_column_pool.give_back(log_size, poly.evals.values);
++                    }
+                 }
+             }
+         }
+@@ -356,6 +412,66 @@ pub struct CommitmentTreeProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
+     pub commitment: MerkleProverLifted<B, MC::H>,
+ }
+ 
++/// Bench: how many bottom Merkle layers each committed tree frees (`memopt::MERKLE_DROP`).
++fn bench_merkle_drop() -> usize {
++    crate::prover::memopt::MERKLE_DROP
++}
++
++/// Bench: how many leading (bit-reversed) values of an extended column of the given log size are
++/// kept after commit; see `bench_truncate_lde`.
++fn bench_keep_len(log_size: u32, log_blowup_factor: u32) -> usize {
++    // Small columns stay whole: CPU fallbacks copy them at full length, and they are a
++    // negligible share of memory.
++    if crate::prover::memopt::TRUNCATE_LDE
++        && log_blowup_factor >= 1
++        && log_size >= 16
++    {
++        1 << (log_size - log_blowup_factor + 1)
++    } else {
++        1 << log_size
++    }
++}
++
++/// Bench: after hashing, composition reads only the first 2^(log_size + 1) rows of each column
++/// (bit-reversed subdomain, degree-2 constraints) and FRI quotients the first 2^log_size;
++/// decommit recomputes its few values from the coefficients. Keep the prefix.
++fn bench_truncate_lde<B: crate::prover::backend::Backend>(poly: &mut Poly<B>, log_blowup_factor: u32) {
++    use crate::prover::backend::Column as _;
++    let keep = bench_keep_len(poly.evals.domain.log_size(), log_blowup_factor);
++    if poly.coeffs.is_some() && keep < poly.evals.domain.size() {
++        poly.evals.values.bench_truncate(keep);
++        // The kept prefix determines the coefficients (see `bench_recover_coeffs`).
++        if crate::prover::memopt::DROP_COEFFS {
++            poly.coeffs = None;
++        }
++    }
++}
++
++/// Bench: the coefficients of a truncated column, interpolated from its kept prefix. For a
++/// polynomial of log size n, in bit-reversed order the first 2^n values are the evaluation on the
++/// first 2^n-point subdomain of the committed domain.
++fn bench_recover_coeffs<B: crate::prover::backend::Backend>(
++    poly: &Poly<B>,
++    twiddles: &TwiddleTree<B>,
++    log_blowup_factor: u32,
++) -> CircleCoefficients<B> {
++    use crate::prover::backend::Column as _;
++    use crate::prover::poly::twiddles::TwiddleBuffer;
++    let domain = poly.evals.domain;
++    let log_size = domain.log_size() - log_blowup_factor;
++    let subdomain = domain.split(domain.log_size() - log_size).0;
++    let subdomain_twiddles = TwiddleTree {
++        root_coset: subdomain.half_coset,
++        twiddles: TwiddleBuffer::empty(),
++        itwiddles: twiddles
++            .itwiddles
++            .extract_subdomain_twiddles(domain.log_size(), log_size),
++    };
++    let prefix = poly.evals.values.to_cpu().into_iter().take(1 << log_size).collect();
++    CircleEvaluation::<B, BaseField, BitReversedOrder>::new(subdomain, prefix)
++        .interpolate_with_twiddles(&subdomain_twiddles)
++}
++
+ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
+     pub fn new(
+         polynomials: ColumnVec<CircleCoefficients<B>>,
+@@ -365,6 +481,71 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
+         lifting_log_size: Option<u32>,
+         base_column_pool: &BaseColumnPool<B>,
+     ) -> Self {
++        if crate::prover::memopt::BLOCK_COMMIT
++            && store_polynomials_coefficients
++            && !polynomials.is_empty()
++        {
++            use crate::prover::backend::Column as _;
++            let _span = span!(Level::INFO, "BlockCommit").entered();
++            let max_log_size = polynomials.iter().map(|p| p.log_size()).max().unwrap();
++            let lifting_log_size = lifting_log_size.unwrap_or(max_log_size + log_blowup_factor);
++            // Same (stable) order as `MerkleProverLifted::commit`.
++            let order = (0..polynomials.len())
++                .sorted_by_key(|&i| polynomials[i].log_size())
++                .collect_vec();
++            let keep_lens = order
++                .iter()
++                .map(|&i| bench_keep_len(polynomials[i].log_size() + log_blowup_factor, log_blowup_factor))
++                .collect_vec();
++            let n_skipped = (bench_merkle_drop() as u32).min(lifting_log_size - 1);
++            if let Some((kept, layer)) = B::bench_block_leaves(
++                &order.iter().map(|&i| &polynomials[i]).collect_vec(),
++                log_blowup_factor,
++                twiddles,
++                lifting_log_size,
++                &keep_lens,
++                n_skipped,
++            ) {
++                let drop_coeffs = crate::prover::memopt::DROP_COEFFS;
++                let mut coeffs = polynomials.into_iter().map(Some).collect_vec();
++                let mut extended: Vec<Option<Poly<B>>> = (0..coeffs.len()).map(|_| None).collect();
++                for (&i, values) in order.iter().zip(kept) {
++                    let poly_coeffs = coeffs[i].take().unwrap();
++                    let domain =
++                        CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor).circle_domain();
++                    let truncated = values.len() < domain.size();
++                    extended[i] = Some(Poly::new(
++                        (!(truncated && drop_coeffs)).then_some(poly_coeffs),
++                        CircleEvaluation::bench_new_truncated(domain, values),
++                    ));
++                }
++                let tree = MerkleProverLifted::bench_from_layer(layer, lifting_log_size, n_skipped);
++                return CommitmentTreeProver {
++                    polynomials: extended.into_iter().map(Option::unwrap).collect(),
++                    commitment: tree,
++                };
++            }
++            info!("bench block commit unsupported for this tree; falling back");
++        }
++        if crate::prover::memopt::STREAM_COMMIT && !polynomials.is_empty()
++        {
++            let min_log_size = polynomials.iter().map(|p| p.log_size()).min().unwrap();
++            let max_log_size = polynomials.iter().map(|p| p.log_size()).max().unwrap();
++            if let Some(stream) = B::leaf_stream(
++                min_log_size + log_blowup_factor,
++                max_log_size + log_blowup_factor,
++            ) {
++                return Self::new_streamed(
++                    polynomials,
++                    stream,
++                    log_blowup_factor,
++                    twiddles,
++                    store_polynomials_coefficients,
++                    lifting_log_size.unwrap_or(max_log_size + log_blowup_factor),
++                    base_column_pool,
++                );
++            }
++        }
+         let span = span!(Level::INFO, "Extension").entered();
+         let polynomials = B::evaluate_polynomials(
+             polynomials,
+@@ -391,12 +572,85 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
+             0,
+         );
+ 
++        let mut polynomials = polynomials;
++        for poly in polynomials.iter_mut() {
++            bench_truncate_lde(poly, log_blowup_factor);
++        }
++
++        let mut tree = tree;
++        tree.bench_drop_bottom_layers(bench_merkle_drop());
+         CommitmentTreeProver {
+             polynomials,
+             commitment: tree,
+         }
+     }
+ 
++    /// Bench: extends the polynomials in size order, a batch of 16-column chunks at a time, and
++    /// absorbs each batch into the leaf hashes (then truncates it) before extending the next, so
++    /// the tree's full extension never exists at once.
++    fn new_streamed(
++        polynomials: ColumnVec<CircleCoefficients<B>>,
++        mut stream: Box<dyn LeafStream<B, MC::H>>,
++        log_blowup_factor: u32,
++        twiddles: &TwiddleTree<B>,
++        store_polynomials_coefficients: bool,
++        lifting_log_size: u32,
++        base_column_pool: &BaseColumnPool<B>,
++    ) -> Self {
++        const CHUNK: usize = 16;
++        let _span = span!(Level::INFO, "StreamCommit").entered();
++        let chunks_per_batch: usize = crate::prover::memopt::STREAM_CHUNKS;
++        let n_columns = polynomials.len();
++        // Same (stable) order as `MerkleProverLifted::commit`.
++        let order = (0..n_columns)
++            .sorted_by_key(|&i| polynomials[i].log_size())
++            .collect_vec();
++        let mut coeffs = polynomials.into_iter().map(Some).collect_vec();
++        let mut extended: Vec<Option<Poly<B>>> = (0..n_columns).map(|_| None).collect();
++        let mut extend = |indices: &[usize]| {
++            B::evaluate_polynomials(
++                indices.iter().map(|&i| coeffs[i].take().unwrap()).collect(),
++                log_blowup_factor,
++                twiddles,
++                store_polynomials_coefficients,
++                base_column_pool,
++            )
++        };
++        let mut store = |indices: &[usize], polys: Vec<Poly<B>>| {
++            for (&i, mut poly) in indices.iter().zip(polys) {
++                bench_truncate_lde(&mut poly, log_blowup_factor);
++                extended[i] = Some(poly);
++            }
++        };
++
++        let last_chunk_index = (n_columns - 1) / CHUNK * CHUNK;
++        for batch in order[..last_chunk_index].chunks(CHUNK * chunks_per_batch) {
++            let polys = extend(batch);
++            for chunk in polys.chunks(CHUNK) {
++                stream.absorb_chunk(&chunk.iter().map(|p| &p.evals.values).collect_vec());
++            }
++            store(batch, polys);
++        }
++        let last = &order[last_chunk_index..];
++        let polys = extend(last);
++        let span = span!(Level::INFO, "StreamFinalize").entered();
++        let leaves = stream.finalize(
++            &polys.iter().map(|p| &p.evals.values).collect_vec(),
++            lifting_log_size,
++        );
++        span.exit();
++        store(last, polys);
++
++        let span = span!(Level::INFO, "StreamLayers").entered();
++        let mut tree = MerkleProverLifted::from_leaves(leaves, lifting_log_size);
++        tree.bench_drop_bottom_layers(bench_merkle_drop());
++        span.exit();
++        CommitmentTreeProver {
++            polynomials: extended.into_iter().map(Option::unwrap).collect(),
++            commitment: tree,
++        }
++    }
++
+     /// Decommits the merkle tree on the given query positions.
+     /// Returns the values at the queried positions and the decommitment.
+     /// The queries are given as a mapping from the log size of the layer size to the queried
+@@ -404,17 +658,79 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
+     fn decommit(
+         &self,
+         queries: &[usize],
++        twiddles: &TwiddleTree<B>,
++        log_blowup_factor: u32,
+     ) -> (
+         ColumnVec<Vec<BaseField>>,
+         ExtendedMerkleDecommitmentLifted<MC::H>,
+     ) {
+-        let eval_vec = self
++        use crate::prover::backend::Column as _;
++        let truncated = self
+             .polynomials
+             .iter()
+-            .map(|poly| &poly.evals.values)
++            .any(|poly| poly.evals.values.len() < poly.evals.domain.size());
++        let dropped_rows = self.commitment.bench_dropped_rows(queries);
++        if !truncated && dropped_rows.is_empty() {
++            let eval_vec = self
++                .polynomials
++                .iter()
++                .map(|poly| &poly.evals.values)
++                .collect_vec();
++            return self.commitment.decommit(queries, eval_vec);
++        }
++        // Bench: re-extend each truncated column from its coefficients, read the queried rows
++        // (and the rows of dropped Merkle subtrees), drop it.
++        let max_log_size = self.commitment.layers.len() - 1;
++        let positions = queries.iter().chain(&dropped_rows).copied().collect_vec();
++        let gather = |poly: &Poly<B>| -> Vec<BaseField> {
++            let full;
++            let values = if poly.evals.values.len() < poly.evals.domain.size() {
++                full = match &poly.coeffs {
++                    Some(coeffs) => coeffs.evaluate_with_twiddles(poly.evals.domain, twiddles),
++                    None => bench_recover_coeffs(poly, twiddles, log_blowup_factor)
++                        .evaluate_with_twiddles(poly.evals.domain, twiddles),
++                };
++                &full.values
++            } else {
++                &poly.evals.values
++            };
++            let shift = max_log_size - poly.evals.domain.log_size() as usize;
++            positions
++                .iter()
++                .map(|pos| values.at((pos >> (shift + 1) << 1) + (pos & 1)))
++                .collect()
++        };
++        #[cfg(feature = "parallel")]
++        let mut gathered: Vec<Vec<BaseField>> = {
++            use rayon::prelude::*;
++            self.polynomials.par_iter().map(gather).collect()
++        };
++        #[cfg(not(feature = "parallel"))]
++        let mut gathered: Vec<Vec<BaseField>> = self.polynomials.iter().map(gather).collect();
++        let row_values = gathered
++            .iter_mut()
++            .map(|values| values.split_off(queries.len()))
+             .collect_vec();
+-        self.commitment.decommit(queries, eval_vec)
++        let restored = if dropped_rows.is_empty() {
++            HashMap::new()
++        } else {
++            // Leaf = hash of the row's values over the columns in commit (size-sorted) order.
++            let order = (0..self.polynomials.len())
++                .sorted_by_key(|&i| self.polynomials[i].evals.domain.log_size())
++                .collect_vec();
++            let leaves = (0..dropped_rows.len())
++                .map(|r| {
++                    let mut hasher = MC::H::default();
++                    hasher.update_leaf(&order.iter().map(|&c| row_values[c][r]).collect_vec());
++                    hasher.finalize()
++                })
++                .collect();
++            self.commitment.bench_restore_nodes(&dropped_rows, leaves)
++        };
++        self.commitment
++            .decommit_with_queried_values(queries, gathered, &restored)
+     }
++
+ }
+ 
+ fn print_column_size_histogram<B: BackendForChannel<MC>, MC: MerkleChannel>(
+diff --git a/crates/stwo/src/prover/poly/circle/evaluation.rs b/crates/stwo/src/prover/poly/circle/evaluation.rs
+index 9bd5446..a15dedf 100644
+--- a/crates/stwo/src/prover/poly/circle/evaluation.rs
++++ b/crates/stwo/src/prover/poly/circle/evaluation.rs
+@@ -34,6 +34,16 @@ impl<B: ColumnOps<F>, F: ExtensionOf<BaseField>, EvalOrder> CircleEvaluation<B,
+         }
+     }
+ 
++    /// Bench: an evaluation that keeps only a bit-reversed prefix of `domain`.
++    pub fn bench_new_truncated(domain: CircleDomain, values: Col<B, F>) -> Self {
++        assert!(values.len() <= domain.size());
++        Self {
++            domain,
++            values,
++            _eval_order: PhantomData,
++        }
++    }
++
+     /// Creates a zero-filled evaluation on a minimal viable domain.
+     ///
+     /// For a custom domain size, use `zero_padding_with_log_size`.
+diff --git a/crates/stwo/src/prover/vcs_lifted/ops.rs b/crates/stwo/src/prover/vcs_lifted/ops.rs
+index a6f0a1e..50adae1 100644
+--- a/crates/stwo/src/prover/vcs_lifted/ops.rs
++++ b/crates/stwo/src/prover/vcs_lifted/ops.rs
+@@ -5,6 +5,8 @@ use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
+ use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+ use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
+ use crate::prover::backend::{Col, ColumnOps};
++use crate::prover::poly::circle::{CircleCoefficients, PolyOps};
++use crate::prover::poly::twiddles::TwiddleTree;
+ 
+ /// Trait for performing Merkle operations on a commitment scheme.
+ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
+@@ -17,6 +19,43 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
+     /// Given a layer of hashes as input, computes a new layer by hashing pairs
+     /// of adjacent elements of the input, as in a standard Merkle tree.
+     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;
++
++    /// Bench: an incremental leaf builder that absorbs size-sorted columns 16 at a time, so the
++    /// caller can materialize one batch of columns at a time. `None` when unsupported.
++    fn leaf_stream(_min_log_size: u32, _max_log_size: u32) -> Option<Box<dyn LeafStream<Self, H>>>
++    where
++        Self: Sized,
++    {
++        None
++    }
++
++    /// Bench: commits to the extensions of size-sorted polynomials one bit-reversed block (a
++    /// coset of the polynomial's size) at a time, so no column is ever extended in full. Returns
++    /// each column's first `keep_lens[i]` extended values and the tree layer `n_skipped_layers`
++    /// above the leaves (the layers below it are never stored). `None` when unsupported.
++    #[allow(clippy::type_complexity)]
++    fn bench_block_leaves(
++        _sorted_coeffs: &[&CircleCoefficients<Self>],
++        _log_blowup_factor: u32,
++        _twiddles: &TwiddleTree<Self>,
++        _lifting_log_size: u32,
++        _keep_lens: &[usize],
++        _n_skipped_layers: u32,
++    ) -> Option<(Vec<Col<Self, BaseField>>, Col<Self, H::Hash>)>
++    where
++        Self: Sized + PolyOps,
++    {
++        None
++    }
++}
++
++/// Bench: incremental equivalent of [`MerkleOpsLifted::build_leaves`] over size-sorted columns.
++pub trait LeafStream<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> {
++    /// Absorbs exactly 16 columns that are not part of the final chunk.
++    fn absorb_chunk(&mut self, columns: &[&Col<B, BaseField>]);
++    /// Absorbs the final (1 to 16) columns and returns the leaves.
++    fn finalize(self: Box<Self>, columns: &[&Col<B, BaseField>], lifting_log_size: u32)
++        -> Col<B, H::Hash>;
+ }
+ 
+ pub trait PackLeavesOps: ColumnOps<BaseField> {
+diff --git a/crates/stwo/src/prover/vcs_lifted/prover.rs b/crates/stwo/src/prover/vcs_lifted/prover.rs
+index 946718d..f41dbba 100644
+--- a/crates/stwo/src/prover/vcs_lifted/prover.rs
++++ b/crates/stwo/src/prover/vcs_lifted/prover.rs
+@@ -76,6 +76,17 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
+         Self { layers }
+     }
+ 
++    /// Bench: builds the tree above leaves produced by a [`super::ops::LeafStream`].
++    pub fn from_leaves(leaves: Col<B, H::Hash>, lifting_log_size: u32) -> Self {
++        let _span = span!(Level::TRACE, "Merkle", class = "MerkleCommitment").entered();
++        let mut layers = vec![leaves];
++        (0..lifting_log_size).for_each(|_| {
++            layers.push(B::build_next_layer(layers.last().unwrap()));
++        });
++        layers.reverse();
++        Self { layers }
++    }
++
+     /// Decommits to columns on the given queries.
+     /// Queries are given as indices to the largest column.
+     ///
+@@ -98,23 +109,110 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
+         ColumnVec<Vec<BaseField>>,
+         ExtendedMerkleDecommitmentLifted<H>,
+     ) {
+-        // Prepare output buffers.
+-        let mut queried_values: ColumnVec<Vec<BaseField>> = vec![];
+-        let mut decommitment = MerkleDecommitmentLifted::<H>::default();
+-        let mut all_node_values: Vec<HashMap<usize, <H as MerkleHasherLifted>::Hash>> = vec![];
++        let queried_values: ColumnVec<Vec<BaseField>>;
+ 
+         // Compute the queried values.
+         let max_log_size = self.layers.len() - 1;
+-        for col in columns.iter() {
++        let gather = |col: &&Col<B, BaseField>| -> Vec<BaseField> {
+             let log_size = col.len().ilog2() as usize;
+             let shift = max_log_size - log_size;
+-            let res: Vec<_> = query_positions
++            query_positions
+                 .iter()
+                 .map(|pos| col.at((pos >> (shift + 1) << 1) + (pos & 1)))
+-                .collect();
+-            queried_values.push(res);
++                .collect()
++        };
++        // Bench: under memory pressure every `at` is a page fault; gathering columns in
++        // parallel keeps many reads in flight instead of one.
++        #[cfg(feature = "parallel")]
++        if crate::prover::memopt::PAR_DECOMMIT {
++            use rayon::prelude::*;
++            queried_values = columns.par_iter().map(gather).collect();
++        } else {
++            queried_values = columns.iter().map(gather).collect();
++        }
++        #[cfg(not(feature = "parallel"))]
++        {
++            queried_values = columns.iter().map(gather).collect();
++        }
++
++        self.decommit_with_queried_values(query_positions, queried_values, &HashMap::new())
++    }
++
++    /// Bench: builds the tree above `layer`, the layer `n_skipped` levels above the leaves; the
++    /// skipped layers are left empty, as after [`Self::bench_drop_bottom_layers`].
++    pub fn bench_from_layer(layer: Col<B, H::Hash>, lifting_log_size: u32, n_skipped: u32) -> Self {
++        let _span = span!(Level::TRACE, "Merkle", class = "MerkleCommitment").entered();
++        let mut layers = vec![layer];
++        (0..lifting_log_size - n_skipped).for_each(|_| {
++            layers.push(B::build_next_layer(layers.last().unwrap()));
++        });
++        layers.reverse();
++        layers.extend((0..n_skipped).map(|_| Col::<B, H::Hash>::zeros(0)));
++        Self { layers }
++    }
++
++    /// Bench: number of bottom layers dropped by [`Self::bench_drop_bottom_layers`].
++    pub fn bench_dropped_layers(&self) -> usize {
++        self.layers.iter().rev().take_while(|layer| layer.len() == 0).count()
++    }
++
++    /// Bench: frees the bottom `n_layers` layers (the leaves first). They are rebuilt for the
++    /// queried subtrees at decommit, from the rows given by [`Self::bench_dropped_rows`].
++    pub fn bench_drop_bottom_layers(&mut self, n_layers: usize) {
++        let max_log_size = self.layers.len() - 1;
++        for layer in &mut self.layers[max_log_size + 1 - n_layers.min(max_log_size)..] {
++            *layer = Col::<B, H::Hash>::zeros(0);
++        }
++    }
++
++    /// Bench: the leaf rows of every queried subtree whose nodes were dropped, increasing.
++    pub fn bench_dropped_rows(&self, query_positions: &[usize]) -> Vec<usize> {
++        let n_dropped = self.bench_dropped_layers();
++        if n_dropped == 0 {
++            return vec![];
+         }
++        query_positions
++            .iter()
++            .map(|pos| pos >> n_dropped)
++            .dedup()
++            .flat_map(|root| (root << n_dropped)..((root + 1) << n_dropped))
++            .collect()
++    }
+ 
++    /// Bench: rebuilds the dropped nodes above the given leaves of `bench_dropped_rows`, keyed by
++    /// (layer log size, index).
++    pub fn bench_restore_nodes(
++        &self,
++        rows: &[usize],
++        leaves: Vec<H::Hash>,
++    ) -> HashMap<(usize, usize), H::Hash> {
++        let max_log_size = self.layers.len() - 1;
++        let mut nodes: HashMap<(usize, usize), H::Hash> =
++            rows.iter().map(|&row| (max_log_size, row)).zip(leaves).collect();
++        let mut indices = rows.to_vec();
++        for log_size in (max_log_size + 1 - self.bench_dropped_layers()..max_log_size).rev() {
++            indices = indices.iter().map(|i| i >> 1).dedup().collect();
++            for &i in &indices {
++                let children = (nodes[&(log_size + 1, 2 * i)], nodes[&(log_size + 1, 2 * i + 1)]);
++                nodes.insert((log_size, i), H::hash_children(children));
++            }
++        }
++        nodes
++    }
++
++    /// Bench: the decommitment given queried values gathered by the caller (e.g. recomputed
++    /// from coefficients when the evaluations were truncated after commit).
++    pub fn decommit_with_queried_values(
++        &self,
++        query_positions: &[usize],
++        queried_values: ColumnVec<Vec<BaseField>>,
++        restored: &HashMap<(usize, usize), H::Hash>,
++    ) -> (
++        ColumnVec<Vec<BaseField>>,
++        ExtendedMerkleDecommitmentLifted<H>,
++    ) {
++        let mut decommitment = MerkleDecommitmentLifted::<H>::default();
++        let mut all_node_values: Vec<HashMap<usize, <H as MerkleHasherLifted>::Hash>> = vec![];
+         let mut prev_layer_queries = query_positions.to_vec();
+         prev_layer_queries.dedup();
+         // The largest log size of a layer is equal to `self.layers.len() - 1`. We start iterating
+@@ -130,6 +228,10 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
+             // Each layer node is a hash of column values as previous layer hashes.
+             // Prepare the previous layer hashes to read from.
+             let prev_layer_hashes = self.layers.get(layer_log_size + 1).unwrap();
++            let prev_layer_hash = |i: usize| match prev_layer_hashes.len() {
++                0 => restored[&(layer_log_size + 1, i)],
++                _ => prev_layer_hashes.at(i),
++            };
+             // All chunks have either length 1 (only one child is present) or 2 (both children are
+             // present).
+             for queries_chunk in prev_layer_queries.as_slice().chunk_by(|a, b| a ^ 1 == *b) {
+@@ -138,16 +240,16 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
+                 if queries_chunk.len() == 1 {
+                     decommitment
+                         .hash_witness
+-                        .push(prev_layer_hashes.at(first ^ 1))
++                        .push(prev_layer_hash(first ^ 1))
+                 }
+                 let curr_index = first >> 1;
+                 curr_layer_queries.push(curr_index);
+ 
+                 // Add the previous layer hashes to all_node_values.
+                 all_node_values_for_layer
+-                    .insert(2 * curr_index, prev_layer_hashes.at(2 * curr_index));
++                    .insert(2 * curr_index, prev_layer_hash(2 * curr_index));
+                 all_node_values_for_layer
+-                    .insert(2 * curr_index + 1, prev_layer_hashes.at(2 * curr_index + 1));
++                    .insert(2 * curr_index + 1, prev_layer_hash(2 * curr_index + 1));
+             }
+             // Propagate queries to the next layer.
+             prev_layer_queries = curr_layer_queries;

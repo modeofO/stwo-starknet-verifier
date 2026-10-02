@@ -1,0 +1,30 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 8e92f4bf1..99da50893 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -4,6 +4,7 @@
+ resolver = "2"
+ 
+ members = [
++    "crates/snip36_phone_ffi",
+   "crates/apollo_base_layer_tests",
+   "crates/apollo_batcher",
+   "crates/apollo_batcher_config",
+@@ -447,3 +448,17 @@ strip = "none"
+ as_conversions = "warn"
+ await_holding_lock = "warn"
+ await_holding_refcell_ref = "warn"
++
++# zkmsg phone build only (.prover/sequencer-phone): the memory-optimized proving stack, i.e.
++# upstream checkouts in .prover/patched-phone with tools/snip36-phone-ffi/memory-opt/*.patch
++# applied. The desktop build (.prover/sequencer) does not have this section.
++[patch."https://github.com/starkware-libs/proving-utils"]
++cairo-program-runner-lib = { path = "../patched-phone/proving-utils/crates/cairo-program-runner-lib" }
++privacy-circuit-verify = { path = "../patched-phone/proving-utils/crates/privacy_circuit_verify" }
++privacy-prove = { path = "../patched-phone/proving-utils/crates/privacy_prove" }
++
++[patch."https://github.com/starkware-libs/stwo"]
++stwo = { path = "../patched-phone/stwo/crates/stwo" }
++stwo-air-utils = { path = "../patched-phone/stwo/crates/air-utils" }
++stwo-air-utils-derive = { path = "../patched-phone/stwo/crates/air-utils-derive" }
++stwo-constraint-framework = { path = "../patched-phone/stwo/crates/constraint-framework" }
