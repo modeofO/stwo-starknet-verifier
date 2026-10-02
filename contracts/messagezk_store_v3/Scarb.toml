@@ -1,0 +1,30 @@
+[package]
+license = "Apache-2.0"
+name = "messagezk_store_v3"
+version = "0.1.0"
+edition = "2024_07"
+
+# zkmsg v3 on the SNIP-36 route (docs/superpowers/specs/
+# 2026-10-01-zkmsg-v3-pq-membership-design.md). ../messagezk_store_pq (v2:
+# hybrid ML-KEM-768 + ECDH) with hash-based membership: every identity also
+# registers m_commit = poseidon([MEMBER_V3, m]) for a secret m, the leaf binds
+# it, and the prover proves knowledge of m with no elliptic-curve step. Same
+# one-transaction send, same proof-facts binding; src/merkle.cairo is a
+# verbatim copy.
+
+[dependencies]
+starknet = "2.18.0"
+
+[[target.starknet-contract]]
+sierra = true
+allowed-libfuncs-list.name = "audited"
+
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
