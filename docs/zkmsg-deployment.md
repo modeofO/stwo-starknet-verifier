@@ -169,3 +169,33 @@ line is an unauthenticated plaintext claim.
 
 See `tools/zkmsg/README.md` (quickstart). The deployed store address is
 baked into `zkmsg init`'s defaults.
+
+## zkmsg v2: hybrid ML-KEM-768 + ECDH, SNIP-36 route (Sepolia alpha, 2026-10-01)
+
+Design: `docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`.
+Code: `contracts/messagezk_store_pq` (Scarb 2.18, sierra 1.8), branch `pq-v2`.
+Declared and deployed from account `deployer`
+(`0x6f3eee3cc01225d84e31c1696411afb129201a60ea44c06f96e0e422d8fa1ce`) via
+`https://api.zan.top/public/starknet-sepolia/rpc/v0_10`.
+
+| What | Value |
+|---|---|
+| `MessageStoreV2PQ` | `0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8` |
+| store class hash | `0x0181e2549f10fe48772038b5940951acd93dd7910f53286030883bde27d0c5be` |
+| store deploy block | **15947092** (scan start) |
+| `ZkmsgSendProverV2` | `0x02d993bd9e1229367fe9643151fdb7b2fb9fe06b28e6ff0d2f1d451894182d79` |
+| prover class hash | `0x07c8b5fb5fd93955698f1818bfad816f24ca26aa0ae851b6a1492d8b74fa864e` |
+| prover deploy block | 15947067 |
+| root history | 64 |
+
+| tx | hash | block | fee |
+|---|---|---|---|
+| declare prover | `0x04e23d7b37714bc34d596c74fa4ed432179568d8c72607803ff23ae977a9a8ad` | 15947061 | 1.58 STRK |
+| deploy prover | `0x010f9f637203027b154a752e6234a85ff232daf95a417e3e01b695b32dabe165` | 15947067 | 0.03 STRK |
+| declare store | `0x07d0d891f0c2894c1d679ce72e9ed255560097dacb85252402263422c76ff3da` | 15947082 | 9.19 STRK |
+| deploy store (pinned to the prover) | `0x0776b67f9bb80da2cd34775d641b494cdcab33e63d7b5de5fa60b3db72caefc6` | 15947092 | 0.04 STRK |
+
+Total 10.83 STRK. Checked after deploy: `prover()` returns the prover
+address, the root is 0, and `n_messages` is 0. No users are registered yet.
+Every identity must register again with `register(handle, scan_pubkey,
+kem_pubkey)`; the v1 store (`0x002b9c6f…8084f`) is no longer read.
