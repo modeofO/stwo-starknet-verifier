@@ -158,7 +158,7 @@ impl ProfileSession {
             }
         });
         if !self.is_virtual_route() {
-            ui.label("this profile's store is retired — move it to the v2 store on the Status tab");
+            ui.label("this profile's store is retired — move it to the v3 store on the Status tab");
         }
         if locked {
             ui.label("a profile setup is running — sending is paused until it finishes");

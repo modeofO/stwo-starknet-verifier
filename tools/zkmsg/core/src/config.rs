@@ -9,26 +9,28 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
-/// MessageStoreV2PQ (contracts/messagezk_store_pq), deployed 2026-10-01
-/// (docs/zkmsg-deployment.md): hybrid ML-KEM-768 + ECDH, recipient check out
-/// of the zk statement, leaf = poseidon(LEAF_V2, scan_pub, kem_digest).
-/// Registration carries the 1184-byte ML-KEM encapsulation key.
-pub const SEPOLIA_STORE_V2: &str =
-    "0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8";
-pub const SEPOLIA_STORE_V2_DEPLOY_BLOCK: u64 = 15_947_092;
-/// ZkmsgSendProverV2 — the v2 store's pinned virtual-OS prover contract.
-pub const SEPOLIA_V2_SEND_PROVER: &str =
-    "0x02d993bd9e1229367fe9643151fdb7b2fb9fe06b28e6ff0d2f1d451894182d79";
+/// MessageStoreV3 (contracts/messagezk_store_pq), deployed 2026-10-01
+/// (docs/zkmsg-deployment.md): hash-based (post-quantum) membership. Each
+/// identity holds a membership secret m; the leaf is
+/// poseidon(LEAF_V3, scan_pub, kem_digest, poseidon(MEMBER_V3, m)), and a send
+/// proves knowledge of m under the root — no elliptic-curve step. Content and
+/// recipient detection are v2's hybrid ML-KEM-768 + ECDH, unchanged.
+pub const SEPOLIA_STORE_V3: &str =
+    "0x0103de677e966a8a72669551093f0f5342621e635531fec146c4b04c5f5d3d9d";
+pub const SEPOLIA_STORE_V3_DEPLOY_BLOCK: u64 = 15_952_418;
+/// ZkmsgSendProverV3 — the v3 store's pinned virtual-OS prover contract.
+pub const SEPOLIA_V3_SEND_PROVER: &str =
+    "0x03d4da714c3bb315fe54017d2556face941836c2d5dfa9cc0b6852b94c0b4f30";
 
 /// The store a fresh profile is configured with — and the only one this
-/// client reads or writes (owner decision 2026-10-01: MessageStore v3 and the
-/// SNIP-36 v1 store are no longer read; `zkmsg migrate-store` moves a
-/// profile still pointing at one of them).
-pub const SEPOLIA_STORE_DEFAULT: &str = SEPOLIA_STORE_V2;
+/// client reads or writes (owner decision 2026-10-01: only the current store
+/// is read; `zkmsg migrate-store` moves a profile still pointing at an older
+/// one — v2 PQ, SNIP-36 v1 or the lane-1 store).
+pub const SEPOLIA_STORE_DEFAULT: &str = SEPOLIA_STORE_V3;
 
-/// Whether `store` is the v2 store.
-pub fn is_v2_store(store: &str) -> bool {
-    same_address(store, SEPOLIA_STORE_V2)
+/// Whether `store` is the current (v3) store.
+pub fn is_current_store(store: &str) -> bool {
+    same_address(store, SEPOLIA_STORE_V3)
 }
 
 /// Address equality as felts (tolerates leading zeros / case).
@@ -39,10 +41,10 @@ pub fn same_address(a: &str, b: &str) -> bool {
     }
 }
 
-/// First block worth scanning for `store`'s events: the v2 store's deploy
+/// First block worth scanning for `store`'s events: the current store's deploy
 /// block, else 0. From-genesis getEvents 500s on publicnode.
 pub fn store_deploy_block(store: &str) -> u64 {
-    if is_v2_store(store) { SEPOLIA_STORE_V2_DEPLOY_BLOCK } else { 0 }
+    if is_current_store(store) { SEPOLIA_STORE_V3_DEPLOY_BLOCK } else { 0 }
 }
 
 pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.com";
@@ -118,12 +120,19 @@ pub struct Keys {
     pub leaf_index: Option<u32>,
     /// ML-KEM-768 seed `d ‖ z`, 64 bytes as `0x` + 128 hex digits (the
     /// scan key's style; zkmsg-ios `zkmsgtool` reads it, with or without the
-    /// prefix, to carry it into a phone backup) — the v2 store's second
-    /// recipient key. Generated on `init`, and added to older profiles the
-    /// first time a v2 operation needs it (`Home::ensure_kem_seed`). Like the
-    /// scan key, losing it loses the v2 inbox.
+    /// prefix, to carry it into a phone backup) — the second recipient key
+    /// (v2 onwards). Generated on `init`, and added to older profiles the
+    /// first time it is needed (`Home::ensure_kem_seed`). Like the scan key,
+    /// losing it loses the inbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kem_seed: Option<String>,
+    /// v3 membership secret m, `0x` + 64 lowercase hex (< 2^251, never 0).
+    /// It is the SEND credential: the leaf commits to poseidon(MEMBER_V3, m)
+    /// and a send proves knowledge of m. Minted on `init`, and fresh for each
+    /// store a profile registers on (`migrate_store`); never re-minted for a
+    /// profile that holds a handle on the current store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_secret: Option<String>,
 }
 
 impl Keys {
@@ -133,6 +142,13 @@ impl Keys {
             .context("keys.json kem_seed hex")?
             .try_into()
             .map_err(|_| anyhow::anyhow!("keys.json kem_seed is not 64 bytes"))
+    }
+
+    /// The membership secret as a felt, range-checked (< 2^251, nonzero).
+    pub fn member_secret_felt(&self) -> Result<Felt> {
+        let hex = self.member_secret.as_deref().context("keys.json has no member_secret")?;
+        let bytes = hex::decode(hex.trim_start_matches("0x")).context("keys.json member_secret hex")?;
+        crate::crypto::member_secret_felt(&bytes).context("keys.json member_secret")
     }
 
     /// `(dk, ek)` from the stored seed.
@@ -147,6 +163,11 @@ impl Keys {
     pub fn scan_pub_felt(&self) -> Result<Felt> {
         Felt::from_hex(&self.scan_pub).context("keys.json scan_pub")
     }
+}
+
+/// The keys.json form of a membership secret: `0x` + 64 lowercase hex.
+pub fn member_secret_hex(m: &[u8; crate::crypto::MEMBER_SECRET_LEN]) -> String {
+    format!("0x{}", hex::encode(m))
 }
 
 /// Writes `bytes` to `path` atomically: a temp file in the same directory
@@ -246,6 +267,26 @@ impl Home {
     /// store that registration committed to a seed this file has lost (an
     /// older build rewrote keys.json without it), and minting another would
     /// only hide that. `migrate_store` clears the handle first.
+    /// Loads keys, adding the KEM seed and the membership secret if missing —
+    /// everything a current-store registration publishes a commitment to.
+    /// Same rule as `ensure_kem_seed`: never minted for a profile that holds
+    /// a handle (its registration committed to the secret it lost).
+    pub fn ensure_register_keys(&self) -> Result<Keys> {
+        let mut keys = self.ensure_kem_seed()?;
+        if keys.member_secret.is_none() {
+            if let Some(handle) = &keys.handle {
+                bail!(
+                    "keys.json holds the handle '{handle}' but no member_secret — refusing to \
+                     mint a new one (restore it from a backup, or `zkmsg migrate-store` if \
+                     '{handle}' is an older store's registration)"
+                );
+            }
+            keys.member_secret = Some(member_secret_hex(&crate::crypto::member_secret_gen()));
+            self.update_keys(&keys)?;
+        }
+        Ok(keys)
+    }
+
     pub fn ensure_kem_seed(&self) -> Result<Keys> {
         let mut keys = self.load_keys()?;
         if keys.kem_seed.is_none() {
@@ -278,6 +319,7 @@ mod tests {
             handle: None,
             leaf_index: None,
             kem_seed: None,
+            member_secret: None,
         };
         home.save_new_keys(&keys).unwrap();
         assert!(home.save_new_keys(&keys).is_err());
@@ -302,6 +344,21 @@ mod tests {
         assert!(home.ensure_kem_seed().is_err());
         assert!(home.load_keys().unwrap().kem_seed.is_none());
         home.update_keys(&seeded).unwrap();
+
+        // The membership secret: minted once, pinned format, range-checked.
+        let full = home.ensure_register_keys().unwrap();
+        let m = full.member_secret.clone().unwrap();
+        assert!(m.starts_with("0x") && m.len() == 66, "pinned format: {m}");
+        assert!(full.member_secret_felt().is_ok());
+        assert_eq!(home.ensure_register_keys().unwrap().member_secret, Some(m.clone()));
+        let too_big = Keys { member_secret: Some(format!("0x08{}", "00".repeat(31))), ..home.load_keys().unwrap() };
+        assert!(too_big.member_secret_felt().is_err(), ">= 2^251 is rejected");
+        let zero = Keys { member_secret: Some(format!("0x{}", "00".repeat(32))), ..home.load_keys().unwrap() };
+        assert!(zero.member_secret_felt().is_err(), "0 is rejected");
+        // Never minted for a registered profile that lost it.
+        let lost = Keys { handle: Some("carol".into()), member_secret: None, ..home.load_keys().unwrap() };
+        home.update_keys(&lost).unwrap();
+        assert!(home.ensure_register_keys().is_err());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -354,13 +411,17 @@ mod tests {
 
     #[test]
     fn store_routing() {
-        assert_eq!(Config::default_sepolia(Path::new("/r")).store, SEPOLIA_STORE_V2);
+        assert_eq!(Config::default_sepolia(Path::new("/r")).store, SEPOLIA_STORE_V3);
         // Leading-zero / case differences still match.
-        assert!(is_v2_store("0x4DC92EF9A90D336A79188C5408CDF9CE480F3ECD5B1CE55EF2CA207F2C3AFE8"));
-        assert_eq!(store_deploy_block(SEPOLIA_STORE_V2), SEPOLIA_STORE_V2_DEPLOY_BLOCK);
+        assert!(is_current_store("0x103DE677E966A8A72669551093F0F5342621E635531FEC146C4B04C5F5D3D9D"));
+        assert_eq!(store_deploy_block(SEPOLIA_STORE_V3), SEPOLIA_STORE_V3_DEPLOY_BLOCK);
         // The retired stores are just unknown addresses now.
-        let snip36_v1 = "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f";
-        assert!(!is_v2_store(snip36_v1));
-        assert_eq!(store_deploy_block(snip36_v1), 0);
+        for retired in [
+            "0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8", // v2 PQ
+            "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f", // SNIP-36 v1
+        ] {
+            assert!(!is_current_store(retired));
+            assert_eq!(store_deploy_block(retired), 0);
+        }
     }
 }

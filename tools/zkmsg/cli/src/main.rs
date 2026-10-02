@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 
 use zkmsg_core::app;
 use zkmsg_core::chain::{Chain, felt_hex};
-use zkmsg_core::config::{Home, is_v2_store};
+use zkmsg_core::config::{Home, is_current_store};
 use zkmsg_core::inbox;
 use zkmsg_core::state::SendState;
 
@@ -56,7 +56,7 @@ enum Command {
         /// sncast account name to send transactions from.
         #[arg(long, default_value = "funded-deployer")]
         account: String,
-        /// MessageStore address (defaults to the v2 store).
+        /// MessageStore address (defaults to the v3 store).
         #[arg(long)]
         store: Option<String>,
     },
@@ -135,7 +135,7 @@ fn cmd_send(home: &Home, handle: &str, text: &str) -> Result<()> {
     ensure!(!config.store.is_empty(), "no store address in config.json");
     ensure!(
         app::on_current_store(&config),
-        "{} is not the v2 store — `zkmsg migrate-store` moves the profile",
+        "{} is not the v3 store — `zkmsg migrate-store` moves the profile",
         config.store,
     );
     keys.leaf_index.context("not registered — run `zkmsg register`")?;
@@ -188,7 +188,7 @@ fn cmd_migrate_store(home: &Home) -> Result<()> {
         "{}: store {} -> {}",
         home.dir.display(),
         m.previous_store,
-        zkmsg_core::config::SEPOLIA_STORE_V2
+        zkmsg_core::config::SEPOLIA_STORE_V3
     );
     match m.previous_handle {
         Some(h) => println!("registration is per store — run `zkmsg register {h}` to register again"),
@@ -208,7 +208,7 @@ fn cmd_status(home: &Home) -> Result<()> {
     );
     let route = if report.store.is_empty() {
         ""
-    } else if is_v2_store(&report.store) {
+    } else if is_current_store(&report.store) {
         " (v2: hybrid ML-KEM + ECDH)"
     } else {
         " (not read any more — `zkmsg migrate-store` moves to v2)"

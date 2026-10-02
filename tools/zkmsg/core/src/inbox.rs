@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
 use crate::chain::{Chain, bytearray_decode, felt_to_u64, snkeccak};
-use crate::config::{Keys, is_v2_store, store_deploy_block};
+use crate::config::{Keys, is_current_store, store_deploy_block};
 use crate::crypto::receive_v2;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,10 +20,10 @@ pub struct ReceivedMessage {
     pub text: String,
 }
 
-/// Scans the v2 store with the profile's scan key and ML-KEM key. Other
+/// Scans the v3 store with the profile's scan key and ML-KEM key. Other
 /// stores are no longer read (owner decision 2026-10-01).
 pub fn scan_with_keys(chain: &Chain, store: &str, keys: &Keys) -> Result<Vec<ReceivedMessage>> {
-    ensure!(is_v2_store(store), "{store} is not the v2 store — `zkmsg migrate-store` moves this profile");
+    ensure!(is_current_store(store), "{store} is not the v3 store — `zkmsg migrate-store` moves this profile");
     let (dk, _) = keys.kem_keypair().context("a v2 inbox needs the profile's ML-KEM key")?;
     scan_v2(chain, store, &keys.scan_priv_felt()?, &dk)
 }
