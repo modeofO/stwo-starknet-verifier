@@ -81,9 +81,13 @@ register(handle: felt252, scan_pubkey: felt252, kem_pubkey: ByteArray)
 - The store computes `kem_digest` from `kem_pubkey` and checks its length is
   exactly 1184 bytes. It inserts `leaf` and stores `(owner, scan_pubkey,
   kem_digest, leaf_index)` per handle.
-- It emits `UserRegistered { handle, owner, scan_pubkey, kem_pubkey,
-  leaf_index }`. The full `ek` goes only in the event, which is far cheaper
-  than 38 storage felts.
+- It emits `UserRegistered { owner (key), handle, scan_pubkey, leaf_index,
+  kem_pubkey }`, so the event data is `[handle, scan_pubkey, leaf_index,
+  kem_pubkey ByteArray...]`. `leaf_index` comes before the ByteArray so that
+  `data[0..3]` keep v1's positions. The full `ek` goes only in the event,
+  which is far cheaper than 38 storage felts.
+- One registration per account (`already registered`), so the owner-keyed
+  views (`get_kem_digest(owner)`, `get_scan_pubkey(owner)`) are unambiguous.
 - `get_user(handle) -> (owner, scan_pubkey, kem_digest, leaf_index)`.
 - A sender gets the recipient's `ek` from the event log and **must** check
   that `kem_digest(ek) == get_user(handle).kem_digest` before encapsulating.
