@@ -1,426 +1,284 @@
-//! Adversarial "limit tests" for the zkmsg authenticity model.
+//! Adversarial "limit tests" for the zkmsg v2 authenticity model.
 //!
 //! These do not test that the happy path works (the unit tests and the
 //! live Sepolia sends already prove that). They test that every attack we
 //! could name FAILS — the properties the product's privacy claim rests on.
 //!
 //! Adversary model. On-chain, everything is public: every `MessageSent`
-//! event exposes `(commitment, ephemeral_pubkey, ciphertext)`, every
-//! `UserRegistered` event exposes `(handle, scan_pubkey, leaf_index)`, and
-//! all Merkle roots are readable. The adversary Eve may be a registered
-//! user with her own scan keypair. What she never has: any other user's
-//! `scan_priv`, or any `ephemeral_priv` (minted fresh per send, dropped
-//! immediately after — see app::prepare_send). Every test below hands Eve
-//! the full public view and asserts she still cannot read, forge, link, or
-//! crash.
+//! event exposes `(commitment, ephemeral_pubkey, content = kem_ct ‖ blob)`,
+//! every `UserRegistered` event exposes `(handle, scan_pubkey, leaf_index,
+//! kem_pubkey)`, and all Merkle roots are readable. The adversary Eve may be
+//! a registered user with her own keys. What she never has: any other user's
+//! scan key or ML-KEM seed, or any send's ephemeral scalar or ML-KEM
+//! randomness (fresh per send, dropped immediately after — see
+//! crypto::encap_v2). Every test below hands Eve the full public view and
+//! asserts she still cannot read, forge, link, or crash.
 //!
-//! Claims proven here:
-//!  1. Confidentiality      — only the recipient's scan_priv decrypts.
-//!  2. Cross-key isolation  — no foreign key opens the envelope (the exact
-//!                            "couldn't anyone use their own keys?" question).
+//! Claims proven here (v2: hybrid ML-KEM-768 + ECDH):
+//!  1. Confidentiality      — only the recipient's keys decrypt.
+//!  2. Hybrid binding       — the scan key alone, or the KEM key alone, opens
+//!                            nothing: the tag needs both shared secrets.
 //!  3. Trial-decrypt sound  — the inbox predicate matches iff addressed to us;
 //!                            the sender's own inbox stays empty.
-//!  4. Integrity            — any tamper (ciphertext, nonce, tag, length)
-//!                            is rejected by the AEAD.
-//!  5. Commitment binding   — a "for-Bob" envelope cannot be forged without
-//!                            bob_scan_priv or the ephemeral secret.
-//!  6. Membership           — you cannot send AS or TO a non-registered user
-//!                            through the honest arg/circuit gate.
-//!  7. Unlinkability        — fresh ephemerals make two sends to the same
-//!                            recipient unlinkable and share no AEAD key.
-//!  8. Malformed input      — an off-curve ephemeral in a crafted event is
+//!  4. Integrity            — any tamper (kem_ct, nonce, body, tag, length) is
+//!                            rejected or simply not ours.
+//!  5. Tag unforgeability   — a made-up commitment never opens for Bob.
+//!  6. Membership           — a leaf binds both the scan key and the KEM key;
+//!                            a swapped KEM key does not fold to the root.
+//!  7. Unlinkability        — fresh randomness makes two sends to the same
+//!                            recipient unlinkable.
+//!  8. Malformed input      — off-curve ephemerals and short content are
 //!                            skipped, never matched, never a panic.
 //!
-//! All offline, deterministic where the property is deterministic and
-//! property-checked over random keys where the claim is "for ALL keys".
-//! No network, no STRK. The one live check is `#[ignore]`d at the bottom.
+//! All offline. No network, no STRK. The one live check is `#[ignore]`d at
+//! the bottom.
 
+use ml_kem::DecapsulationKey768;
 use starknet_types_core::felt::Felt;
-use zkmsg_core::crypto::{commitment, ecdh_shared_x, encrypt, decrypt, scan_keygen};
+use zkmsg_core::crypto::{
+    KEM_CT_LEN, MIN_CONTENT_V2_LEN, decap_tag_v2, ec_mul_gen_x, ecdh_shared_x, kem_keygen_from_seed,
+    kem_seed_gen, receive_v2, scan_keygen, send_v2,
+};
 
-/// One honest send, reduced to what actually lands on-chain. Mirrors
-/// app::prepare_send: fresh ephemeral, shared = ecdh(eph_priv, recipient_pub),
-/// commitment = poseidon2(shared, 0), ciphertext = AEAD(shared, text).
+/// One user: scan key, ML-KEM key pair.
+struct User {
+    scan_priv: Felt,
+    scan_pub: Felt,
+    dk: DecapsulationKey768,
+    ek: Vec<u8>,
+}
+
+fn user() -> User {
+    let (scan_priv, scan_pub) = scan_keygen();
+    let (dk, ek) = kem_keygen_from_seed(&kem_seed_gen());
+    User { scan_priv, scan_pub, dk, ek }
+}
+
+/// One honest send, reduced to what lands on-chain.
 struct Envelope {
     eph_pub: Felt,
     commitment: Felt,
-    ciphertext: Vec<u8>,
+    content: Vec<u8>,
 }
 
-fn seal(recipient_pub: &Felt, text: &[u8]) -> Envelope {
-    let (eph_priv, eph_pub) = scan_keygen();
-    let shared = ecdh_shared_x(&eph_priv, recipient_pub).expect("recipient pub is on-curve");
-    Envelope {
-        eph_pub,
-        commitment: commitment(&shared),
-        ciphertext: encrypt(&shared, text),
-    }
+fn seal(to: &User, text: &[u8]) -> Envelope {
+    let s = send_v2(&to.scan_pub, &to.ek, text).expect("recipient keys are valid");
+    Envelope { eph_pub: s.ephemeral_pub, commitment: s.commitment, content: s.content }
 }
 
-/// The inbox's exact trial-decrypt predicate (inbox::scan): a scan key
-/// "owns" an envelope iff its ECDH reproduces the published commitment.
-/// Returns the recovered plaintext only on a genuine match.
-fn trial_open(scan_priv: &Felt, env: &Envelope) -> Option<Vec<u8>> {
-    let shared = ecdh_shared_x(scan_priv, &env.eph_pub).ok()?;
-    if commitment(&shared) != env.commitment {
-        return None; // not for us — same branch inbox.rs takes
-    }
-    decrypt(&shared, &env.ciphertext).ok()
+/// The inbox's exact predicate (inbox::scan): Some(plaintext) only on a
+/// genuine, openable match.
+fn trial_open(scan_priv: &Felt, dk: &DecapsulationKey768, env: &Envelope) -> Option<Vec<u8>> {
+    receive_v2(scan_priv, dk, &env.commitment, &env.eph_pub, &env.content)?.ok()
 }
 
-// --- 1 + 2. Confidentiality and cross-key isolation ----------------------
+fn open(u: &User, env: &Envelope) -> Option<Vec<u8>> {
+    trial_open(&u.scan_priv, &u.dk, env)
+}
+
+// --- 1. Confidentiality ----------------------------------------------------
 
 #[test]
 fn recipient_recovers_plaintext_but_eve_cannot() {
-    let (bob_priv, bob_pub) = scan_keygen();
-    let (eve_priv, _eve_pub) = scan_keygen();
+    let (bob, eve) = (user(), user());
     let msg = b"the witness never leaves your machine";
-
-    let env = seal(&bob_pub, msg);
-
-    // Bob (the intended recipient) opens it.
-    assert_eq!(trial_open(&bob_priv, &env).as_deref(), Some(&msg[..]));
-    // Eve, with her own valid key and the full public envelope, cannot.
-    assert!(trial_open(&eve_priv, &env).is_none());
+    let env = seal(&bob, msg);
+    assert_eq!(open(&bob, &env).as_deref(), Some(&msg[..]));
+    assert!(open(&eve, &env).is_none());
 }
 
 #[test]
-fn no_foreign_key_ever_opens_the_envelope() {
-    // The property behind recipient anonymity: for a message to Bob, run
-    // the trial-decrypt with 256 independent foreign keys. Not one may
-    // match the commitment (a false positive) or decrypt (a leak).
-    let (_bob_priv, bob_pub) = scan_keygen();
-    let env = seal(&bob_pub, b"addressed to exactly one person");
-
-    for _ in 0..256 {
-        let (eve_priv, _) = scan_keygen();
-        assert!(
-            trial_open(&eve_priv, &env).is_none(),
-            "a foreign scan key opened an envelope it was not addressed to",
-        );
+fn no_foreign_identity_ever_opens_the_envelope() {
+    // The property behind recipient anonymity: 64 independent foreign
+    // identities run the trial. Not one may match (a false positive) or
+    // decrypt (a leak).
+    let bob = user();
+    let env = seal(&bob, b"addressed to exactly one person");
+    for _ in 0..64 {
+        assert!(open(&user(), &env).is_none(), "a foreign identity opened an envelope");
     }
 }
 
+// --- 2. Hybrid binding: both halves are required --------------------------------
+
 #[test]
-fn eve_with_full_public_view_derives_a_different_secret() {
-    // Eve sees eph_pub and bob_pub (both public). Combining two *public*
-    // keys is not the shared secret: she has no private scalar that yields
-    // shared = eph_priv * bob_priv * G. Concretely, her best move —
-    // ecdh(eve_priv, eph_pub) — lands on a different point.
-    let (bob_priv, bob_pub) = scan_keygen();
-    let (eph_priv, eph_pub) = scan_keygen();
-    let (eve_priv, _) = scan_keygen();
-
-    let real_shared = ecdh_shared_x(&eph_priv, &bob_pub).unwrap();
-    let bob_shared = ecdh_shared_x(&bob_priv, &eph_pub).unwrap();
-    let eve_shared = ecdh_shared_x(&eve_priv, &eph_pub).unwrap();
-
-    assert_eq!(real_shared, bob_shared, "DH must commute for the recipient");
-    assert_ne!(eve_shared, real_shared, "a non-recipient must land elsewhere");
+fn bobs_scan_key_with_another_kem_key_opens_nothing() {
+    // A quantum adversary recovers bob's scan key from his public scan_pub.
+    // Without his ML-KEM key the tag still does not match.
+    let (bob, eve) = (user(), user());
+    let env = seal(&bob, b"post-quantum");
+    assert!(trial_open(&bob.scan_priv, &eve.dk, &env).is_none());
 }
 
-// --- 3. Trial-decrypt soundness ------------------------------------------
+#[test]
+fn bobs_kem_key_with_another_scan_key_opens_nothing() {
+    // If ML-KEM were broken, security falls back to ECDH, never below it.
+    let (bob, eve) = (user(), user());
+    let env = seal(&bob, b"classical fallback");
+    assert!(trial_open(&eve.scan_priv, &bob.dk, &env).is_none());
+}
+
+// --- 3. Trial-decrypt soundness ------------------------------------------------
 
 #[test]
 fn sender_own_inbox_is_empty() {
-    // Alice sends to Bob. Alice's own scan key must NOT match her own
-    // outgoing message — ecdh(alice, eph) != ecdh(eph, bob) unless
-    // alice == bob. This is why "your sent messages never show in your
-    // inbox" holds.
-    let (alice_priv, _alice_pub) = scan_keygen();
-    let (_bob_priv, bob_pub) = scan_keygen();
-    let env = seal(&bob_pub, b"hello bob");
-    assert!(trial_open(&alice_priv, &env).is_none());
+    let (alice, bob) = (user(), user());
+    let env = seal(&bob, b"hello bob");
+    assert!(open(&alice, &env).is_none());
 }
 
 #[test]
 fn message_to_self_is_the_only_self_match() {
-    // A user messaging themselves is the sole case where the sender's key
-    // opens the envelope — proving the predicate keys strictly on the
-    // recipient pubkey, nothing else.
-    let (me_priv, me_pub) = scan_keygen();
-    let env = seal(&me_pub, b"note to self");
-    assert_eq!(trial_open(&me_priv, &env).as_deref(), Some(&b"note to self"[..]));
+    let me = user();
+    let env = seal(&me, b"note to self");
+    assert_eq!(open(&me, &env).as_deref(), Some(&b"note to self"[..]));
 }
 
-// --- 4. Integrity: AEAD tamper detection ---------------------------------
+// --- 4. Integrity -----------------------------------------------------------------
 
 #[test]
 fn any_single_byte_tamper_is_rejected() {
-    let (bob_priv, bob_pub) = scan_keygen();
-    let env = seal(&bob_pub, b"integrity or nothing");
-    let shared = ecdh_shared_x(&bob_priv, &env.eph_pub).unwrap();
-
-    // Sanity: the pristine blob opens.
-    assert!(decrypt(&shared, &env.ciphertext).is_ok());
-
-    // Flip every byte in turn — nonce region, ciphertext body, GCM tag —
-    // and require each corruption to fail closed.
-    for i in 0..env.ciphertext.len() {
-        let mut tampered = env.ciphertext.clone();
-        tampered[i] ^= 0xFF;
-        assert!(
-            decrypt(&shared, &tampered).is_err(),
-            "AEAD accepted a blob corrupted at byte {i}",
-        );
+    // Flip every byte in turn. A kem_ct byte moves the tag (implicit
+    // rejection), so the envelope is no longer ours; a blob byte keeps the
+    // tag but fails the AEAD. Either way nothing opens.
+    let bob = user();
+    let env = seal(&bob, b"integrity or nothing");
+    for i in 0..env.content.len() {
+        let mut content = env.content.clone();
+        content[i] ^= 0xFF;
+        let tampered = Envelope { content, ..seal_copy(&env) };
+        let result = receive_v2(&bob.scan_priv, &bob.dk, &tampered.commitment, &tampered.eph_pub, &tampered.content);
+        if i < KEM_CT_LEN {
+            assert!(result.is_none(), "a kem_ct tamper at byte {i} still matched");
+        } else {
+            assert!(matches!(result, Some(Err(_))), "a blob tamper at byte {i} opened");
+        }
     }
+}
+
+fn seal_copy(env: &Envelope) -> Envelope {
+    Envelope { eph_pub: env.eph_pub, commitment: env.commitment, content: env.content.clone() }
 }
 
 #[test]
 fn truncation_and_extension_are_rejected() {
-    let (bob_priv, bob_pub) = scan_keygen();
-    let env = seal(&bob_pub, b"exact bytes only");
-    let shared = ecdh_shared_x(&bob_priv, &env.eph_pub).unwrap();
-
-    let mut short = env.ciphertext.clone();
-    short.pop();
-    assert!(decrypt(&shared, &short).is_err(), "truncated blob accepted");
-
-    let mut long = env.ciphertext.clone();
-    long.push(0);
-    assert!(decrypt(&shared, &long).is_err(), "extended blob accepted");
-
-    assert!(decrypt(&shared, &[]).is_err(), "empty blob accepted");
+    let bob = user();
+    let env = seal(&bob, b"exact bytes only");
+    let mut short = seal_copy(&env);
+    short.content.pop();
+    assert!(open(&bob, &short).is_none(), "truncated content accepted");
+    let mut long = seal_copy(&env);
+    long.content.push(0);
+    assert!(open(&bob, &long).is_none(), "extended content accepted");
+    let empty = Envelope { content: vec![], ..seal_copy(&env) };
+    assert!(open(&bob, &empty).is_none(), "empty content accepted");
 }
 
 #[test]
-fn ciphertext_cannot_be_moved_between_envelopes() {
-    // Two independent sends to Bob. The AEAD key is derived from a
-    // per-message shared secret, so pairing envelope A's ciphertext with
-    // envelope B's key (or vice versa) must fail — no cut-and-paste.
-    let (bob_priv, bob_pub) = scan_keygen();
-    let a = seal(&bob_pub, b"message A");
-    let b = seal(&bob_pub, b"message B");
-    let shared_a = ecdh_shared_x(&bob_priv, &a.eph_pub).unwrap();
-    let shared_b = ecdh_shared_x(&bob_priv, &b.eph_pub).unwrap();
-
-    assert!(decrypt(&shared_a, &b.ciphertext).is_err());
-    assert!(decrypt(&shared_b, &a.ciphertext).is_err());
+fn content_cannot_be_moved_between_envelopes() {
+    // Two sends to Bob. Pairing A's content with B's (commitment, eph) must
+    // fail: the tag binds kem_ct, E and R.
+    let bob = user();
+    let a = seal(&bob, b"message A");
+    let b = seal(&bob, b"message B");
+    let swapped = Envelope { content: b.content.clone(), ..seal_copy(&a) };
+    assert!(open(&bob, &swapped).is_none());
+    // Nor the ephemeral key: E is bound into the tag and the AAD.
+    let swapped_eph = Envelope { eph_pub: b.eph_pub, ..seal_copy(&a) };
+    assert!(open(&bob, &swapped_eph).is_none());
 }
 
-// --- 5. Commitment binding / unforgeability ------------------------------
+// --- 5. Tag unforgeability ---------------------------------------------------
 
 #[test]
 fn a_random_commitment_never_opens_for_bob() {
-    // An attacker who publishes a MessageSent with a made-up commitment
-    // and a made-up ephemeral pubkey cannot make it appear addressed to
-    // Bob: his trial-decrypt keys on poseidon2(ecdh(bob_priv, eph), 0),
-    // which he cannot pre-image without bob_priv.
-    let (bob_priv, _bob_pub) = scan_keygen();
-    for seed in 1u64..=256 {
-        let (_junk_priv, junk_eph) = scan_keygen();
+    let bob = user();
+    let honest = seal(&bob, b"template");
+    for seed in 1u64..=64 {
         let forged = Envelope {
-            eph_pub: junk_eph,
-            commitment: Felt::from(seed) * Felt::from(0x9e37_79b9u64), // arbitrary
-            ciphertext: vec![0u8; 40],
+            commitment: Felt::from(seed) * Felt::from(0x9e37_79b9u64),
+            ..seal_copy(&honest)
         };
-        assert!(trial_open(&bob_priv, &forged).is_none());
+        assert!(open(&bob, &forged).is_none());
     }
 }
 
 #[test]
-fn forging_a_for_bob_commitment_requires_bobs_secret() {
-    // The ONLY commitment Bob accepts for a given ephemeral pubkey is
-    // poseidon2(ecdh(bob_priv, eph_pub), 0). Computing it requires
-    // bob_priv; anyone holding it is Bob. We show the accepted value is
-    // exactly that and nothing adjacent works.
-    let (bob_priv, bob_pub) = scan_keygen();
-    let (eph_priv, eph_pub) = scan_keygen();
-
-    let shared = ecdh_shared_x(&eph_priv, &bob_pub).unwrap();
-    let accepted = commitment(&shared);
-
-    // The value Bob will match.
-    let bob_side = commitment(&ecdh_shared_x(&bob_priv, &eph_pub).unwrap());
-    assert_eq!(accepted, bob_side);
-
-    // Off-by-one on the commitment breaks the match.
-    let env = Envelope { eph_pub, commitment: accepted + Felt::ONE, ciphertext: vec![] };
-    assert!(
-        commitment(&ecdh_shared_x(&bob_priv, &env.eph_pub).unwrap()) != env.commitment,
-    );
+fn the_accepted_tag_is_exactly_the_hybrid_one() {
+    let bob = user();
+    let env = seal(&bob, b"exactly");
+    let keys = decap_tag_v2(&bob.scan_priv, &bob.dk, &env.eph_pub, &env.content[..KEM_CT_LEN]).unwrap();
+    assert_eq!(keys.tag, env.commitment);
+    let off_by_one = Envelope { commitment: env.commitment + Felt::ONE, ..seal_copy(&env) };
+    assert!(open(&bob, &off_by_one).is_none());
 }
 
-// --- 6. Membership: cannot send AS or TO a non-user ----------------------
+// --- 6. Membership: the leaf binds both keys -----------------------------------------
 
 mod membership {
     use starknet_types_core::felt::Felt;
-    use zkmsg_core::args::{build_circuit_args, CircuitInputs};
-    use zkmsg_core::crypto::ec_mul_gen_x;
-    use zkmsg_core::tree::MerkleTree;
+    use zkmsg_core::crypto::{ec_mul_gen_x, kem_digest, kem_keygen_from_seed, leaf_v2};
+    use zkmsg_core::tree::{MerkleTree, fold_path};
 
-    /// A registered two-user tree (sender at 0, recipient at 1), the honest
-    /// inputs that build_circuit_args accepts, and the pieces to perturb.
-    struct Fixture {
-        tree: MerkleTree,
-        sender_priv: Felt,
-        recipient_pub: Felt,
-    }
-
-    fn registered_pair() -> Fixture {
-        let sender_priv = Felt::from(5u32);
-        let recipient_pub = ec_mul_gen_x(&Felt::from(7u32));
+    #[test]
+    fn a_swapped_kem_key_is_not_a_member() {
+        let scan_pub = ec_mul_gen_x(&Felt::from(5u32));
+        let (_, ek) = kem_keygen_from_seed(&[1u8; 64]);
+        let (_, other_ek) = kem_keygen_from_seed(&[2u8; 64]);
         let mut tree = MerkleTree::new();
-        tree.insert(ec_mul_gen_x(&sender_priv));
-        tree.insert(recipient_pub);
-        Fixture { tree, sender_priv, recipient_pub }
-    }
+        let index = tree.insert(leaf_v2(&scan_pub, &kem_digest(&ek)));
+        tree.insert(leaf_v2(&ec_mul_gen_x(&Felt::from(7u32)), &kem_digest(&other_ek)));
+        let path = tree.path(index);
 
-    fn inputs<'a>(
-        f: &Fixture,
-        sender_priv: Felt,
-        recipient_pub: Felt,
-        sender_index: u32,
-        recipient_index: u32,
-        sender_path: &'a [Felt],
-        recipient_path: &'a [Felt],
-    ) -> CircuitInputs<'a> {
-        CircuitInputs {
-            merkle_root: f.tree.root(),
-            sender_scan_priv: sender_priv,
-            recipient_scan_pub: recipient_pub,
-            ephemeral_priv: Felt::from(6u32),
-            sender_leaf_index: sender_index,
-            recipient_leaf_index: recipient_index,
-            sender_path,
-            recipient_path,
-        }
-    }
-
-    #[test]
-    fn honest_pair_is_accepted() {
-        let f = registered_pair();
-        let (sp, rp) = (f.tree.path(0), f.tree.path(1));
-        assert!(
-            build_circuit_args(&inputs(&f, f.sender_priv, f.recipient_pub, 0, 1, &sp, &rp))
-                .is_ok(),
-        );
-    }
-
-    #[test]
-    fn unregistered_sender_rejected() {
-        // A sender whose scan pubkey is not a leaf cannot fold to the root.
-        let f = registered_pair();
-        let (sp, rp) = (f.tree.path(0), f.tree.path(1));
-        let outsider = Felt::from(9999u32); // never inserted
-        let err = build_circuit_args(&inputs(&f, outsider, f.recipient_pub, 0, 1, &sp, &rp))
-            .unwrap_err();
-        assert!(err.to_string().contains("sender membership"), "{err}");
-    }
-
-    #[test]
-    fn unregistered_recipient_rejected() {
-        let f = registered_pair();
-        let (sp, rp) = (f.tree.path(0), f.tree.path(1));
-        let outsider_pub = ec_mul_gen_x(&Felt::from(9999u32));
-        let err = build_circuit_args(&inputs(&f, f.sender_priv, outsider_pub, 0, 1, &sp, &rp))
-            .unwrap_err();
-        assert!(err.to_string().contains("recipient membership"), "{err}");
-    }
-
-    #[test]
-    fn wrong_sender_leaf_index_rejected() {
-        // Correct pubkey, correct path, but claim the wrong index — the
-        // fold direction flips and misses the root.
-        let f = registered_pair();
-        let (sp, rp) = (f.tree.path(0), f.tree.path(1));
-        let err = build_circuit_args(&inputs(&f, f.sender_priv, f.recipient_pub, 1, 1, &sp, &rp))
-            .unwrap_err();
-        assert!(err.to_string().contains("sender membership"), "{err}");
-    }
-
-    #[test]
-    fn swapped_paths_rejected() {
-        // Use the recipient's path to authenticate the sender.
-        let f = registered_pair();
-        let (sp, rp) = (f.tree.path(0), f.tree.path(1));
-        let err = build_circuit_args(&inputs(&f, f.sender_priv, f.recipient_pub, 0, 1, &rp, &sp))
-            .unwrap_err();
-        assert!(err.to_string().contains("membership"), "{err}");
-    }
-
-    #[test]
-    fn stale_or_forged_root_rejected() {
-        // Advance the root past what the paths authenticate: the membership
-        // that used to fold no longer does. (The store separately pins the
-        // root to a 20-deep freshness window; here we prove the client gate.)
-        let mut f = registered_pair();
-        let (sp, rp) = (f.tree.path(0), f.tree.path(1));
-        f.tree.insert(ec_mul_gen_x(&Felt::from(11u32))); // root moves
-        let err = build_circuit_args(&inputs(&f, f.sender_priv, f.recipient_pub, 0, 1, &sp, &rp))
-            .unwrap_err();
-        assert!(err.to_string().contains("membership"), "{err}");
+        assert_eq!(fold_path(&leaf_v2(&scan_pub, &kem_digest(&ek)), index, &path), tree.root());
+        assert_ne!(fold_path(&leaf_v2(&scan_pub, &kem_digest(&other_ek)), index, &path), tree.root());
+        // A v1 leaf (the bare scan key) is not a v2 member either.
+        assert_ne!(fold_path(&scan_pub, index, &path), tree.root());
     }
 }
 
-// --- 7. Unlinkability via fresh ephemerals -------------------------------
+// --- 7. Unlinkability -------------------------------------------------------------
 
 #[test]
 fn two_sends_to_the_same_recipient_are_unlinkable() {
-    // Identical (recipient, text), two sends. Because the ephemeral is
-    // fresh each time, an on-chain observer sees two unrelated
-    // (eph_pub, commitment, ciphertext) triples — no field links them.
-    let (bob_priv, bob_pub) = scan_keygen();
+    let bob = user();
     let text = b"same words, twice";
-    let a = seal(&bob_pub, text);
-    let b = seal(&bob_pub, text);
-
+    let (a, b) = (seal(&bob, text), seal(&bob, text));
     assert_ne!(a.eph_pub, b.eph_pub, "ephemeral pubkey must be fresh");
     assert_ne!(a.commitment, b.commitment, "commitment must not repeat");
-    assert_ne!(a.ciphertext, b.ciphertext, "ciphertext must not repeat");
-
-    // Yet Bob opens both to the same plaintext.
-    assert_eq!(trial_open(&bob_priv, &a).as_deref(), Some(&text[..]));
-    assert_eq!(trial_open(&bob_priv, &b).as_deref(), Some(&text[..]));
+    assert_ne!(a.content[..KEM_CT_LEN], b.content[..KEM_CT_LEN], "kem_ct must not repeat");
+    assert_ne!(a.content, b.content, "content must not repeat");
+    assert_eq!(open(&bob, &a).as_deref(), Some(&text[..]));
+    assert_eq!(open(&bob, &b).as_deref(), Some(&text[..]));
 }
 
-#[test]
-fn identical_plaintext_encrypts_differently_each_time() {
-    // Even under a FIXED shared secret, encrypt() randomizes the nonce, so
-    // no two ciphertexts of the same plaintext collide (no AEAD nonce
-    // reuse leak). Belt-and-suspenders on top of fresh-ephemeral.
-    let (_p, pubk) = scan_keygen();
-    let shared = ecdh_shared_x(&Felt::from(3u32), &pubk).unwrap();
-    let c1 = encrypt(&shared, b"repeat");
-    let c2 = encrypt(&shared, b"repeat");
-    assert_ne!(c1, c2, "nonce reuse: identical ciphertext for identical input");
-    assert_eq!(decrypt(&shared, &c1).unwrap(), decrypt(&shared, &c2).unwrap());
-}
-
-// --- 8. Malformed on-chain input -----------------------------------------
+// --- 8. Malformed on-chain input -----------------------------------------------------
 
 #[test]
 fn off_curve_ephemeral_is_skipped_not_matched() {
-    // A crafted MessageSent may carry an ephemeral_pubkey x that is not a
-    // valid stark-curve x. The inbox lifts it via ecdh_shared_x, which
-    // must Err (inbox then `continue`s) — never panic, never false-match.
-    let (bob_priv, _bob_pub) = scan_keygen();
-
-    // Find an off-curve x (roughly half of all felts are); bounded scan.
+    let bob = user();
     let mut off_curve = None;
     for candidate in 2u64..4096 {
         let x = Felt::from(candidate);
-        if ecdh_shared_x(&bob_priv, &x).is_err() {
+        if ecdh_shared_x(&bob.scan_priv, &x).is_err() {
             off_curve = Some(x);
             break;
         }
     }
     let x = off_curve.expect("an off-curve x must exist below 4096");
-
-    let env = Envelope { eph_pub: x, commitment: Felt::ZERO, ciphertext: vec![0u8; 40] };
-    assert!(trial_open(&bob_priv, &env).is_none());
+    let env = Envelope { eph_pub: x, commitment: Felt::ZERO, content: vec![0u8; MIN_CONTENT_V2_LEN] };
+    assert!(open(&bob, &env).is_none());
 }
 
 #[test]
 fn shared_secret_is_nondegenerate() {
-    // The shared x must not collapse to a trivial value (0, or the
-    // ephemeral pubkey itself) that would weaken the derived AEAD key.
     for _ in 0..64 {
         let (_p, pubk) = scan_keygen();
         let (eph, _) = scan_keygen();
         let shared = ecdh_shared_x(&eph, &pubk).unwrap();
         assert_ne!(shared, Felt::ZERO);
         assert_ne!(shared, pubk);
+        assert_ne!(shared, ec_mul_gen_x(&eph));
     }
 }
 

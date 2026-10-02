@@ -1,8 +1,7 @@
-//! Stark-curve ECDH + Poseidon + content AEAD — the Rust mirror of the
-//! circuit's primitives (fixtures/messagezk_scan). Every mapping is pinned
-//! by golden vectors from fixtures/zkmsg_vectors (Cairo dump + starknet.js,
-//! cross-validated; the milestone-1 bootloader preimage seals the full
-//! chain — see docs/superpowers/specs/2026-07-05-zkmsg-milestone1-addendum.md):
+//! zkmsg crypto: Poseidon, Stark-curve ECDH, and the v2 hybrid ML-KEM-768 +
+//! ECDH message key (below). The primitives are pinned by golden vectors
+//! from fixtures/zkmsg_vectors (Cairo dump + starknet.js, cross-validated)
+//! and by `examples/export_vectors`, which the iOS client pins to too:
 //!
 //! - `hash_pair`  = starknet_crypto::poseidon_hash_many(&[l, r])
 //!   (Cairo: Poseidon builder over two children)
@@ -24,7 +23,6 @@ use starknet_curve::curve_params::{EC_ORDER, GENERATOR};
 use starknet_types_core::curve::AffinePoint;
 use starknet_types_core::felt::Felt;
 
-const HKDF_INFO: &[u8] = b"zkmsg-v1";
 const NONCE_LEN: usize = 12;
 
 pub fn hash_pair(l: &Felt, r: &Felt) -> Felt {
@@ -33,11 +31,6 @@ pub fn hash_pair(l: &Felt, r: &Felt) -> Felt {
 
 pub fn poseidon2(a: &Felt, b: &Felt) -> Felt {
     starknet_crypto::poseidon_hash(*a, *b)
-}
-
-/// commitment = poseidon2(shared_x, 0) — the circuit's step 6.
-pub fn commitment(shared_x: &Felt) -> Felt {
-    poseidon2(shared_x, &Felt::ZERO)
 }
 
 /// x-coordinate of priv·G (the circuit's `ec_mul`).
@@ -65,37 +58,6 @@ pub fn scan_keygen() -> (Felt, Felt) {
             return (candidate, ec_mul_gen_x(&candidate));
         }
     }
-}
-
-fn aead_key(shared_x: &Felt) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(None, &shared_x.to_bytes_be());
-    let mut key = [0u8; 32];
-    hk.expand(HKDF_INFO, &mut key).expect("32 bytes is a valid HKDF length");
-    key
-}
-
-/// blob = nonce(12) ‖ AES-256-GCM ciphertext+tag under HKDF(shared_x).
-pub fn encrypt(shared_x: &Felt, plaintext: &[u8]) -> Vec<u8> {
-    let cipher = Aes256Gcm::new((&aead_key(shared_x)).into());
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload::from(plaintext))
-        .expect("AES-GCM encryption is infallible for in-memory buffers");
-    let mut blob = nonce.to_vec();
-    blob.extend_from_slice(&ct);
-    blob
-}
-
-pub fn decrypt(shared_x: &Felt, blob: &[u8]) -> Result<Vec<u8>> {
-    if blob.len() < NONCE_LEN + 16 {
-        bail!("ciphertext blob too short ({} bytes)", blob.len());
-    }
-    let (nonce, ct) = blob.split_at(NONCE_LEN);
-    let cipher = Aes256Gcm::new((&aead_key(shared_x)).into());
-    cipher
-        .decrypt(Nonce::from_slice(nonce), Payload::from(ct))
-        .map_err(|_| anyhow!("AEAD decryption failed (wrong key or tampered blob)"))
 }
 
 // ---------------------------------------------------------------------------
@@ -413,16 +375,12 @@ mod tests {
     }
 
     #[test]
-    fn golden_ecdh_and_commitment() {
+    fn golden_ecdh() {
         let pub7 = ec_mul_gen_x(&felt("7"));
         let shared = ecdh_shared_x(&felt("6"), &pub7).unwrap();
         assert_eq!(
             shared,
             felt("116790107469130620194501433118398966236215846997329127478236149064647078075"),
-        );
-        assert_eq!(
-            commitment(&shared),
-            felt("1030795386918240909424940654827557726691387512779373992039088349375326101405"),
         );
     }
 
@@ -435,25 +393,6 @@ mod tests {
         let a = ecdh_shared_x(&eph_priv, &scan_pub).unwrap();
         let b = ecdh_shared_x(&scan_priv, &eph_pub).unwrap();
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn aead_round_trip_and_tamper() {
-        let shared =
-            felt("116790107469130620194501433118398966236215846997329127478236149064647078075");
-        let blob = encrypt(&shared, b"the first natively-proven private message");
-        assert_eq!(
-            decrypt(&shared, &blob).unwrap(),
-            b"the first natively-proven private message".to_vec(),
-        );
-
-        let mut tampered = blob.clone();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 1;
-        assert!(decrypt(&shared, &tampered).is_err());
-
-        let wrong_key = felt("12345");
-        assert!(decrypt(&wrong_key, &blob).is_err());
     }
 
     #[test]

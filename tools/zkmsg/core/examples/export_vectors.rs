@@ -1,20 +1,20 @@
 //! Export golden test vectors for cross-language ports (zkmsg-ios).
 //!
 //! Emits JSON to stdout covering every primitive a port must reproduce
-//! byte-exactly: Poseidon hashes, Stark-curve ec_mul/ECDH, the AEAD blob
-//! format, ByteArray/Span calldata encoding, and selector hashing.
+//! byte-exactly: Poseidon hashes, Stark-curve ec_mul/ECDH, the v2 hybrid KEM
+//! key schedule and content format, ByteArray/Span calldata encoding, and
+//! selector hashing.
 //!
 //!     cargo run -p zkmsg-core --example export_vectors > vectors.json
 //!
-//! The AEAD `blob` uses a random nonce at generation time; the committed
-//! fixture is deterministic because the output is committed, not the run.
+//! Every input is fixed, so a rerun reproduces the output byte for byte.
 
 use serde_json::json;
 use starknet_types_core::felt::Felt;
 use zkmsg_core::chain::{bytearray_calldata, bytearray_decode, felt_hex, snkeccak, span_calldata};
 use zkmsg_core::crypto::{
-    KEM_SEED_LEN, assemble_v2, bytearray_felts, commitment, content_hash, decap_tag_v2, decrypt,
-    ec_mul_gen_x, ecdh_shared_x, encap_v2_deterministic, encrypt, hash_pair, kem_digest,
+    KEM_SEED_LEN, assemble_v2, bytearray_felts, content_hash, decap_tag_v2,
+    ec_mul_gen_x, ecdh_shared_x, encap_v2_deterministic, hash_pair, kem_digest,
     kem_keygen_from_seed, leaf_v2, leaf_v2_domain, open_v2, poseidon2, receive_v2,
     seal_v2_with_nonce,
 };
@@ -31,7 +31,6 @@ fn main() {
     let pub5 = ec_mul_gen_x(&f("5"));
     let pub7 = ec_mul_gen_x(&f("7"));
     let shared_6_7 = ecdh_shared_x(&f("6"), &pub7).unwrap();
-    let commit_6_7 = commitment(&shared_6_7);
 
     // Commutativity pair (inbox trial-decrypt property).
     let scan_pub = ec_mul_gen_x(&f("31337"));
@@ -39,11 +38,6 @@ fn main() {
     let shared_a = ecdh_shared_x(&f("271828"), &scan_pub).unwrap();
     let shared_b = ecdh_shared_x(&f("31337"), &eph_pub).unwrap();
     assert_eq!(shared_a, shared_b);
-
-    // --- AEAD: fixed shared secret, recorded blob ---------------------------
-    let plaintext = b"the first natively-proven private message";
-    let blob = encrypt(&shared_6_7, plaintext);
-    assert_eq!(decrypt(&shared_6_7, &blob).unwrap(), plaintext.to_vec());
 
     // --- ByteArray encodings -------------------------------------------------
     let ba = |s: &str| {
@@ -195,13 +189,7 @@ fn main() {
             "priv": "0x6",
             "peer_pub_x": felt_hex(&pub7),
             "shared_x": felt_hex(&shared_6_7),
-            "commitment": felt_hex(&commit_6_7),
             "commute_shared_x": felt_hex(&shared_a),
-        },
-        "aead": {
-            "shared_x": felt_hex(&shared_6_7),
-            "plaintext_utf8": String::from_utf8_lossy(plaintext),
-            "blob_hex": hex::encode(&blob),
         },
         "bytearray": [
             ba(""),
