@@ -498,10 +498,9 @@ impl<'a> VirtualSender<'a> {
     /// Resumes a saved virtual send. Only Publish can be pending: the state
     /// is first written after the proof exists.
     pub fn resume(&self, state: &mut SendState, sink: &mut dyn FnMut(PipelineEvent)) -> Result<()> {
-        ensure!(state.is_virtual(), "send '{}' is a lane-1 send; resume it with the lane-1 pipeline", state.id);
         match state.next_pending().map(|i| state.steps[i].kind.clone()) {
             None => {
-                sink(PipelineEvent::Completed { fact: None });
+                sink(PipelineEvent::Completed);
                 Ok(())
             }
             Some(StepKind::Publish) => self.publish(state, sink),
@@ -605,7 +604,7 @@ impl<'a> VirtualSender<'a> {
         state.mark_done(index, Some(tx_hash.clone()), Some("message published".into()));
         state.save(self.home)?;
         sink(PipelineEvent::StepCompleted { kind: StepKind::Publish, tx_hash: Some(tx_hash), note: None });
-        sink(PipelineEvent::Completed { fact: None });
+        sink(PipelineEvent::Completed);
         Ok(())
     }
 

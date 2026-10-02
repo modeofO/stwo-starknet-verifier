@@ -429,56 +429,29 @@ fn shared_secret_is_nondegenerate() {
 // `#[ignore]` by default: needs network. Run with:
 //     cargo test -p zkmsg-core --test adversarial -- --ignored live_
 //
-// Proves the deployed store is what the client trusts: the verification
-// route (registry, program_hash, inner_root) is pinned to the immutable
-// config values, and the live registry still validates the first shipped
-// fact. A route swap or unset verifier — the rug vector the store's own
-// docs warn about — would fail this.
+// Proves the deployed v2 store is what the client trusts: it is pinned to the
+// prover contract whose virtual execution the client proves. A store pinned
+// elsewhere would accept proofs of some other statement.
 
 #[test]
 #[ignore = "hits Sepolia; run with --ignored"]
-fn live_store_route_is_pinned_and_registry_validates_shipped_fact() {
+fn live_v2_store_is_pinned_to_our_prover() {
     use serde_json::json;
     use zkmsg_core::chain::{snkeccak, Chain};
-    use zkmsg_core::config::{
-        INNER_ROOT, PROGRAM_HASH, SEPOLIA_REGISTRY, SEPOLIA_RPC_DEFAULT, SEPOLIA_STORE_V3,
-    };
+    use zkmsg_core::config::{SEPOLIA_PROVER_RPC, SEPOLIA_STORE_V2, SEPOLIA_V2_SEND_PROVER};
 
-    let chain = Chain::new(SEPOLIA_RPC_DEFAULT, "unused-for-read-only");
-
-    let call = |contract: &str, func: &str, calldata: Vec<String>| -> Vec<Felt> {
-        let selector = format!("{:#x}", snkeccak(func));
-        let result = chain
-            .rpc(
-                "starknet_call",
-                json!([
-                    { "contract_address": contract, "entry_point_selector": selector,
-                      "calldata": calldata },
-                    "latest"
-                ]),
-            )
-            .unwrap_or_else(|e| panic!("live call {func} failed: {e}"));
-        result
-            .as_array()
-            .expect("starknet_call returns a felt array")
-            .iter()
-            .map(|v| Felt::from_hex(v.as_str().unwrap()).unwrap())
-            .collect()
-    };
-
-    // verification_route() -> (registry, program_hash, [8 inner_root words]).
-    let route = call(SEPOLIA_STORE_V3, "verification_route", vec![]);
-    assert_eq!(route[0], Felt::from_hex(SEPOLIA_REGISTRY).unwrap(), "registry re-pointed");
-    assert_eq!(route[1], Felt::from_hex(PROGRAM_HASH).unwrap(), "program hash changed");
-    // route[2] is the span length (8); words follow.
-    assert_eq!(route[2], Felt::from(8u32));
-    for (i, word) in INNER_ROOT.iter().enumerate() {
-        assert_eq!(route[3 + i], Felt::from(*word), "inner_root word {i} drifted");
-    }
-
-    // The first shipped fact must still validate on the live registry.
-    const SHIPPED_FACT: &str =
-        "0x2dc0a3703c2703c471591c64307ebb8a50f8c4eae35f0c916d6fca56014145f";
-    let valid = call(SEPOLIA_REGISTRY, "is_valid", vec![SHIPPED_FACT.into()]);
-    assert_eq!(valid, vec![Felt::ONE], "live registry no longer validates the shipped fact");
+    let chain = Chain::new(SEPOLIA_PROVER_RPC, "unused-for-read-only");
+    let result = chain
+        .rpc(
+            "starknet_call",
+            json!([
+                { "contract_address": SEPOLIA_STORE_V2,
+                  "entry_point_selector": format!("{:#x}", snkeccak("prover")),
+                  "calldata": [] },
+                "latest"
+            ]),
+        )
+        .unwrap_or_else(|e| panic!("live call prover() failed: {e}"));
+    let prover = Felt::from_hex(result[0].as_str().unwrap()).unwrap();
+    assert_eq!(prover, Felt::from_hex(SEPOLIA_V2_SEND_PROVER).unwrap(), "store re-pinned");
 }

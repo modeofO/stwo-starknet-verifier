@@ -9,15 +9,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
-/// Live lane-1 registry on Sepolia (docs/lane1-results.md) — the one
-/// production address that is NOT ours to change.
-pub const SEPOLIA_REGISTRY: &str =
-    "0x0194f44002b4af71e58ba7d30667ed565f1d420d3fb1e7c578de35170309c6aa";
 /// MessageStore v3 — deployed 2026-07-05 (docs/zkmsg-deployment.md),
 /// class 0x04dc67c0…5745, pinned to the live registry + the
-/// messagezk_scan circuit route. Legacy: kept read-only for inbox history
-/// (`zkmsg inbox --legacy`), and still the store the lane-1 send pipeline
-/// targets.
+/// messagezk_scan circuit route. Legacy: read-only inbox history
+/// (`zkmsg inbox --legacy`); nothing sends to it since lane 1 was removed.
 pub const SEPOLIA_STORE_V3: &str =
     "0x02d66a02b2efdddb5282bf7d7931cbb7a724f191478843b1fccbf3b9729e91b7";
 pub const SEPOLIA_STORE_V3_DEPLOY_BLOCK: u64 = 11_624_399;
@@ -88,27 +83,11 @@ pub fn store_deploy_block(store: &str) -> u64 {
     }
 }
 
-/// Whether `store` is a SNIP-36 store (its `send_message` needs
-/// proof_facts the lane-1 pipeline cannot produce).
+/// Whether `store` is a SNIP-36 store — one this client sends to.
 pub fn is_snip36_store(store: &str) -> bool {
     matches!(store_kind(store), Some(StoreKind::Snip36V1 | StoreKind::V2))
 }
 
-/// Refuses a desktop send against the SNIP-36 store with a pointer to the
-/// route that can do it.
-pub fn ensure_lane1_send_store(store: &str) -> Result<()> {
-    if is_snip36_store(store) {
-        bail!(
-            "sending to the SNIP-36 store ({store}) is not supported from desktop yet: its \
-             send_message needs SNIP-36 proof_facts (virtual-OS proof of ZkmsgSendProver), \
-             which the lane-1 fact-registry pipeline cannot produce. Send from the iOS app \
-             (phone-only SNIP-36 route) or the `snip36` CLI in snip-36-prover-backend. To send \
-             on the legacy v3 store instead, set \"store\" in config.json to {SEPOLIA_STORE_V3} \
-             (requires a v3 registration)."
-        );
-    }
-    Ok(())
-}
 pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.com";
 /// Serves `starknet_getStorageProof` for recent blocks (refuses blocks older
 /// than ~6 minutes), which the virtual-OS prover needs.
@@ -119,25 +98,12 @@ pub const SEPOLIA_PROVER_RPC: &str = "https://api.zan.top/public/starknet-sepoli
 pub const STRK_TOKEN: &str =
     "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 
-/// The messagezk_scan circuit route, pinned at milestone 1
-/// (docs/superpowers/specs/2026-07-05-zkmsg-milestone1-addendum.md).
-pub const PROGRAM_HASH: &str =
-    "0x250cb04a129e5259221ad4635950ac983bccf1de574893a2fae75c3c64385c";
-pub const INNER_ROOT: [u32; 8] = [
-    2674953418, 3988685724, 1385424428, 1661362028, 3534442848, 356489633, 2101289576,
-    2757001180,
-];
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub rpc_url: String,
     pub account: String,
-    pub registry: String,
     pub store: String,
-    /// The bridge binary (prove/wrap legs).
-    pub bridge_bin: PathBuf,
-    /// The built circuit executable.
-    pub circuit_executable: PathBuf,
     /// This profile is a throwaway sender created by the burner wizard.
     /// Local-only; nothing on-chain marks a burner.
     #[serde(default)]
@@ -160,12 +126,7 @@ impl Config {
         Self {
             rpc_url: SEPOLIA_RPC_DEFAULT.into(),
             account: "funded-deployer".into(),
-            registry: SEPOLIA_REGISTRY.into(),
             store: SEPOLIA_STORE_DEFAULT.into(),
-            bridge_bin: repo_root
-                .join(".prover/proving-utils/target/release/privacy_prove_cairo_bridge"),
-            circuit_executable: repo_root
-                .join("fixtures/target/dev/messagezk_scan.executable.json"),
             burner: false,
             virtual_prover_bin: Some(default_virtual_prover_bin(repo_root)),
             prover_rpc_url: None,
@@ -173,15 +134,14 @@ impl Config {
     }
 
     /// The `snip36-prove` binary: the configured one, else the default build
-    /// location beside the lane-1 bridge (both live under the repo's
-    /// gitignored `.prover/`).
+    /// location in the repo this binary was built from (the gitignored
+    /// `.prover/` checkout).
     pub fn virtual_prover_bin(&self) -> PathBuf {
         if let Some(bin) = &self.virtual_prover_bin {
             return bin.clone();
         }
-        // bridge_bin = <repo>/.prover/proving-utils/target/release/<bin>
-        let repo_root = self.bridge_bin.ancestors().nth(5).unwrap_or(Path::new("."));
-        default_virtual_prover_bin(repo_root)
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        default_virtual_prover_bin(&repo_root.canonicalize().unwrap_or(repo_root))
     }
 
     pub fn prover_rpc_url(&self) -> &str {
@@ -358,7 +318,9 @@ mod tests {
 
     #[test]
     fn config_serde_defaults_burner_fields() {
-        // A pre-burner config.json (alice/bob/carol era): no burner fields.
+        // A pre-burner config.json (alice/bob/carol era): no burner fields,
+        // and the lane-1 keys (registry, bridge_bin, circuit_executable)
+        // removed 2026-10-01 — ignored.
         let old = r#"{
             "rpc_url": "https://x", "account": "funded-deployer",
             "registry": "0x1", "store": "0x2",
@@ -383,18 +345,15 @@ mod tests {
     }
 
     #[test]
-    fn prover_bin_defaults_beside_the_bridge() {
+    fn prover_bin_default_location() {
         let c = Config::default_sepolia(Path::new("/repo"));
         assert_eq!(
             c.virtual_prover_bin(),
             PathBuf::from("/repo/.prover/sequencer/target/release/snip36-prove")
         );
-        // An older config without the key derives the same path.
+        // An older config without the key falls back to this build's repo.
         let old = Config { virtual_prover_bin: None, ..c };
-        assert_eq!(
-            old.virtual_prover_bin(),
-            PathBuf::from("/repo/.prover/sequencer/target/release/snip36-prove")
-        );
+        assert!(old.virtual_prover_bin().ends_with(".prover/sequencer/target/release/snip36-prove"));
         assert_eq!(old.prover_rpc_url(), SEPOLIA_PROVER_RPC);
     }
 
@@ -411,7 +370,5 @@ mod tests {
         );
         assert_eq!(store_deploy_block(SEPOLIA_STORE_V3), SEPOLIA_STORE_V3_DEPLOY_BLOCK);
         assert_eq!(store_deploy_block("0x123"), 0);
-        assert!(ensure_lane1_send_store(SEPOLIA_STORE_SNIP36).is_err());
-        assert!(ensure_lane1_send_store(SEPOLIA_STORE_V3).is_ok());
     }
 }

@@ -1,24 +1,28 @@
 # zkmsg — private messages on Starknet, proven natively
 
-The messagezk model (sender/recipient membership in a registered-user
-Merkle tree + ephemeral ECDH + Poseidon commitment) as a native Rust CLI:
-the ZK proof is generated on YOUR machine (the witness — who you are, who
-you're messaging — never leaves it), verified on Starknet Sepolia through
-the live lane-1 `StwoFactRegistry`, and the message published to an
-immutable `MessageStoreV3`. No browser, no proving service.
+A serverless dead drop on Starknet. A message proves its sender is a
+registered member without saying which one, and only the recipient can
+tell it is theirs. The proof is generated on YOUR machine (the witness —
+who you are, who you're messaging — never leaves it) by StarkWare's
+virtual Starknet OS, and rides inside the one transaction that publishes
+the message; the sequencer verifies it natively (SNIP-36). No browser, no
+proving service, no relay.
 
-Spec: `docs/superpowers/specs/2026-07-05-zkmsg-lane1-port-design.md`.
-Deployment record: `docs/zkmsg-deployment.md`.
+Specs: `docs/superpowers/specs/2026-10-01-zkmsg-desktop-snip36-pq-design.md`,
+`docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`.
+Deployment record: `docs/zkmsg-deployment.md`. (The first route, lane 1 —
+prove, wrap, then verify through the `StwoFactRegistry` in several ~24 STRK
+transactions — shipped 2026-07-05 and was removed from this client
+2026-10-01; its history is in the deployment record.)
 
 ## Prerequisites
 
-- The repo's prover checkout (`scripts/setup-prover.sh` once) and the
-  bridge binary built (`.prover/proving-utils/target/release/…` — see
-  the bridge rebuild note in the repo docs).
-- The circuit built once: `cd fixtures && scarb build` (scarb 2.18.0).
+- The SNIP-36 prover binary, built once from the sequencer checkout:
+  `.prover/sequencer/target/release/snip36-prove` (see
+  `tools/snip36-phone-ffi/README.md`, "Desktop").
 - `sncast` 0.61 with a funded Sepolia account in
-  `~/.starknet_accounts/starknet_open_zeppelin_accounts.json`.
-- ~64 GB RAM helps: the wrap leg peaks at ~25 GB.
+  `~/.starknet_accounts/starknet_open_zeppelin_accounts.json` (~4 STRK
+  of fee ceiling per send).
 
 ## Quickstart
 
@@ -26,24 +30,19 @@ Deployment record: `docs/zkmsg-deployment.md`.
 cd tools/zkmsg && cargo build --release
 alias zkmsg=$PWD/target/release/zkmsg
 
-zkmsg init --account <your-sncast-account>   # keygen + config (~/.zkmsg)
-zkmsg register <your-handle>                 # one cheap tx
+zkmsg init --account <your-sncast-account>   # scan key + ML-KEM seed + config
+zkmsg register <your-handle>                 # one cheap tx (~0.2 STRK)
 zkmsg status                                 # balance, addresses, count
 
-zkmsg send <their-handle> "hello"            # ~1 min local proving + 5 txs (~50 STRK)
-                                             # (qm31-native verifier, measured on
-                                             # sepolia-integration 2026-07-29: −36% verify
-                                             # gas, 5 txs → 3 — tools/qm31-gate-probe/README.md)
-zkmsg inbox                                  # trial-decrypt everything addressed to you
+zkmsg send <their-handle> "hello"            # ~30 s: prepare, prove, publish (~1.6 STRK)
+zkmsg inbox                                  # detect and decrypt what's addressed to you
 ```
 
-`send` is resumable: every step (prove → wrap → pack → stage → phase 1 →
-phase 2 → publish) checkpoints to `~/.zkmsg/sends/<id>.json` BEFORE it
-runs; if anything fails mid-flight (gas spike, RPC flake), `zkmsg resume
-<id>` re-enters at the first incomplete step without re-paying landed
-transactions. Two pre-spend gates abort BEFORE any money moves if the
-proof doesn't carry exactly the expected public tuple or the wrap's
-inner circuit root drifts from the pinned route.
+`send` is resumable once its proof exists: the state is saved to
+`~/.zkmsg/sends/<id>.json` (the proof beside it; the witness never), and
+the publish hash is recorded the moment the gateway accepts it, so
+`zkmsg resume <id>` polls that hash before it would ever resubmit. A send
+that fails before proving has nothing to resume — send it again.
 
 ## v2: post-quantum key exchange (the default store, 2026-10-01)
 
@@ -115,15 +114,16 @@ init/register onboarding), **Compose** (recipient resolve, byte counter,
 and a send gated behind an explicit confirm dialog stating the STRK
 cost), **Inbox** (trial-decrypt scan with manual Refresh + optional 30 s
 auto-refresh). During a send the compose view becomes a live checklist —
-one row per pipeline step, tx hashes as Voyager links as they land.
+one row per step (prepare, prove, publish), the publish hash as a
+Voyager link the moment it is submitted.
 Incomplete sends surface as a resume banner on launch: the GUI face of
 the same checkpoint files the CLI's `resume` uses.
 
 The workspace is three crates: `zkmsg-core` (all logic, emits typed
-`PipelineEvent`s through a sink), `zkmsg` (the CLI, stdout byte-identical
-to the pre-refactor tool), `zkmsg-gui` (egui/eframe; the pipeline runs on
-a worker thread feeding an `mpsc` channel — the UI thread never blocks on
-RPC or subprocesses, and no async runtime is involved).
+`PipelineEvent`s through a sink), `zkmsg` (the CLI), `zkmsg-gui`
+(egui/eframe; the send runs on a worker thread feeding an `mpsc` channel —
+the UI thread never blocks on RPC or the prover subprocess, and no async
+runtime is involved).
 
 **Profiles (2026-07-08):** `~/.zkmsg` is a profile root — one
 `.zkmsg-<name>/` dir per identity plus a `current` pointer — and the

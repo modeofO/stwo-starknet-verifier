@@ -23,21 +23,13 @@ use zkmsg_core::inbox::ReceivedMessage;
 use zkmsg_core::state::StepKind;
 
 use crate::send_flow::SendFlow;
-use crate::worker::{self, InboxWorkerMsg, PrepareWorkerMsg, ResolveWorkerMsg, StatusWorkerMsg, WorkerMsg};
+use crate::worker::{self, InboxWorkerMsg, ResolveWorkerMsg, StatusWorkerMsg, WorkerMsg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
     Status,
     Compose,
     Inbox,
-}
-
-/// Whether a send is mid-flight given the two guard flags: `preparing` is
-/// the compose prepare-RPC window (before `send_rx` exists) and `sending`
-/// is the running pipeline. Pure so the guard both `work_in_flight` and
-/// the profile picker rely on is unit-testable without a live session.
-pub(crate) fn work_in_flight_flags(preparing: bool, sending: bool) -> bool {
-    preparing || sending
 }
 
 pub struct ProfileSession {
@@ -83,8 +75,6 @@ pub struct ProfileSession {
     pub(crate) compose_resolved: Option<Result<(Felt, u32), String>>,
     pub(crate) compose_resolve_rx: Option<Receiver<ResolveWorkerMsg>>,
     pub(crate) compose_show_confirm: bool,
-    pub(crate) compose_preparing: bool,
-    pub(crate) compose_prepare_rx: Option<Receiver<PrepareWorkerMsg>>,
     /// `Some` once `prepare_send` has returned a plan — presence of this
     /// (not `tab`) is what switches the Compose central area to the
     /// progress checklist.
@@ -136,8 +126,6 @@ impl ProfileSession {
             compose_resolved: None,
             compose_resolve_rx: None,
             compose_show_confirm: false,
-            compose_preparing: false,
-            compose_prepare_rx: None,
             send_flow: None,
             send_rx: None,
             send_state_id: None,
@@ -148,10 +136,10 @@ impl ProfileSession {
 
     /// Drains every worker channel this session may have in flight. Called
     /// once per frame by `ZkmsgApp::update` before rendering.
-    pub(crate) fn poll_all(&mut self, ctx: &egui::Context) {
+    pub(crate) fn poll_all(&mut self) {
         self.poll_worker();
         self.poll_inbox_worker();
-        self.poll_compose_worker(ctx);
+        self.poll_compose_worker();
         self.poll_send_worker();
     }
 
@@ -178,7 +166,7 @@ impl ProfileSession {
     /// wake once a second while inbox auto-refresh is armed, else sleep.
     pub(crate) fn tick_repaint(&self, ctx: &egui::Context) {
         let compose_busy =
-            self.compose_resolving || self.compose_preparing || self.send_rx.is_some();
+            self.compose_resolving || self.send_rx.is_some();
         if self.busy || self.inbox_loading || compose_busy {
             // A scan/call is in flight — repaint every frame so the mpsc
             // channel gets drained promptly once it lands.
@@ -456,7 +444,6 @@ impl ProfileSession {
             // live (networked) report is still in flight.
             if let Some(config) = &self.config {
                 ui.label(format!("account: {}", config.account));
-                ui.label(format!("registry: {}", config.registry));
                 ui.label(format!("store: {}", config.store));
             }
             ui.label("loading live status…");
@@ -478,10 +465,6 @@ impl ProfileSession {
 
             ui.label("account");
             ui.label(&report.account);
-            ui.end_row();
-
-            ui.label("registry");
-            ui.label(&report.registry);
             ui.end_row();
 
             ui.label("store");
@@ -508,17 +491,5 @@ impl ProfileSession {
             }
             ui.end_row();
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::work_in_flight_flags;
-
-    #[test]
-    fn work_in_flight_covers_prepare_and_send_windows() {
-        assert!(!work_in_flight_flags(false, false));
-        assert!(work_in_flight_flags(true, false)); // prepare window (the race the 07-07 review closed)
-        assert!(work_in_flight_flags(false, true));
     }
 }

@@ -80,9 +80,8 @@ pub fn spawn_setup(
     rx
 }
 
-/// Runs (or resumes) a saved send on a worker thread, on whichever route
-/// made it; the returned receiver yields progress until Done. `ctx` is
-/// repainted on each message.
+/// Resumes a saved send on a worker thread; the returned receiver yields
+/// progress until Done. `ctx` is repainted on each message.
 pub fn spawn_send(
     home: Home, config: Config, mut state: SendState, ctx: egui::Context,
 ) -> Receiver<WorkerMsg> {
@@ -101,7 +100,7 @@ pub fn spawn_send(
     rx
 }
 
-/// A fresh SNIP-36 send — prepare, prove and publish in one worker, because
+/// A fresh send — prepare, prove and publish in one worker, because
 /// the witness Prepare builds lives in memory only until Prove consumes it.
 pub fn spawn_virtual_send(
     home_dir: PathBuf, handle: String, text: String, ctx: egui::Context,
@@ -126,11 +125,7 @@ pub fn spawn_virtual_send(
     rx
 }
 
-/// Compose tab: recipient resolve (read-only) and prepare-before-spend
-/// (resolve + root + both merkle paths + encrypt — still no transaction).
-/// Both are chain RPC, so both get the one-shot worker-thread treatment;
-/// `prepare_send` also persists the `SendState` before returning, so a
-/// crash between here and `spawn_send` still leaves a resumable checkpoint.
+/// Compose tab: recipient resolve (read-only chain RPC, one-shot worker).
 pub enum ResolveWorkerMsg {
     Resolved(Result<(Felt, u32), String>),
 }
@@ -145,28 +140,6 @@ pub fn spawn_resolve(home_dir: PathBuf, handle: String, ctx: egui::Context) -> R
             app::resolve_recipient(&chain, &config.store, &handle).map_err(|e| format!("{e:#}"))
         })();
         let _ = tx.send(ResolveWorkerMsg::Resolved(result));
-        ctx.request_repaint();
-    });
-    rx
-}
-
-pub enum PrepareWorkerMsg {
-    Prepared(Result<SendState, String>),
-}
-
-pub fn spawn_prepare(
-    home_dir: PathBuf, sender_leaf: u32, handle: String, text: String, ctx: egui::Context,
-) -> Receiver<PrepareWorkerMsg> {
-    let (tx, rx) = channel();
-    thread::spawn(move || {
-        let home = Home::new(home_dir);
-        let result = (|| {
-            let config = home.load_config().map_err(|e| format!("{e:#}"))?;
-            let keys = home.load_keys().map_err(|e| format!("{e:#}"))?;
-            app::prepare_send(&home, &config, &keys, sender_leaf, &handle, &text)
-                .map_err(|e| format!("{e:#}"))
-        })();
-        let _ = tx.send(PrepareWorkerMsg::Prepared(result));
         ctx.request_repaint();
     });
     rx

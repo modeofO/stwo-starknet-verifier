@@ -23,13 +23,11 @@ pub struct StepView {
 #[derive(Debug, Clone)]
 pub struct SendFlow {
     pub steps: Vec<StepView>,
-    pub fact: Option<String>,
     pub error: Option<String>,
-    /// Set by `Completed`. A SNIP-36 send finishes with no fact, so this —
-    /// not `fact` — is what says the message is out.
+    /// Set by `Completed`: the message is out.
     pub published: bool,
-    /// The saved state's id once one exists (`Checkpointed`). A SNIP-36 send
-    /// that fails before its proof is saved has nothing to resume.
+    /// The saved state's id once one exists (`Checkpointed`). A send that
+    /// fails before its proof is saved has nothing to resume.
     pub checkpoint: Option<String>,
 }
 
@@ -45,16 +43,16 @@ impl SendFlow {
             })
             .collect();
         let published = !state.steps.is_empty() && state.steps.iter().all(|s| s.done);
-        Self { steps, fact: state.fact.clone(), error: None, published, checkpoint: None }
+        Self { steps, error: None, published, checkpoint: None }
     }
 
-    /// The SNIP-36 checklist, before Prepare has produced a state.
+    /// The checklist, before Prepare has produced a state.
     pub fn virtual_plan() -> Self {
         let steps = [StepKind::Prepare, StepKind::Prove, StepKind::Publish]
             .into_iter()
             .map(|kind| StepView { kind, status: StepStatus::Pending, tx_hash: None })
             .collect();
-        Self { steps, fact: None, error: None, published: false, checkpoint: None }
+        Self { steps, error: None, published: false, checkpoint: None }
     }
 
     /// The first not-yet-Done step matching `kind` — plans can repeat a
@@ -85,8 +83,7 @@ impl SendFlow {
                     }
                 }
             }
-            PipelineEvent::Completed { fact } => {
-                self.fact = fact;
+            PipelineEvent::Completed => {
                 for step in &mut self.steps {
                     if step.status != StepStatus::Failed {
                         step.status = StepStatus::Done;
@@ -110,65 +107,33 @@ impl SendFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zkmsg_core::pipeline::PipelineEvent as E;
 
     #[test]
-    fn reducer_tracks_running_then_done() {
-        use zkmsg_core::state::StepKind;
-        use zkmsg_core::pipeline::PipelineEvent as E;
-        let mut f = SendFlow {
-            steps: vec![
-                StepView { kind: StepKind::Prove, status: StepStatus::Pending, tx_hash: None },
-                StepView { kind: StepKind::Phase1, status: StepStatus::Pending, tx_hash: None },
-            ],
-            fact: None,
-            error: None,
-            published: false,
-            checkpoint: None,
-        };
-        f.apply(E::StepStarted { index: 0, total: 2, kind: StepKind::Prove });
-        assert!(matches!(f.steps[0].status, StepStatus::Running));
-        f.apply(E::StepCompleted { kind: StepKind::Prove, tx_hash: None, note: None });
-        assert!(matches!(f.steps[0].status, StepStatus::Done));
-        f.apply(E::TxSubmitted { kind: StepKind::Phase1, tx_hash: "0xabc".into() });
-        assert_eq!(f.steps[1].tx_hash.as_deref(), Some("0xabc"));
-        f.apply(E::Completed { fact: Some("0xf".into()) });
-        assert_eq!(f.fact.as_deref(), Some("0xf"));
-        assert!(f.published);
-    }
-
-    #[test]
-    fn virtual_send_publishes_without_a_fact() {
-        use zkmsg_core::pipeline::PipelineEvent as E;
+    fn reducer_tracks_a_send_to_published() {
         let mut f = SendFlow::virtual_plan();
         f.apply(E::StepStarted { index: 0, total: 3, kind: StepKind::Prepare });
+        assert!(matches!(f.steps[0].status, StepStatus::Running));
         f.apply(E::StepCompleted { kind: StepKind::Prepare, tx_hash: None, note: None });
+        assert!(matches!(f.steps[0].status, StepStatus::Done));
         f.apply(E::Checkpointed { id: "abc".into() });
         assert_eq!(f.checkpoint.as_deref(), Some("abc"));
         f.apply(E::TxSubmitted { kind: StepKind::Publish, tx_hash: "0x1".into() });
         assert_eq!(f.steps[2].tx_hash.as_deref(), Some("0x1"));
-        f.apply(E::Completed { fact: None });
+        assert!(!f.published);
+        f.apply(E::Completed);
         assert!(f.published);
-        assert!(f.fact.is_none());
+        assert!(f.steps.iter().all(|s| s.status == StepStatus::Done));
     }
 
     #[test]
     fn fail_marks_running_step_and_sets_error() {
-        use zkmsg_core::state::StepKind;
-        use zkmsg_core::pipeline::PipelineEvent as E;
-        let mut f = SendFlow {
-            steps: vec![
-                StepView { kind: StepKind::Prove, status: StepStatus::Pending, tx_hash: None },
-                StepView { kind: StepKind::Wrap, status: StepStatus::Pending, tx_hash: None },
-            ],
-            fact: None,
-            error: None,
-            published: false,
-            checkpoint: None,
-        };
-        f.apply(E::StepStarted { index: 0, total: 2, kind: StepKind::Prove });
-        f.fail("bridge prove failed".to_string());
-        assert!(matches!(f.steps[0].status, StepStatus::Failed));
-        assert!(matches!(f.steps[1].status, StepStatus::Pending));
-        assert_eq!(f.error.as_deref(), Some("bridge prove failed"));
+        let mut f = SendFlow::virtual_plan();
+        f.apply(E::StepStarted { index: 1, total: 3, kind: StepKind::Prove });
+        f.fail("snip36-prove failed".to_string());
+        assert!(matches!(f.steps[1].status, StepStatus::Failed));
+        assert!(matches!(f.steps[2].status, StepStatus::Pending));
+        assert_eq!(f.error.as_deref(), Some("snip36-prove failed"));
+        assert!(!f.published);
     }
 }

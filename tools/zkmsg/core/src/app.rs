@@ -15,7 +15,6 @@ use crate::state::{SendState, StepKind};
 pub struct StatusReport {
     pub rpc: String,
     pub account: String,
-    pub registry: String,
     pub store: String,
     pub scan_pub: Option<String>,
     pub handle: Option<String>,
@@ -50,7 +49,6 @@ pub fn status(home: &Home) -> Result<StatusReport> {
     Ok(StatusReport {
         rpc: config.rpc_url.clone(),
         account: config.account.clone(),
-        registry: config.registry.clone(),
         store: config.store.clone(),
         scan_pub: keys.as_ref().map(|k| k.scan_pub.clone()),
         handle: keys.as_ref().and_then(|k| k.handle.clone()),
@@ -197,53 +195,6 @@ pub fn resolve_recipient(chain: &Chain, store: &str, handle: &str) -> Result<(Fe
     Ok((user.scan_pub, user.leaf_index))
 }
 
-/// Everything a send needs before the paid pipeline runs: resolve the
-/// recipient, pull the current root + both membership paths, mint a
-/// fresh ephemeral key, build the circuit args + expected tuple, encrypt
-/// the message, and persist the resulting `SendState` so a crash before
-/// `Pipeline::run` still leaves a resumable checkpoint.
-pub fn prepare_send(
-    home: &Home,
-    config: &Config,
-    keys: &Keys,
-    sender_leaf: u32,
-    handle: &str,
-    text: &str,
-) -> Result<SendState> {
-    crate::config::ensure_lane1_send_store(&config.store)?;
-    let chain = Chain::new(&config.rpc_url, &config.account);
-    let (recipient_pub, recipient_leaf) = resolve_recipient(&chain, &config.store, handle)?;
-
-    let root = Felt::from_hex(
-        chain.call(&config.store, "get_merkle_root", &[])?.first().context("root")?,
-    )?;
-    let sender_path = call_path(&chain, config, sender_leaf)?;
-    let recipient_path = call_path(&chain, config, recipient_leaf)?;
-
-    let material = crate::send::build_send(&crate::send::SendInputs {
-        merkle_root: root,
-        sender_scan_priv: keys.scan_priv_felt()?,
-        recipient_scan_pub: recipient_pub,
-        sender_leaf_index: sender_leaf,
-        recipient_leaf_index: recipient_leaf,
-        sender_path: &sender_path,
-        recipient_path: &recipient_path,
-        text,
-        ephemeral_priv: None,
-    })?;
-
-    let send_state = SendState::new_plan(
-        material.id.clone(),
-        handle.to_string(),
-        material.ciphertext,
-        material.args,
-        (material.commitment, material.ephemeral_pubkey, material.merkle_root),
-        material.proof_id,
-    );
-    send_state.save(home)?;
-    Ok(send_state)
-}
-
 /// What `migrate_store` changed, so a caller can tell the user what to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreMigration {
@@ -285,15 +236,15 @@ pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
     Ok(migration)
 }
 
-/// Whether sends on `config`'s store go through SNIP-36 (one transaction,
-/// virtual-OS proof) rather than the lane-1 fact-registry pipeline.
+/// Whether `config`'s store can be sent to (a SNIP-36 store). The legacy v3
+/// store can still be read with `inbox --legacy`, but its lane-1 send route
+/// was removed 2026-10-01.
 pub fn uses_virtual_route(config: &Config) -> bool {
     crate::config::is_snip36_store(&config.store)
 }
 
-/// A fresh SNIP-36 send, end to end. The lane-1 counterpart is
-/// `prepare_send` + `Pipeline::run`; this one can't be split the same way,
-/// because the witness it prepares is never written down.
+/// A fresh send, end to end: prepare, prove and publish in one call,
+/// because the witness Prepare builds is never written down.
 pub fn send_virtual(
     home: &Home,
     config: &Config,
@@ -305,19 +256,14 @@ pub fn send_virtual(
     crate::virtual_send::VirtualSender::new(home, config)?.send(keys, handle, text, sink)
 }
 
-/// Resumes a saved send on whichever route made it. Neither route adopts the
-/// other's state.
+/// Resumes a saved send (only its Publish can be pending).
 pub fn resume_send(
     home: &Home,
     config: &Config,
     state: &mut SendState,
     sink: &mut dyn FnMut(crate::pipeline::PipelineEvent),
 ) -> Result<()> {
-    if state.is_virtual() {
-        crate::virtual_send::VirtualSender::new(home, config)?.resume(state, sink)
-    } else {
-        crate::pipeline::Pipeline::new(home, config).run(state, sink)
-    }
+    crate::virtual_send::VirtualSender::new(home, config)?.resume(state, sink)
 }
 
 /// Incomplete sends under `home` — id + the kind of their next pending
@@ -334,7 +280,9 @@ pub fn pending_sends(home: &Home) -> Result<Vec<(String, StepKind)>> {
             continue;
         }
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        let state = SendState::load(home, id)?;
+        // States from the removed lane-1 pipeline no longer parse: skip
+        // them rather than hide every other pending send behind the error.
+        let Ok(state) = SendState::load(home, id) else { continue };
         if let Some(index) = state.next_pending() {
             out.push((id.to_string(), state.steps[index].kind.clone()));
         }
@@ -348,13 +296,6 @@ pub fn short_string_felt(s: &str) -> Result<Felt> {
     let mut buf = [0u8; 32];
     buf[32 - s.len()..].copy_from_slice(s.as_bytes());
     Ok(Felt::from_bytes_be(&buf))
-}
-
-fn call_path(chain: &Chain, config: &Config, leaf_index: u32) -> Result<Vec<Felt>> {
-    let raw = chain.call(&config.store, "get_merkle_path", &[format!("{leaf_index:#x}")])?;
-    // Array<felt252> response: length prefix + 20 siblings.
-    ensure!(raw.len() == 21, "get_merkle_path shape: {} felts", raw.len());
-    raw[1..].iter().map(|s| Felt::from_hex(s).context("path felt")).collect()
 }
 
 /// The account's STRK balance in whole tokens (floor).
@@ -428,11 +369,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zkmsg-app-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = crate::config::Home::new(dir.clone());
-        let mut s = crate::state::SendState::new_plan("s1".into(), "bob".into(),
-            "00".into(), vec!["0x1".into()],
-            ("0xa".into(),"0xb".into(),"0xc".into()), "0xd".into());
+        let mut s = crate::state::SendState::new_virtual_plan("s1".into(), "bob".into(),
+            "00".into(), ("0xa".into(),"0xb".into(),"0xc".into()), 1);
         s.mark_done(0, None, None);
         s.save(&home).unwrap();
+        // A lane-1 state left over from before 2026-10-01 is skipped.
+        std::fs::write(home.sends_dir().join("old.json"), r#"{"id":"old","steps":[{"kind":"Wrap"}]}"#)
+            .unwrap();
         let pending = pending_sends(&home).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, "s1");

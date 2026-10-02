@@ -445,7 +445,7 @@ impl eframe::App for ZkmsgApp {
         }
 
         if let Some(session) = &mut self.session {
-            session.poll_all(ctx);
+            session.poll_all();
         }
 
         // The active profile's name + in-flight state, snapshotted so the top
@@ -648,7 +648,7 @@ fn dir_suffix_name(dir: &std::path::Path) -> String {
 }
 
 /// The repo this binary was built from — `init_identity`'s default
-/// config needs it for the bridge/circuit artifact paths. Mirrors
+/// config needs it for the default prover binary path. Mirrors
 /// cli/src/main.rs's `repo_root()`: `gui/` sits at the same
 /// `tools/zkmsg/<crate>/` depth as `cli/`, so the same "../../.." climbs
 /// to the repo root.

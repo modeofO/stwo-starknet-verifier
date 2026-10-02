@@ -1,37 +1,30 @@
-//! zkmsg — messagezk on lane 1, natively. A private message costs one
-//! locally-proven ZK statement (sender+recipient membership, ephemeral
-//! ECDH, commitment), verified on Starknet Sepolia through the live
-//! `StwoFactRegistry`, then published to MessageStore v3. Fresh profiles
-//! default to the SNIP-36 store, where a send is one transaction carrying a
-//! virtual-OS proof (core/src/virtual_send.rs).
+//! zkmsg — private messages on Starknet, proven on your own machine. A send
+//! is one transaction: the zkmsg statement (sender membership in the
+//! registered-user tree, plus the hybrid ML-KEM + ECDH envelope) runs in
+//! StarkWare's virtual Starknet OS here, and the S-two proof of that run
+//! rides in the invoke for the sequencer to verify (SNIP-36,
+//! core/src/virtual_send.rs).
 //!
-//! Spec: docs/superpowers/specs/2026-07-05-zkmsg-lane1-port-design.md.
+//! Specs: docs/superpowers/specs/2026-10-01-zkmsg-desktop-snip36-pq-design.md
+//! and 2026-10-01-zkmsg-pq-hybrid-kem-design.md.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use starknet_types_core::felt::Felt;
 
 use zkmsg_core::app;
-use zkmsg_core::args::{CircuitInputs, args_to_json, build_circuit_args};
 use zkmsg_core::chain::{Chain, felt_hex};
-use zkmsg_core::config::{Config, Home};
-use zkmsg_core::crypto::ec_mul_gen_x;
-use zkmsg_core::pipeline::Pipeline;
+use zkmsg_core::config::{Home, StoreKind, store_kind};
+use zkmsg_core::inbox;
 use zkmsg_core::state::SendState;
-use zkmsg_core::{inbox, tree};
-
-/// Rough per-send ceiling at spiky Sepolia prices (runbook: the fixture
-/// fact cost ~49 STRK; refuse to start below this unless --force).
-const MIN_BALANCE_STRK: u128 = 60;
 
 fn default_home() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home).join(".zkmsg")
 }
 
-/// The repo this binary was built from — bridge + circuit artifact paths.
+/// The repo this binary was built from — the default prover binary path.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
@@ -39,7 +32,7 @@ fn repo_root() -> PathBuf {
 }
 
 #[derive(Parser)]
-#[command(name = "zkmsg", about = "Private messages on Starknet, proven natively (lane 1)")]
+#[command(name = "zkmsg", about = "Private messages on Starknet, proven on your machine")]
 struct Cli {
     /// zkmsg home directory (config, keys, send state).
     #[arg(long, global = true)]
@@ -57,29 +50,22 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate the scan keypair + default config (refuses to overwrite).
+    /// Generate the scan keypair, the ML-KEM seed and a default config
+    /// (refuses to overwrite).
     Init {
         /// sncast account name to send transactions from.
         #[arg(long, default_value = "funded-deployer")]
         account: String,
-        /// MessageStore address (defaults to the SNIP-36 store; pass the v3
-        /// address to keep sending on the legacy lane-1 route).
+        /// MessageStore address (defaults to the v2 store).
         #[arg(long)]
         store: Option<String>,
     },
     /// Register a handle on-chain (one tx).
     Register { handle: String },
-    /// Prove + publish a private message. SNIP-36 store: one transaction
-    /// (~1.6 STRK; the account must hold ~4 STRK of fee ceiling). Legacy v3
-    /// store: the lane-1 pipeline (~50 STRK).
-    Send {
-        handle: String,
-        text: String,
-        /// Skip the balance pre-check.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Resume an interrupted send at its first incomplete step.
+    /// Prove + publish a private message: one transaction, ~1.6 STRK (the
+    /// account must hold ~4 STRK of fee ceiling).
+    Send { handle: String, text: String },
+    /// Resume an interrupted send (its proof is saved; Publish is retried).
     Resume { id: String },
     /// Scan MessageSent events and decrypt the ones addressed to you.
     Inbox {
@@ -87,7 +73,7 @@ enum Command {
         #[arg(long)]
         legacy: bool,
     },
-    /// Config, balance, projected cost, deployed addresses.
+    /// Config, balance, deployed addresses.
     Status,
     /// Point a profile at the v2 (post-quantum) store. Registration is per
     /// store: the handle is cleared and you register again. The scan key is
@@ -96,9 +82,6 @@ enum Command {
         /// Profile name under the profile root (default: the current one).
         profile: Option<String>,
     },
-    /// Internal: write the milestone-1 synthetic-tree args file.
-    #[command(hide = true, name = "dev-args")]
-    DevArgs { out: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -114,12 +97,11 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init { account, store } => cmd_init(&home, account, store),
         Command::Register { handle } => cmd_register(&home, &handle),
-        Command::Send { handle, text, force } => cmd_send(&home, &handle, &text, force),
+        Command::Send { handle, text } => cmd_send(&home, &handle, &text),
         Command::Resume { id } => cmd_resume(&home, &id),
         Command::Inbox { legacy } => cmd_inbox(&home, legacy),
         Command::Status => cmd_status(&home),
         Command::MigrateStore { .. } => cmd_migrate_store(&home),
-        Command::DevArgs { out } => cmd_dev_args(&out),
     }
 }
 
@@ -151,83 +133,39 @@ fn cmd_register(home: &Home, handle: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_send(home: &Home, handle: &str, text: &str, force: bool) -> Result<()> {
+fn cmd_send(home: &Home, handle: &str, text: &str) -> Result<()> {
     let config = home.load_config()?;
     let keys = home.load_keys()?;
     ensure!(!config.store.is_empty(), "no store address in config.json");
-    let sender_leaf = keys.leaf_index.context("not registered — run `zkmsg register`")?;
-
-    if app::uses_virtual_route(&config) {
-        // The fee-ceiling check runs inside, against live prices, before
-        // proving; `--force` has nothing to skip here.
-        let state = app::send_virtual(home, &config, &keys, handle, text, &mut virtual_sink())?;
-        println!("send '{}' -> {handle} published", state.id);
-        return Ok(());
-    }
-
-    if !force {
-        let chain = Chain::new(&config.rpc_url, &config.account);
-        check_balance(&chain, &config)?;
-    }
-
-    let mut send_state = app::prepare_send(home, &config, &keys, sender_leaf, handle, text)?;
-    let ciphertext_len = send_state.ciphertext_hex.len() / 2;
-    println!("send '{}' -> {handle} ({ciphertext_len} bytes ciphertext)", send_state.id);
-
-    let id = send_state.id.clone();
-    let result = Pipeline::new(home, &config).run(&mut send_state, &mut cli_sink(&id));
-    result
+    ensure!(
+        app::uses_virtual_route(&config),
+        "{} is not a store this client sends to — `zkmsg migrate-store` moves the profile to v2",
+        config.store,
+    );
+    keys.leaf_index.context("not registered — run `zkmsg register`")?;
+    // The fee-ceiling check runs inside, against live prices, before proving.
+    let state = app::send_virtual(home, &config, &keys, handle, text, &mut sink())?;
+    println!("send '{}' -> {handle} published", state.id);
+    Ok(())
 }
 
 fn cmd_resume(home: &Home, id: &str) -> Result<()> {
     let config = home.load_config()?;
     let mut send_state = SendState::load(home, id)?;
-    let id = send_state.id.clone();
-    if send_state.is_virtual() {
-        return app::resume_send(home, &config, &mut send_state, &mut virtual_sink());
-    }
-    let result = Pipeline::new(home, &config).run(&mut send_state, &mut cli_sink(&id));
-    result
+    app::resume_send(home, &config, &mut send_state, &mut sink())
 }
 
-/// SNIP-36 progress: the send id is only known once Prepare has built the
+/// Progress lines. The send id is only known once Prepare has built the
 /// commitment, so lines are keyed by step, and the publish hash is printed
 /// the moment the gateway takes it.
-fn virtual_sink() -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) {
+fn sink() -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) {
     use zkmsg_core::pipeline::PipelineEvent as E;
     move |event| match event {
-        E::StepStarted { index, total, kind } => println!("[snip36] step {}/{total}: {kind:?}", index + 1),
-        E::StepCompleted { kind, .. } => println!("[snip36] {kind:?} done"),
-        E::Checkpointed { id } => println!("[snip36] proof saved — resumable as `zkmsg resume {id}`"),
-        E::TxSubmitted { tx_hash, .. } => println!("[snip36] submitted {tx_hash}"),
-        E::Completed { .. } => {}
-    }
-}
-
-fn format_step_line(id: &str, index: usize, total: usize, kind: &zkmsg_core::state::StepKind) -> String {
-    format!("[{id}] step {}/{}: {kind:?}", index + 1, total)
-}
-
-fn format_complete_line(id: &str, fact: Option<&str>) -> String {
-    format!("[{id}] complete — fact {}", fact.unwrap_or("(recorded on-chain)"))
-}
-
-/// Reproduces the pre-refactor CLI's live progress output exactly:
-/// a "step N/M: Kind" line per step start, and a "complete — fact …" line
-/// at the end. Tx submissions and step completions print nothing, as
-/// before — the runbook was narrated by step, not by transaction.
-fn cli_sink(id: &str) -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) + '_ {
-    use zkmsg_core::pipeline::PipelineEvent as E;
-    move |event| match event {
-        E::StepStarted { index, total, kind } => {
-            println!("{}", format_step_line(id, index, total, &kind));
-        }
-        E::TxSubmitted { .. } => {}
-        E::StepCompleted { .. } => {}
-        E::Checkpointed { .. } => {}
-        E::Completed { fact } => {
-            println!("{}", format_complete_line(id, fact.as_deref()));
-        }
+        E::StepStarted { index, total, kind } => println!("[send] step {}/{total}: {kind:?}", index + 1),
+        E::StepCompleted { kind, .. } => println!("[send] {kind:?} done"),
+        E::Checkpointed { id } => println!("[send] proof saved — resumable as `zkmsg resume {id}`"),
+        E::TxSubmitted { tx_hash, .. } => println!("[send] submitted {tx_hash}"),
+        E::Completed => {}
     }
 }
 
@@ -264,7 +202,12 @@ fn cmd_inbox(home: &Home, legacy: bool) -> Result<()> {
 
 fn cmd_migrate_store(home: &Home) -> Result<()> {
     let m = app::migrate_store(home)?;
-    println!("{}: store {} -> {}", home.dir.display(), m.previous_store, zkmsg_core::config::SEPOLIA_STORE_V2);
+    println!(
+        "{}: store {} -> {}",
+        home.dir.display(),
+        m.previous_store,
+        zkmsg_core::config::SEPOLIA_STORE_V2
+    );
     match m.previous_handle {
         Some(h) => println!("registration is per store — run `zkmsg register {h}` to register again"),
         None => println!("registration is per store — run `zkmsg register <handle>`"),
@@ -277,17 +220,12 @@ fn cmd_status(home: &Home) -> Result<()> {
 
     println!("rpc      : {}", report.rpc);
     println!("account  : {}", report.account);
-    println!("registry : {} (live lane-1)", report.registry);
-    let route = if report.store.is_empty() {
-        ""
-    } else if zkmsg_core::config::store_kind(&report.store) == Some(zkmsg_core::config::StoreKind::V2) {
-        " (v2: hybrid ML-KEM + ECDH, SNIP-36 sends)"
-    } else if zkmsg_core::config::is_snip36_store(&report.store) {
-        " (SNIP-36 v1 — `zkmsg migrate-store` moves to v2)"
-    } else if zkmsg_core::config::same_address(&report.store, zkmsg_core::config::SEPOLIA_STORE_V3) {
-        " (legacy v3, lane-1)"
-    } else {
-        ""
+    let route = match store_kind(&report.store) {
+        _ if report.store.is_empty() => "",
+        Some(StoreKind::V2) => " (v2: hybrid ML-KEM + ECDH)",
+        Some(StoreKind::Snip36V1) => " (SNIP-36 v1 — `zkmsg migrate-store` moves to v2)",
+        Some(StoreKind::V3) => " (legacy v3, read-only — `zkmsg migrate-store` moves to v2)",
+        None => "",
     };
     println!(
         "store    : {}{route}",
@@ -304,81 +242,11 @@ fn cmd_status(home: &Home) -> Result<()> {
         println!("messages : {n}");
     }
     match report.balance_strk {
-        Some(strk) if zkmsg_core::config::is_snip36_store(&report.store) => {
-            println!("balance  : ~{strk} STRK (a send costs ~1.6; needs ~4 of fee ceiling)")
-        }
-        Some(strk) => println!("balance  : ~{strk} STRK (a send costs ~50 at spiky prices)"),
+        Some(strk) => println!("balance  : ~{strk} STRK (a send costs ~1.6; needs ~4 of fee ceiling)"),
         None => {
             let e = report.balance_error.as_deref().unwrap_or("?");
             println!("balance  : unavailable ({e})");
         }
     }
     Ok(())
-}
-
-fn cmd_dev_args(out: &Path) -> Result<()> {
-    // The milestone-1 synthetic 2-user tree (scan privs 5/7, ephemeral 6).
-    let mut tree = tree::MerkleTree::new();
-    tree.insert(ec_mul_gen_x(&Felt::from(5u32)));
-    let recipient_pub = ec_mul_gen_x(&Felt::from(7u32));
-    tree.insert(recipient_pub);
-    let (args, tuple) = build_circuit_args(&CircuitInputs {
-        merkle_root: tree.root(),
-        sender_scan_priv: Felt::from(5u32),
-        recipient_scan_pub: recipient_pub,
-        ephemeral_priv: Felt::from(6u32),
-        sender_leaf_index: 0,
-        recipient_leaf_index: 1,
-        sender_path: &tree.path(0),
-        recipient_path: &tree.path(1),
-    })?;
-    std::fs::write(out, args_to_json(&args))?;
-    println!("wrote {} (commitment {})", out.display(), felt_hex(&tuple.commitment));
-    Ok(())
-}
-
-// --- helpers ----------------------------------------------------------------
-
-fn check_balance(chain: &Chain, config: &Config) -> Result<()> {
-    let strk = zkmsg_core::app::account_balance_strk(chain, config)
-        .context("balance check failed (use --force to skip)")?;
-    ensure!(
-        strk >= MIN_BALANCE_STRK,
-        "balance ~{strk} STRK < {MIN_BALANCE_STRK} projected send ceiling — top up or --force",
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cli_sink_line_formats() {
-        use zkmsg_core::state::StepKind;
-
-        // Plain kind.
-        assert_eq!(
-            format_step_line("6d3671ecef", 0, 6, &StepKind::Prove),
-            "[6d3671ecef] step 1/6: Prove",
-        );
-        // Kind with a field.
-        assert_eq!(
-            format_step_line("6d3671ecef", 2, 6, &StepKind::Stage { offset: 0 }),
-            "[6d3671ecef] step 3/6: Stage { offset: 0 }",
-        );
-        // Completed with a fact.
-        assert_eq!(
-            format_complete_line(
-                "6d3671ecef",
-                Some("0x2dc0a3703c2703c471591c64307ebb8a50f8c4eae35f0c916d6fca56014145f"),
-            ),
-            "[6d3671ecef] complete — fact 0x2dc0a3703c2703c471591c64307ebb8a50f8c4eae35f0c916d6fca56014145f",
-        );
-        // Completed without a fact falls back to the placeholder.
-        assert_eq!(
-            format_complete_line("6d3671ecef", None),
-            "[6d3671ecef] complete — fact (recorded on-chain)",
-        );
-    }
 }

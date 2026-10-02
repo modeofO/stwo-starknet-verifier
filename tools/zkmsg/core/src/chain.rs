@@ -14,9 +14,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use starknet_types_core::felt::Felt;
 
-/// Explicit resource bounds — sncast's automatic estimation multiplies
-/// by 1.5, which pushes the big lane-1 verify txs over the per-invoke
-/// bound check (docs/lane1-results.md runbook).
+/// Explicit resource bounds for an `sncast invoke`; all `None` lets sncast
+/// estimate (what register and the wizard's transfers use).
 #[derive(Debug, Clone, Default)]
 pub struct GasBounds {
     pub l1_gas: Option<u64>,
