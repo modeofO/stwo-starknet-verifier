@@ -337,6 +337,65 @@ pub fn receive_v2(
     Some(open_v2(&keys, ephemeral_pub, blob))
 }
 
+// ---------------------------------------------------------------------------
+// v3: hash-based membership
+// (docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md)
+//
+//   m        : 32 bytes BE, top 5 bits clear (m < 2^251 < p), m != 0
+//   m_commit = poseidon_hash_many([MEMBER_V3, m])
+//   leaf     = poseidon_hash_many([LEAF_V3, R, kem_digest, m_commit])
+// ---------------------------------------------------------------------------
+
+pub const MEMBER_SECRET_LEN: usize = 32;
+
+/// 'zkmsg-member-v3' as a Cairo short string.
+pub fn member_v3_domain() -> Felt {
+    Felt::from_bytes_be_slice(b"zkmsg-member-v3")
+}
+
+/// 'zkmsg-leaf-v3' as a Cairo short string.
+pub fn leaf_v3_domain() -> Felt {
+    Felt::from_bytes_be_slice(b"zkmsg-leaf-v3")
+}
+
+/// Fresh membership secret: 32 random bytes with the top 5 bits cleared,
+/// so it is always below 2^251 (a felt, uniform, unreduced). Never zero.
+pub fn member_secret_gen() -> [u8; MEMBER_SECRET_LEN] {
+    loop {
+        let mut m = [0u8; MEMBER_SECRET_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut m);
+        m[0] &= 0x07;
+        if m.iter().any(|b| *b != 0) {
+            return m;
+        }
+    }
+}
+
+/// The stored 32-byte form → felt. Rejects values >= 2^251 and zero, which
+/// a generated secret never is (a hand-edited or truncated file might be).
+pub fn member_secret_felt(m: &[u8]) -> Result<Felt> {
+    let m: &[u8; MEMBER_SECRET_LEN] = m
+        .try_into()
+        .map_err(|_| anyhow!("member secret must be {MEMBER_SECRET_LEN} bytes, got {}", m.len()))?;
+    if m[0] & 0xf8 != 0 {
+        bail!("member secret is not below 2^251");
+    }
+    if m.iter().all(|b| *b == 0) {
+        bail!("member secret is zero");
+    }
+    Ok(Felt::from_bytes_be(m))
+}
+
+/// m_commit = poseidon_hash_many([MEMBER_V3, m]).
+pub fn member_commit(m: &Felt) -> Felt {
+    starknet_crypto::poseidon_hash_many(&[member_v3_domain(), *m])
+}
+
+/// leaf = poseidon_hash_many([LEAF_V3, R, kem_digest, m_commit]).
+pub fn leaf_v3(scan_pub: &Felt, kem_digest: &Felt, m_commit: &Felt) -> Felt {
+    starknet_crypto::poseidon_hash_many(&[leaf_v3_domain(), *scan_pub, *kem_digest, *m_commit])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +566,43 @@ mod tests {
         bad[0] = 0xff;
         bad[1] = 0xff;
         assert!(encap_v2(&scan_pub, &bad).is_err());
+    }
+
+    // --- v3 ----------------------------------------------------------------
+
+    #[test]
+    fn v3_domains() {
+        assert_eq!(member_v3_domain(), Felt::from_hex("0x7a6b6d73672d6d656d6265722d7633").unwrap());
+        assert_eq!(leaf_v3_domain(), Felt::from_hex("0x7a6b6d73672d6c6561662d7633").unwrap());
+    }
+
+    #[test]
+    fn v3_member_secret_is_a_251_bit_nonzero_felt() {
+        for _ in 0..256 {
+            let m = member_secret_gen();
+            assert_eq!(m[0] & 0xf8, 0);
+            let f = member_secret_felt(&m).unwrap();
+            assert_eq!(f.to_bytes_be(), m, "stored form round-trips");
+        }
+        let mut high = [0u8; 32];
+        high[0] = 0x08;
+        assert!(member_secret_felt(&high).is_err(), ">= 2^251 rejected");
+        assert!(member_secret_felt(&[0u8; 32]).is_err(), "zero rejected");
+        assert!(member_secret_felt(&[1u8; 31]).is_err(), "short rejected");
+        let mut max = [0xffu8; 32];
+        max[0] = 0x07;
+        assert!(member_secret_felt(&max).is_ok(), "2^251 - 1 accepted");
+    }
+
+    #[test]
+    fn v3_leaf_binds_every_part() {
+        let (r, d, m) = (felt("5"), felt("6"), felt("7"));
+        let c = member_commit(&m);
+        let leaf = leaf_v3(&r, &d, &c);
+        assert_ne!(leaf, leaf_v3(&r, &d, &member_commit(&felt("8"))));
+        assert_ne!(leaf, leaf_v3(&felt("9"), &d, &c));
+        assert_ne!(leaf, leaf_v3(&r, &felt("9"), &c));
+        assert_ne!(leaf, leaf_v2(&r, &d), "not a v2 leaf");
+        assert_ne!(c, m);
     }
 }

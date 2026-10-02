@@ -112,6 +112,7 @@ fn main() {
     };
 
     let v2 = v2_vectors();
+    let v3 = v3_vectors();
 
     let out = json!({
         "generator": "zkmsg-core export_vectors (tools/zkmsg/core/examples/export_vectors.rs)",
@@ -207,6 +208,7 @@ fn main() {
             "is_valid": felt_hex(&snkeccak("is_valid")),
         },
         "v2": v2,
+        "v3": v3,
     });
 
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -321,6 +323,64 @@ fn v2_vectors() -> serde_json::Value {
         "decaps_reject": {
             "kem_ct_hex": hex::encode(&bad_ct),
             "ss_kem_hex": hex::encode(rejected),
+        },
+    })
+}
+
+/// v3 hash-based membership vectors: fixed member secrets, their commitments,
+/// the v3 leaves of the v2 test identities, and the two-leaf tree.
+fn v3_vectors() -> serde_json::Value {
+    use zkmsg_core::crypto::{
+        leaf_v3, leaf_v3_domain, member_commit, member_secret_felt, member_v3_domain,
+    };
+
+    let secret = |fill: u8| -> [u8; 32] {
+        let mut m = [fill; 32];
+        m[0] &= 0x07;
+        m
+    };
+    let identity = |scan_priv: &str, kem_seed_fill: u8, m_bytes: [u8; 32]| {
+        let scan_pub = ec_mul_gen_x(&Felt::from_hex(scan_priv).unwrap());
+        let mut seed = [0u8; KEM_SEED_LEN];
+        for (i, v) in seed.iter_mut().enumerate() {
+            *v = kem_seed_fill.wrapping_add(i as u8);
+        }
+        let (_, ek) = kem_keygen_from_seed(&seed);
+        let digest = kem_digest(&ek);
+        let m = member_secret_felt(&m_bytes).unwrap();
+        let commit = member_commit(&m);
+        let leaf = leaf_v3(&scan_pub, &digest, &commit);
+        (scan_priv.to_string(), scan_pub, digest, m_bytes, m, commit, leaf)
+    };
+    // Same scan keys and KEM seeds as the v2 section, plus member secrets.
+    let alice = identity("0x7a69", 0x00, secret(0xa1));
+    let bob = identity("0x1e240", 0x80, secret(0xb0));
+    let id_json = |id: &(String, Felt, Felt, [u8; 32], Felt, Felt, Felt)| {
+        json!({
+            "scan_priv": id.0,
+            "scan_pub": felt_hex(&id.1),
+            "kem_digest": felt_hex(&id.2),
+            "member_secret_hex": hex::encode(id.3),
+            "member_secret": felt_hex(&id.4),
+            "m_commit": felt_hex(&id.5),
+            "leaf": felt_hex(&id.6),
+        })
+    };
+    let mut tree = MerkleTree::new();
+    tree.insert(alice.6);
+    tree.insert(bob.6);
+    json!({
+        "spec": "docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md",
+        "member_domain": felt_hex(&member_v3_domain()),
+        "leaf_domain": felt_hex(&leaf_v3_domain()),
+        "alice": id_json(&alice),
+        "bob": id_json(&bob),
+        "tree_alice_bob": {
+            "root": felt_hex(&tree.root()),
+            "alice_index": 0,
+            "alice_path": tree.path(0).iter().map(felt_hex).collect::<Vec<_>>(),
+            "bob_index": 1,
+            "bob_path": tree.path(1).iter().map(felt_hex).collect::<Vec<_>>(),
         },
     })
 }
