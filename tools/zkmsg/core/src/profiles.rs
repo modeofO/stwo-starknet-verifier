@@ -238,6 +238,28 @@ pub fn archive_profile(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(to)
 }
 
+/// The archived profiles, as `list_profiles` would list them in place.
+pub fn list_archived(root: &Path) -> Result<Vec<ProfileEntry>> {
+    list_profiles(&root.join(ARCHIVE_DIR))
+}
+
+/// The reverse of `archive_profile`: `root/archive/.zkmsg-<name>` back to
+/// `root/.zkmsg-<name>`, by rename only. Refuses if a live profile already
+/// holds the name.
+pub fn unarchive_profile(root: &Path, name: &str) -> Result<PathBuf> {
+    let from = root.join(ARCHIVE_DIR).join(format!("{PROFILE_PREFIX}{name}"));
+    ensure!(from.is_dir(), "no archived profile at {}", from.display());
+    let to = root.join(format!("{PROFILE_PREFIX}{name}"));
+    ensure!(
+        to.symlink_metadata().is_err(),
+        "a profile named '{name}' already exists at {} — refusing to overwrite",
+        to.display()
+    );
+    fs::rename(&from, &to)
+        .with_context(|| format!("unarchiving {} -> {}", from.display(), to.display()))?;
+    Ok(to)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +410,30 @@ mod tests {
         mk_profile(&root.join(".zkmsg-burner-aa11bb"), Some("again"));
         assert!(archive_profile(&root, "burner-aa11bb").is_err());
         assert!(root.join(".zkmsg-burner-aa11bb/keys.json").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unarchive_is_the_reverse() {
+        let root = tmp("unarchive");
+        mk_profile(&root.join(".zkmsg-carol"), Some("carol"));
+        archive_profile(&root, "carol").unwrap();
+        let archived = list_archived(&root).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!((archived[0].name.as_str(), archived[0].handle.as_deref()), ("carol", Some("carol")));
+
+        // A live profile holding the name blocks the move, touching nothing.
+        mk_profile(&root.join(".zkmsg-carol"), Some("other"));
+        assert!(unarchive_profile(&root, "carol").is_err());
+        assert!(root.join("archive/.zkmsg-carol/keys.json").exists());
+        fs::remove_dir_all(root.join(".zkmsg-carol")).unwrap();
+
+        let back = unarchive_profile(&root, "carol").unwrap();
+        assert_eq!(back, root.join(".zkmsg-carol"));
+        assert!(back.join("keys.json").exists());
+        assert!(list_archived(&root).unwrap().is_empty());
+        assert_eq!(list_profiles(&root).unwrap().len(), 1);
+        assert!(unarchive_profile(&root, "carol").is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 

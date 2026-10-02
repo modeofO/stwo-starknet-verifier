@@ -3,7 +3,7 @@ name = "zkmsg-ffi"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "C ABI over the zkmsg send builder, proof packing and RPC-free chain sync, for linking into an iOS app"
+description = "C ABI over the zkmsg v1 SNIP-36 send builder, for linking into an iOS app"
 
 [lib]
 name = "zkmsg_ffi"
@@ -11,7 +11,6 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 zkmsg-core = { path = "../core" }
-zkmsg-gateway = { path = "../gateway" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

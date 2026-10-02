@@ -7,15 +7,14 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use starknet_types_core::felt::Felt;
 
-use crate::chain::{Chain, account_address, felt_hex, felt_to_u64};
-use crate::config::{Config, Home, Keys, STRK_TOKEN};
-use crate::crypto::scan_keygen;
+use crate::chain::{Chain, account_address, bytearray_calldata, felt_hex, felt_to_u64};
+use crate::config::{Config, Home, Keys, STRK_TOKEN, is_v2_store};
+use crate::crypto::{kem_digest, scan_keygen};
 use crate::state::{SendState, StepKind};
 
 pub struct StatusReport {
     pub rpc: String,
     pub account: String,
-    pub registry: String,
     pub store: String,
     pub scan_pub: Option<String>,
     pub handle: Option<String>,
@@ -50,7 +49,6 @@ pub fn status(home: &Home) -> Result<StatusReport> {
     Ok(StatusReport {
         rpc: config.rpc_url.clone(),
         account: config.account.clone(),
-        registry: config.registry.clone(),
         store: config.store.clone(),
         scan_pub: keys.as_ref().map(|k| k.scan_pub.clone()),
         handle: keys.as_ref().and_then(|k| k.handle.clone()),
@@ -76,6 +74,7 @@ pub fn init_identity(
         scan_pub: felt_hex(&scan_pub),
         handle: None,
         leaf_index: None,
+        kem_seed: Some(crate::config::kem_seed_hex(&crate::crypto::kem_seed_gen())),
     })?;
     #[cfg(unix)]
     {
@@ -111,34 +110,46 @@ pub enum RegisterOutcome {
 /// just syncs local state instead of re-registering.
 pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let config = home.load_config()?;
-    let mut keys = home.load_keys()?;
-    ensure!(!config.store.is_empty(), "no store address in config.json");
-    if let Some(existing) = &keys.handle {
+    ensure!(
+        is_v2_store(&config.store),
+        "{} is not the v2 store — `zkmsg migrate-store` first",
+        config.store
+    );
+    if let Some(existing) = &home.load_keys()?.handle {
         bail!("already registered as '{existing}'");
     }
+    // Registration publishes the ML-KEM key too; an older profile gets its
+    // seed now, written to keys.json before anything reaches the chain.
+    let mut keys = home.ensure_kem_seed()?;
+    let ek = keys.kem_keypair()?.1;
+    let digest = kem_digest(&ek);
 
     let chain = Chain::new(&config.rpc_url, &config.account);
     let handle_felt = short_string_felt(handle)?;
-    let already = chain
-        .call(&config.store, "get_user", &[felt_hex(&handle_felt)])
-        .ok()
-        .filter(|u| u.len() == 3 && Felt::from_hex(&u[1]).ok() == keys.scan_pub_felt().ok());
+    let ours = |user: &Member| {
+        Some(user.scan_pub) == keys.scan_pub_felt().ok() && user.kem_digest == digest
+    };
+    // Only the store's own "unknown handle" means unregistered; any other
+    // failure (RPC down, timeout) stops here rather than paying for a
+    // register that may already have landed.
+    let already = match chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)]) {
+        Ok(u) => Some(Member::parse(&u)?).filter(|u| ours(u)),
+        Err(e) if is_unknown_handle(&format!("{e:#}")) => None,
+        Err(e) => return Err(e.context("checking whether the handle is registered")),
+    };
     let tx_hash = if already.is_none() {
-        let tx = chain.invoke(
-            &config.store,
-            "register",
-            &[felt_hex(&handle_felt), keys.scan_pub.clone()],
-            &Default::default(),
-        )?;
+        let mut calldata = vec![felt_hex(&handle_felt), keys.scan_pub.clone()];
+        calldata.extend(bytearray_calldata(&ek));
+        let tx = chain.invoke(&config.store, "register", &calldata, &Default::default())?;
         chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
         Some(tx)
     } else {
         None
     };
 
-    let user = chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)])?;
-    ensure!(user.len() == 3, "get_user shape: {user:?}");
-    let leaf_index = felt_to_u64(&Felt::from_hex(&user[2])?)? as u32;
+    let user = Member::parse(&chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)])?)?;
+    ensure!(ours(&user), "'{handle}' is registered, but not to this profile's keys");
+    let leaf_index = user.leaf_index;
     keys.handle = Some(handle.to_string());
     keys.leaf_index = Some(leaf_index);
     home.update_keys(&keys)?;
@@ -149,61 +160,111 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     })
 }
 
+/// The store's `get_user` revert for an unregistered handle. sncast reports
+/// the reason hex-encoded (`0x756e6b…` = 'unknown handle'); match both forms.
+fn is_unknown_handle(error: &str) -> bool {
+    error.contains("unknown handle") || error.contains(&format!("0x{}", hex::encode("unknown handle")))
+}
+
+/// A registered member as `get_user` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub scan_pub: Felt,
+    /// Poseidon over the registered ML-KEM key's ByteArray.
+    pub kem_digest: Felt,
+    pub leaf_index: u32,
+}
+
+impl Member {
+    /// `get_user` returns `(owner, scan_pubkey, kem_digest, leaf_index)`.
+    pub fn parse(user: &[String]) -> Result<Self> {
+        let felts: Vec<Felt> =
+            user.iter().map(|s| Felt::from_hex(s).context("get_user felt")).collect::<Result<_>>()?;
+        Self::from_felts(&felts)
+    }
+
+    pub fn from_felts(user: &[Felt]) -> Result<Self> {
+        ensure!(user.len() == 4, "get_user returned {} felts, expected 4", user.len());
+        Ok(Self { scan_pub: user[1], kem_digest: user[2], leaf_index: u32::try_from(felt_to_u64(&user[3])?).context("leaf index")? })
+    }
+}
+
 /// Looks up a handle's scan pubkey + leaf index in the store.
 pub fn resolve_recipient(chain: &Chain, store: &str, handle: &str) -> Result<(Felt, u32)> {
     let handle_felt = short_string_felt(handle)?;
-    let user = chain.call(store, "get_user", &[felt_hex(&handle_felt)])?;
-    ensure!(user.len() == 3, "get_user shape: {user:?}");
-    let recipient_pub = Felt::from_hex(&user[1])?;
-    let recipient_leaf = felt_to_u64(&Felt::from_hex(&user[2])?)? as u32;
-    Ok((recipient_pub, recipient_leaf))
+    let user = Member::parse(&chain.call(store, "get_user", &[felt_hex(&handle_felt)])?)?;
+    Ok((user.scan_pub, user.leaf_index))
 }
 
-/// Everything a send needs before the paid pipeline runs: resolve the
-/// recipient, pull the current root + both membership paths, mint a
-/// fresh ephemeral key, build the circuit args + expected tuple, encrypt
-/// the message, and persist the resulting `SendState` so a crash before
-/// `Pipeline::run` still leaves a resumable checkpoint.
-pub fn prepare_send(
+/// What `migrate_store` changed, so a caller can tell the user what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreMigration {
+    pub previous_store: String,
+    /// The handle the profile had on the previous store — the obvious one to
+    /// register again (registration is per store).
+    pub previous_handle: Option<String>,
+}
+
+/// Points a profile at the v2 store. Registration is per store, so the
+/// handle and leaf index are cleared and the user registers again; the
+/// profile gets its ML-KEM seed now if it predates v2. The scan key is kept.
+/// Refused while a send is incomplete: its proof is bound to the old store.
+pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
+    let mut config = home.load_config()?;
+    ensure!(!is_v2_store(&config.store), "this profile already uses the v2 store");
+    let pending = pending_sends(home)?;
+    ensure!(
+        pending.is_empty(),
+        "{} incomplete send(s) on the current store ({}); resume or discard them first",
+        pending.len(),
+        pending.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", "),
+    );
+
+    // One write: the old store's handle out, a seed in if there isn't one.
+    let mut keys = home.load_keys()?;
+    let migration = StoreMigration {
+        previous_store: config.store.clone(),
+        previous_handle: keys.handle.take(),
+    };
+    keys.leaf_index = None;
+    if keys.kem_seed.is_none() {
+        keys.kem_seed = Some(crate::config::kem_seed_hex(&crate::crypto::kem_seed_gen()));
+    }
+    home.update_keys(&keys)?;
+    config.store = crate::config::SEPOLIA_STORE_V2.to_string();
+    home.save_config(&config)?;
+    // The cached inbox belongs to the old store.
+    let _ = std::fs::remove_file(home.inbox_cache_path());
+    Ok(migration)
+}
+
+/// Whether `config` points at the store this client reads and writes (v2).
+/// Anything else needs `migrate_store` first.
+pub fn on_current_store(config: &Config) -> bool {
+    is_v2_store(&config.store)
+}
+
+/// A fresh send, end to end: prepare, prove and publish in one call,
+/// because the witness Prepare builds is never written down.
+pub fn send_virtual(
     home: &Home,
     config: &Config,
     keys: &Keys,
-    sender_leaf: u32,
     handle: &str,
     text: &str,
+    sink: &mut dyn FnMut(crate::pipeline::PipelineEvent),
 ) -> Result<SendState> {
-    crate::config::ensure_lane1_send_store(&config.store)?;
-    let chain = Chain::new(&config.rpc_url, &config.account);
-    let (recipient_pub, recipient_leaf) = resolve_recipient(&chain, &config.store, handle)?;
+    crate::virtual_send::VirtualSender::new(home, config)?.send(keys, handle, text, sink)
+}
 
-    let root = Felt::from_hex(
-        chain.call(&config.store, "get_merkle_root", &[])?.first().context("root")?,
-    )?;
-    let sender_path = call_path(&chain, config, sender_leaf)?;
-    let recipient_path = call_path(&chain, config, recipient_leaf)?;
-
-    let material = crate::send::build_send(&crate::send::SendInputs {
-        merkle_root: root,
-        sender_scan_priv: keys.scan_priv_felt()?,
-        recipient_scan_pub: recipient_pub,
-        sender_leaf_index: sender_leaf,
-        recipient_leaf_index: recipient_leaf,
-        sender_path: &sender_path,
-        recipient_path: &recipient_path,
-        text,
-        ephemeral_priv: None,
-    })?;
-
-    let send_state = SendState::new_plan(
-        material.id.clone(),
-        handle.to_string(),
-        material.ciphertext,
-        material.args,
-        (material.commitment, material.ephemeral_pubkey, material.merkle_root),
-        material.proof_id,
-    );
-    send_state.save(home)?;
-    Ok(send_state)
+/// Resumes a saved send (only its Publish can be pending).
+pub fn resume_send(
+    home: &Home,
+    config: &Config,
+    state: &mut SendState,
+    sink: &mut dyn FnMut(crate::pipeline::PipelineEvent),
+) -> Result<()> {
+    crate::virtual_send::VirtualSender::new(home, config)?.resume(state, sink)
 }
 
 /// Incomplete sends under `home` — id + the kind of their next pending
@@ -220,7 +281,9 @@ pub fn pending_sends(home: &Home) -> Result<Vec<(String, StepKind)>> {
             continue;
         }
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        let state = SendState::load(home, id)?;
+        // States from the removed lane-1 pipeline no longer parse: skip
+        // them rather than hide every other pending send behind the error.
+        let Ok(state) = SendState::load(home, id) else { continue };
         if let Some(index) = state.next_pending() {
             out.push((id.to_string(), state.steps[index].kind.clone()));
         }
@@ -236,13 +299,6 @@ pub fn short_string_felt(s: &str) -> Result<Felt> {
     Ok(Felt::from_bytes_be(&buf))
 }
 
-fn call_path(chain: &Chain, config: &Config, leaf_index: u32) -> Result<Vec<Felt>> {
-    let raw = chain.call(&config.store, "get_merkle_path", &[format!("{leaf_index:#x}")])?;
-    // Array<felt252> response: length prefix + 20 siblings.
-    ensure!(raw.len() == 21, "get_merkle_path shape: {} felts", raw.len());
-    raw[1..].iter().map(|s| Felt::from_hex(s).context("path felt")).collect()
-}
-
 /// The account's STRK balance in whole tokens (floor).
 pub fn account_balance_strk(chain: &Chain, config: &Config) -> Result<u128> {
     let address = account_address(&config.account)?;
@@ -254,65 +310,85 @@ pub fn account_balance_strk(chain: &Chain, config: &Config) -> Result<u128> {
     Ok(low / 1_000_000_000_000_000_000)
 }
 
-/// Fri retained on a swept account to cover the transfer's own fee
-/// (measured transfers cost ~0.05 STRK; 0.2 is generous, and the dust
-/// left behind is the price of never under-providing the fee).
-pub const SWEEP_HEADROOM_FRI: u128 = 200_000_000_000_000_000;
-
-/// How much a sweep can move: balance minus headroom, `None` when the
-/// balance doesn't exceed the headroom (nothing worth sweeping).
-pub fn sweep_amount_fri(balance_fri: u128, headroom_fri: u128) -> Option<u128> {
-    (balance_fri > headroom_fri).then(|| balance_fri - headroom_fri)
-}
-
-/// Sweeps (balance - headroom) STRK from `config.account` (the burner)
-/// to `to_address`, waiting for the receipt. Returns (tx_hash, swept
-/// fri). Blocking (invoke + receipt wait) — worker threads only.
-///
-/// The caller's UI must have shown the linking warning: this transfer
-/// is a public on-chain edge from the burner to the target.
-pub fn sweep_strk(config: &Config, to_address: &str) -> Result<(String, u128)> {
-    let chain = Chain::new(&config.rpc_url, &config.account);
-    let own_address = account_address(&config.account)?;
-    let balance = crate::setup::read_balance_fri(&chain, &own_address)?;
-    let amount = sweep_amount_fri(balance, SWEEP_HEADROOM_FRI)
-        .with_context(|| format!("balance {balance} fri does not exceed the fee headroom"))?;
-    let tx = chain.invoke(
-        STRK_TOKEN,
-        "transfer",
-        &[to_address.to_string(), format!("{amount:#x}"), "0x0".into()],
-        &Default::default(),
-    )?;
-    chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
-    Ok((tx, amount))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recognises_the_unknown_handle_revert() {
+        // Verbatim from sncast 0.61 against the v2 store, 2026-10-01.
+        assert!(is_unknown_handle(
+            r#"sncast error: "An error occurred in the called contract = ContractErrorData { revert_error: Message(\"0x756e6b6e6f776e2068616e646c65\") }""#
+        ));
+        assert!(!is_unknown_handle("rpc starknet_call: connection refused"));
+    }
+
     #[test]
     fn short_string_matches_cairo() {
         assert_eq!(short_string_felt("zkmsg").unwrap(),
             starknet_types_core::felt::Felt::from_hex("0x7a6b6d7367").unwrap());
         assert!(short_string_felt("x".repeat(40).as_str()).is_err());
     }
+    /// The retired SNIP-36 v1 store.
+    const OLD_STORE: &str = "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f";
+
     #[test]
-    fn sweep_amount_leaves_headroom() {
-        let one = 1_000_000_000_000_000_000u128;
-        assert_eq!(sweep_amount_fri(10 * one, one / 5), Some(10 * one - one / 5));
-        assert_eq!(sweep_amount_fri(one / 5, one / 5), None); // exactly headroom: nothing to sweep
-        assert_eq!(sweep_amount_fri(0, one / 5), None);
+    fn migrate_store_moves_to_v2_and_clears_registration() {
+        let dir = std::env::temp_dir().join(format!("zkmsg-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = Home::new(dir.clone());
+        let mut config = Config::default_sepolia(Path::new("/r"));
+        config.store = OLD_STORE.into();
+        home.save_config(&config).unwrap();
+        home.save_new_keys(&Keys {
+            scan_priv: "0x5".into(),
+            scan_pub: "0x6".into(),
+            handle: Some("carol".into()),
+            leaf_index: Some(0),
+            kem_seed: None,
+        })
+        .unwrap();
+
+        let m = migrate_store(&home).unwrap();
+        assert_eq!(m.previous_handle.as_deref(), Some("carol"));
+        assert_eq!(m.previous_store, OLD_STORE);
+        let keys = home.load_keys().unwrap();
+        assert_eq!((keys.handle, keys.leaf_index), (None, None));
+        assert_eq!(keys.scan_priv, "0x5", "the scan key survives");
+        assert!(keys.kem_seed.is_some());
+        assert!(is_v2_store(&home.load_config().unwrap().store));
+        // Twice is refused.
+        assert!(migrate_store(&home).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn migrate_store_refuses_with_pending_sends() {
+        let dir = std::env::temp_dir().join(format!("zkmsg-migrate-p-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = Home::new(dir.clone());
+        let mut config = Config::default_sepolia(Path::new("/r"));
+        config.store = OLD_STORE.into();
+        home.save_config(&config).unwrap();
+        let s = SendState::new_virtual_plan(
+            "p1".into(), "mode2".into(), "00".into(), ("0xa".into(), "0xb".into(), "0xc".into()), 1,
+        );
+        s.save(&home).unwrap();
+        assert!(migrate_store(&home).unwrap_err().to_string().contains("p1"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn pending_sends_reads_incomplete_only() {
         let dir = std::env::temp_dir().join(format!("zkmsg-app-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = crate::config::Home::new(dir.clone());
-        let mut s = crate::state::SendState::new_plan("s1".into(), "bob".into(),
-            "00".into(), vec!["0x1".into()],
-            ("0xa".into(),"0xb".into(),"0xc".into()), "0xd".into());
+        let mut s = crate::state::SendState::new_virtual_plan("s1".into(), "bob".into(),
+            "00".into(), ("0xa".into(),"0xb".into(),"0xc".into()), 1);
         s.mark_done(0, None, None);
         s.save(&home).unwrap();
+        // A lane-1 state left over from before 2026-10-01 is skipped.
+        std::fs::write(home.sends_dir().join("old.json"), r#"{"id":"old","steps":[{"kind":"Wrap"}]}"#)
+            .unwrap();
         let pending = pending_sends(&home).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, "s1");

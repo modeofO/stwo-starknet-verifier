@@ -5,7 +5,7 @@
 //! it is a static name label. When no profile is open (a profile root with no
 //! `current`) the central panel lists the discovered profiles as buttons.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use eframe::egui;
 
@@ -32,8 +32,10 @@ enum PickerAction {
     /// Resume an incomplete profile's setup wizard (from its checkpoint dir;
     /// the name is read back from `setup.json`).
     Resume(PathBuf),
-    /// Retire a burner profile (open the sweep + archive dialog).
-    Retire(String, PathBuf),
+    /// Archive a profile (open the archive dialog).
+    Archive(String),
+    /// Move an archived profile back into the picker.
+    Unarchive(String),
 }
 
 pub struct ZkmsgApp {
@@ -156,7 +158,6 @@ impl ZkmsgApp {
     fn work_in_flight(&self) -> bool {
         self.session.as_ref().is_some_and(|s| s.work_in_flight())
             || self.wizard.as_ref().is_some_and(|w| w.running())
-            || self.retire.as_ref().is_some_and(|r| r.sweeping())
     }
 
     /// Opens `home` as the active session and retitles the window to name
@@ -227,19 +228,15 @@ impl ZkmsgApp {
                             }
                             continue;
                         }
-                        // A burner entry gets a small "retire…" button beside
-                        // its row; the config read is a cheap local fs read.
-                        let is_burner = Home::new(entry.dir.clone())
-                            .load_config()
-                            .map(|c| c.burner)
-                            .unwrap_or(false);
+                        // Every profile can be archived (hidden here, directory
+                        // and keys kept); nothing is ever deleted.
                         ui.horizontal(|ui| {
                             let selected = entry.name == active_name;
                             if ui.selectable_label(selected, picker_label(entry)).clicked() && !selected {
                                 action = PickerAction::Switch(entry.name.clone(), entry.dir.clone());
                             }
-                            if is_burner && ui.small_button("retire…").clicked() {
-                                action = PickerAction::Retire(entry.name.clone(), entry.dir.clone());
+                            if ui.small_button("archive…").clicked() {
+                                action = PickerAction::Archive(entry.name.clone());
                             }
                         });
                     }
@@ -271,6 +268,24 @@ impl ZkmsgApp {
                             "open a configured profile first — its RPC endpoint drives the setup \
                              (no funds are drawn from it)",
                         );
+                    }
+                    let archived = self
+                        .root
+                        .as_deref()
+                        .map(zkmsg_core::profiles::list_archived)
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    if !archived.is_empty() {
+                        ui.separator();
+                        ui.label(format!("archived ({})", archived.len()));
+                        for entry in &archived {
+                            ui.horizontal(|ui| {
+                                ui.add_enabled(false, egui::Label::new(picker_label(entry)));
+                                if ui.small_button("unarchive").clicked() {
+                                    action = PickerAction::Unarchive(entry.name.clone());
+                                }
+                            });
+                        }
                     }
                 },
             );
@@ -338,19 +353,8 @@ impl ZkmsgApp {
         // register is another paid tx from the same account, so it must block
         // the setup spend too. This over-locks during a plain status refresh
         // (same `busy` flag) — the intended safe direction.
-        // Also block on an in-flight retire sweep: a sweep is a second paid tx
-        // waiting on its own receipt, so letting the wizard's Create/Confirm/
-        // Resume/Refresh stay live during it would run two concurrent paid
-        // pipelines. `self.retire` is still in self here — update_wizard() runs
-        // before the retire dialog is taken/driven at the end of update() — so
-        // this reads the live sweep flag with no take() race. No self-deadlock:
-        // the sweep's own buttons gate on the separate `paid_elsewhere`, which
-        // deliberately excludes retire.sweeping().
-        let session_busy = self
-            .session
-            .as_ref()
-            .is_some_and(|s| s.work_in_flight() || s.worker_busy())
-            || self.retire.as_ref().is_some_and(|r| r.sweeping());
+        let session_busy =
+            self.session.as_ref().is_some_and(|s| s.work_in_flight() || s.worker_busy());
         let Some(mut wizard) = self.wizard.take() else { return };
         let outcome = wizard.update(&WizardCtx {
             egui_ctx: ctx,
@@ -441,45 +445,6 @@ impl ZkmsgApp {
             }
         }
     }
-
-    /// Sweep targets for retiring `exclude`: every other complete profile
-    /// whose config + account address resolve. The retiring burner's
-    /// `reply_handle` profile (its creator) sorts first, so it is the
-    /// default selection — spec: "default: the profile named by
-    /// reply_handle, else first non-burner".
-    fn retire_targets(&self, exclude: &str, exclude_dir: &Path) -> Vec<(String, String)> {
-        let reply = Home::new(exclude_dir.to_path_buf())
-            .load_config()
-            .ok()
-            .and_then(|c| c.reply_handle);
-        let mut targets: Vec<(String, String)> = self
-            .profiles
-            .iter()
-            .filter(|p| !p.setup_incomplete && p.name != exclude)
-            .filter_map(|p| {
-                let config = Home::new(p.dir.clone()).load_config().ok()?;
-                let address = zkmsg_core::chain::account_address(&config.account).ok()?;
-                Some((p.name.clone(), address))
-            })
-            .collect();
-        // Creator first (matched by profile name OR cached handle), then
-        // non-burners before burners, then name order (list is name-sorted
-        // already, and the sort is stable).
-        targets.sort_by_key(|(name, _)| {
-            let is_reply = reply.as_deref() == Some(name.as_str())
-                || self.profiles.iter().any(|p| {
-                    p.name == *name && p.handle.as_deref() == reply.as_deref() && reply.is_some()
-                });
-            let is_burner = Home::new(
-                self.profiles.iter().find(|p| p.name == *name).map(|p| p.dir.clone()).unwrap_or_default(),
-            )
-            .load_config()
-            .map(|c| c.burner)
-            .unwrap_or(false);
-            (!is_reply, is_burner)
-        });
-        targets
-    }
 }
 
 impl eframe::App for ZkmsgApp {
@@ -496,7 +461,7 @@ impl eframe::App for ZkmsgApp {
         }
 
         if let Some(session) = &mut self.session {
-            session.poll_all(ctx);
+            session.poll_all();
         }
 
         // The active profile's name + in-flight state, snapshotted so the top
@@ -518,7 +483,6 @@ impl eframe::App for ZkmsgApp {
                     ui.selectable_value(&mut session.tab, Tab::Status, "Status");
                     ui.selectable_value(&mut session.tab, Tab::Compose, "Compose");
                     ui.selectable_value(&mut session.tab, Tab::Inbox, "Inbox");
-                    ui.selectable_value(&mut session.tab, Tab::Pair, "Pair");
                 }
                 if let Some(active_name) = &active_name {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -548,12 +512,7 @@ impl eframe::App for ZkmsgApp {
             }
             PickerAction::NewBurner => {
                 self.picker_error = None;
-                let reply = self
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.keys.as_ref())
-                    .and_then(|k| k.handle.clone());
-                self.wizard = Some(WizardUi::new_burner(reply));
+                self.wizard = Some(WizardUi::new_burner());
             }
             PickerAction::Resume(dir) => match WizardUi::resume(dir) {
                 Ok(w) => {
@@ -562,24 +521,34 @@ impl eframe::App for ZkmsgApp {
                 }
                 Err(e) => self.picker_error = Some(e),
             },
-            PickerAction::Retire(name, dir) => {
+            PickerAction::Archive(name) => {
                 self.picker_error = None;
-                let targets = self.retire_targets(&name, &dir);
-                self.retire = Some(RetireUi::new(name, dir, targets));
+                let is_burner = self
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == name)
+                    .and_then(|p| Home::new(p.dir.clone()).load_config().ok())
+                    .is_some_and(|c| c.burner);
+                self.retire = Some(RetireUi::new(name, is_burner));
+            }
+            PickerAction::Unarchive(name) => {
+                if let Some(root) = self.root.clone() {
+                    match zkmsg_core::profiles::unarchive_profile(&root, &name) {
+                        Ok(_) => {
+                            self.picker_error = None;
+                            self.profiles = list_profiles(&root).unwrap_or_default();
+                        }
+                        Err(e) => self.picker_error = Some(format!("{e:#}")),
+                    }
+                }
             }
         }
 
-        // The app-level spend lock: a wizard actively spending OR a retire
-        // sweep waiting on its receipt. Suppresses the pending-send banner's
-        // Resume and disables the Compose spend buttons (and Register), so no
-        // paid pipeline races the wizard's funding transfer — or a sweep
-        // draining the very burner account a new send would spend from
-        // (reachable via the post-send offer: sweep starts → "Compose
-        // another" → Send). Computed while `retire` is still in `self`; the
-        // dialog's own buttons gate on the separate session+wizard-only
-        // `paid_elsewhere`, so this cannot deadlock the dialog itself.
-        let locked = self.wizard.as_ref().is_some_and(|w| w.running())
-            || self.retire.as_ref().is_some_and(|r| r.sweeping());
+        // The app-level spend lock: a wizard actively spending. Suppresses the
+        // pending-send banner's Resume and disables the Compose spend buttons
+        // (and Register), so no paid pipeline races the wizard's funding
+        // transfer out of the same account.
+        let locked = self.wizard.as_ref().is_some_and(|w| w.running());
         if let Some(session) = &mut self.session {
             session.pending_banner(ctx, locked);
         }
@@ -632,7 +601,7 @@ impl eframe::App for ZkmsgApp {
             self.open_session(ctx, name, home);
         }
 
-        // The post-send "Sweep & archive this burner…" button set an offer
+        // The post-send "Archive this burner…" button set an offer
         // flag on the session; drain it and open the retire dialog (once,
         // and only under a root — a bare-profile launch has no archive dir).
         if self.session.as_ref().is_some_and(|s| s.retire_offer) {
@@ -640,12 +609,8 @@ impl eframe::App for ZkmsgApp {
                 s.retire_offer = false;
             }
             if self.retire.is_none() && self.root.is_some() {
-                let (name, dir) = {
-                    let s = self.session.as_ref().unwrap();
-                    (s.name.clone(), s.home_dir())
-                };
-                let targets = self.retire_targets(&name, &dir);
-                self.retire = Some(RetireUi::new(name, dir, targets));
+                let name = self.session.as_ref().unwrap().name.clone();
+                self.retire = Some(RetireUi::new(name, true));
             }
         }
 
@@ -659,21 +624,12 @@ impl eframe::App for ZkmsgApp {
             session.tick_repaint(ctx);
         }
 
-        // Drive the retire dialog last, over everything. `app_busy` here MUST
-        // exclude the retire's own sweep — folding `work_in_flight()` in whole
-        // (which now counts retire.sweeping()) would disable the dialog's own
-        // buttons and never process the sweep's completion, deadlocking it.
-        // Snapshot only the session+wizard paid work before the take.
+        // Drive the retire dialog last, over everything. Archive waits on any
+        // send, setup, or register in flight: the rename must not pull a
+        // profile directory out from under a running flow.
         if let Some(mut retire) = self.retire.take() {
-            // Fold in the session's register/status worker: an in-flight
-            // Register is another paid tx from the same account, so it must
-            // block Sweep. This over-locks the dialog during a plain status
-            // refresh (same `worker_busy` flag) — the intended safe direction,
-            // matching worker_busy's own doc comment.
-            let paid_elsewhere = self.session.as_ref().is_some_and(|s| s.work_in_flight())
-                || self.wizard.as_ref().is_some_and(|w| w.running())
+            retire.app_busy = self.work_in_flight()
                 || self.session.as_ref().is_some_and(|s| s.worker_busy());
-            retire.app_busy = paid_elsewhere;
             let Some(root) = self.root.clone() else {
                 // No root (bare-profile launch) — retirement needs the
                 // archive dir under a root; drop the dialog.
@@ -725,7 +681,7 @@ fn dir_suffix_name(dir: &std::path::Path) -> String {
 }
 
 /// The repo this binary was built from — `init_identity`'s default
-/// config needs it for the bridge/circuit artifact paths. Mirrors
+/// config needs it for the default prover binary path. Mirrors
 /// cli/src/main.rs's `repo_root()`: `gui/` sits at the same
 /// `tools/zkmsg/<crate>/` depth as `cli/`, so the same "../../.." climbs
 /// to the repo root.

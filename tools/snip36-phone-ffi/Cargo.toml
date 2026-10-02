@@ -8,6 +8,11 @@ description = "Spike: C ABI over the SNIP-36 virtual-OS transaction prover, for 
 [lib]
 crate-type = ["staticlib", "rlib"]
 
+# The desktop calls this as a subprocess (zkmsg-core virtual_send.rs).
+[[bin]]
+name = "snip36-prove"
+path = "src/bin/snip36-prove.rs"
+
 [dependencies]
 blockifier_reexecution.workspace = true
 libc = "0.2"

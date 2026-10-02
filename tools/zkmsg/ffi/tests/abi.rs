@@ -129,22 +129,3 @@ fn malformed_requests_are_reported_not_fatal() {
     unsafe { zkmsg_ffi::zkmsg_string_free(raw) };
     assert!(text.contains("null request"));
 }
-
-#[test]
-fn pack_proof_matches_the_contract_transport() {
-    // 7 u32 limbs per slot: 14 small values must pack into exactly 2 slots.
-    let values: Vec<String> = (1..=14u32).map(|v| format!("{v:#x}")).collect();
-    let response = call(zkmsg_ffi::zkmsg_pack_proof, &json!({ "values": values }));
-    let packed = ok(&response);
-    assert_eq!(packed["n_values"], 14);
-    assert_eq!(packed["slots"].as_array().unwrap().len(), 2, "7 limbs per felt252 slot");
-
-    // And it agrees with the native packer the desktop pipeline uses.
-    use starknet_types_core::felt::Felt;
-    let native = zkmsg_core::pack::pack_v1(
-        &(1..=14u32).map(Felt::from).collect::<Vec<_>>(),
-    )
-    .expect("native pack");
-    let expected: Vec<String> = native.iter().map(|f| format!("{f:#x}")).collect();
-    assert_eq!(packed["slots"], json!(expected));
-}
