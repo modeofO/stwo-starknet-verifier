@@ -1,8 +1,9 @@
 # zkmsg v3: hash-based (post-quantum) membership (2026-10-01)
 
-Status: **in progress** (branch `pq-v3`). The pinned encodings and ABI are
-in "v3 pinned encodings and ABI" below. Comes after v2 (`2026-10-01-zkmsg-pq-hybrid-kem-design.md`)
-ships on both clients.
+Status: **shipped 2026-10-01** on Sepolia alpha, phone and desktop (store
+`MessageStoreV3`, prover `ZkmsgSendProverV3`; addresses and the end-to-end runs in
+`docs/zkmsg-deployment.md`). The pinned encodings and ABI are in "v3 pinned
+encodings and ABI" below. Builds on v2 (`2026-10-01-zkmsg-pq-hybrid-kem-design.md`).
 
 ## The gap v2 leaves
 
