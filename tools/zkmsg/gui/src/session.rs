@@ -30,7 +30,6 @@ pub(crate) enum Tab {
     Status,
     Compose,
     Inbox,
-    Pair,
 }
 
 /// Whether a send is mid-flight given the two guard flags: `preparing` is
@@ -84,10 +83,6 @@ pub struct ProfileSession {
     pub(crate) compose_resolved: Option<Result<(Felt, u32), String>>,
     pub(crate) compose_resolve_rx: Option<Receiver<ResolveWorkerMsg>>,
     pub(crate) compose_show_confirm: bool,
-    /// Burner-only: prepend `from: <reply_handle>` inside the encrypted
-    /// plaintext so the recipient can reply to the real identity. Default
-    /// on; the checkbox only renders for burner profiles with a handle.
-    pub(crate) compose_reveal_from: bool,
     pub(crate) compose_preparing: bool,
     pub(crate) compose_prepare_rx: Option<Receiver<PrepareWorkerMsg>>,
     /// `Some` once `prepare_send` has returned a plan — presence of this
@@ -104,24 +99,10 @@ pub struct ProfileSession {
     /// per-frame.
     pub(crate) pending: Vec<(String, StepKind)>,
 
-    /// Set by the post-send "Sweep & archive this burner…" button, drained
+    /// Set by the post-send "Archive this burner…" button, drained
     /// by the app to open the retire dialog. Lives here (not compose state)
     /// because the app owns the dialog, which outlives this session.
     pub(crate) retire_offer: bool,
-
-    /// Pair tab: the daemon's listen address (`host:port`) the pairing URI
-    /// points a phone at. The GUI cannot know the daemon's runtime bind, so
-    /// this defaults to the machine's LAN IP (else the loopback default) and
-    /// the user confirms it. The daemon stays the source of truth.
-    pub(crate) pair_addr: String,
-    /// The last "Save pairing file…" result — `Ok(path)` shows where it
-    /// landed, `Err(msg)` the failure. `None` before the first save.
-    pub(crate) pair_saved: Option<Result<PathBuf, String>>,
-    /// Manages the companion daemon (`zkmsgd`) this session started, if any.
-    /// Never auto-starts — the Pair tab's Start button does. Its `Drop` kills
-    /// the child on a profile switch (this session is dropped) or GUI exit, so
-    /// a GUI-started daemon is never orphaned.
-    pub(crate) daemon: crate::daemon_control::DaemonManager,
 }
 
 impl ProfileSession {
@@ -155,7 +136,6 @@ impl ProfileSession {
             compose_resolved: None,
             compose_resolve_rx: None,
             compose_show_confirm: false,
-            compose_reveal_from: true,
             compose_preparing: false,
             compose_prepare_rx: None,
             send_flow: None,
@@ -163,9 +143,6 @@ impl ProfileSession {
             send_state_id: None,
             pending,
             retire_offer: false,
-            pair_addr: crate::pair_view::default_pair_addr(),
-            pair_saved: None,
-            daemon: crate::daemon_control::DaemonManager::default(),
         }
     }
 
@@ -176,9 +153,6 @@ impl ProfileSession {
         self.poll_inbox_worker();
         self.poll_compose_worker(ctx);
         self.poll_send_worker();
-        // Reap/promote a daemon this session started (crash, bind failure, or
-        // the Starting -> Running promotion). Cheap non-blocking `try_wait`.
-        self.daemon.poll();
     }
 
     /// Renders the active tab's central content. `repo_root` is the shell's
@@ -197,7 +171,6 @@ impl ProfileSession {
             Tab::Status => self.status_tab(ui, ctx, repo_root, locked),
             Tab::Compose => self.compose_tab(ui, ctx, locked),
             Tab::Inbox => self.inbox_tab(ui, ctx),
-            Tab::Pair => self.pair_tab(ui),
         }
     }
 
@@ -210,11 +183,6 @@ impl ProfileSession {
             // A scan/call is in flight — repaint every frame so the mpsc
             // channel gets drained promptly once it lands.
             ctx.request_repaint();
-        } else if self.daemon.is_active() {
-            // A daemon is Starting/Running: wake periodically so `poll` catches
-            // an exit (crash/bind failure) and the Pair tab re-reads the token
-            // file the daemon just minted, without busy-spinning.
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         } else if self.inbox_auto_refresh {
             // Idle but armed: wake up periodically to re-check the 30s
             // elapsed-since-last-refresh condition, without busy-spinning.

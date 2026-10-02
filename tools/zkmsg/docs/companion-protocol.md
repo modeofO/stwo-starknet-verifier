@@ -1,4 +1,10 @@
-# Companion protocol (Phase B)
+# Companion protocol (Phase B) — RETIRED 2026-10-01
+
+> **Retired.** The phone side of this route was removed 2026-09-30 (the
+> phone now proves and sends on its own through SNIP-36), and the desktop
+> daemon (`tools/zkmsg/daemon`, `zkmsgd`) and the GUI Pair tab were removed
+> 2026-10-01. Kept as a record of the design; nothing implements it now.
+
 
 This document defines the wire contract between the zkmsg phone client and the
 desktop companion daemon. The phone composes a message. The daemon proves,

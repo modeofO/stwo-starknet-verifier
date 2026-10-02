@@ -106,10 +106,6 @@ pub struct Config {
     /// Local-only; nothing on-chain marks a burner.
     #[serde(default)]
     pub burner: bool,
-    /// The creating profile's registered handle, for the compose
-    /// from-line. Local-only.
-    #[serde(default)]
-    pub reply_handle: Option<String>,
 }
 
 impl Config {
@@ -124,7 +120,6 @@ impl Config {
             circuit_executable: repo_root
                 .join("fixtures/target/dev/messagezk_scan.executable.json"),
             burner: false,
-            reply_handle: None,
         }
     }
 }
@@ -245,7 +240,20 @@ mod tests {
         }"#;
         let c: Config = serde_json::from_str(old).unwrap();
         assert!(!c.burner);
-        assert!(c.reply_handle.is_none());
+    }
+
+    #[test]
+    fn config_ignores_retired_reply_handle() {
+        // A burner config written before the from-line was retired still
+        // loads: serde skips the unknown `reply_handle` field.
+        let old = r#"{
+            "rpc_url": "https://x", "account": "zkmsg-burner-ab12cd",
+            "registry": "0x1", "store": "0x2",
+            "bridge_bin": "/b", "circuit_executable": "/c",
+            "burner": true, "reply_handle": "alice"
+        }"#;
+        let c: Config = serde_json::from_str(old).unwrap();
+        assert!(c.burner);
     }
 
     #[test]

@@ -71,8 +71,6 @@ pub struct WizardUi {
     resume_source: Option<String>,
     /// Burner mode: auto-named, external funding, stamps burner metadata.
     burner: bool,
-    /// The creating profile's handle, recorded for the compose from-line.
-    reply_handle: Option<String>,
     /// External resume: loaded state's fund mode (a resumed Transfer
     /// wizard still re-arms the confirm; External never needs it once the
     /// dir exists — nothing transfers).
@@ -99,7 +97,6 @@ impl WizardUi {
             error: None,
             resume_source: None,
             burner: false,
-            reply_handle: None,
             fund_mode: zkmsg_core::setup::FundMode::Transfer,
             fund_touched: false,
             recommend_rx: None,
@@ -110,7 +107,7 @@ impl WizardUi {
     /// A burner form: auto-generated identity, external funding. The name
     /// stays editable but arrives filled so the default path is zero
     /// typing.
-    pub fn new_burner(reply_handle: Option<String>) -> Self {
+    pub fn new_burner() -> Self {
         let name = zkmsg_core::setup::burner_name();
         let mut w = Self::new_profile();
         w.handle = name.clone();
@@ -119,7 +116,6 @@ impl WizardUi {
         w.handle_touched = true;
         w.account_touched = true;
         w.burner = true;
-        w.reply_handle = reply_handle;
         w.fund_mode = zkmsg_core::setup::FundMode::External;
         w
     }
@@ -149,7 +145,6 @@ impl WizardUi {
             error: None,
             resume_source: Some(state.source_account.clone()),
             burner: state.burner,
-            reply_handle: state.reply_handle.clone(),
             fund_mode: state.fund_mode.clone(),
             fund_touched: true,
             recommend_rx: None,
@@ -556,7 +551,6 @@ impl WizardUi {
                         self.handle.trim().to_string(),
                         self.account_name.trim().to_string(),
                         fund,
-                        self.reply_handle.clone(),
                     )
                 } else {
                     SetupState::new_plan(

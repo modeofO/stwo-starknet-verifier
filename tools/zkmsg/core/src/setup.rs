@@ -67,8 +67,6 @@ pub struct SetupState {
     pub fund_mode: FundMode,
     #[serde(default)]
     pub burner: bool,
-    #[serde(default)]
-    pub reply_handle: Option<String>,
     /// The new account's address, filled once CreateAccount runs.
     pub address: Option<String>,
     pub steps: Vec<SetupStep>,
@@ -100,7 +98,6 @@ impl SetupState {
             source_account,
             fund_mode: FundMode::Transfer,
             burner: false,
-            reply_handle: None,
             address: None,
             steps,
         }
@@ -115,12 +112,10 @@ impl SetupState {
         handle: String,
         account_name: String,
         fund_strk: u64,
-        reply_handle: Option<String>,
     ) -> Self {
         let mut s = Self::new_plan(profile_name, handle, account_name, fund_strk, String::new());
         s.fund_mode = FundMode::External;
         s.burner = true;
-        s.reply_handle = reply_handle;
         s
     }
 
@@ -328,7 +323,6 @@ impl SetupRunner<'_> {
             // config — idempotent, local-only.
             let mut config = home.load_config()?;
             config.burner = true;
-            config.reply_handle = state.reply_handle.clone();
             home.save_config(&config)?;
         }
         Ok((None, note))
@@ -457,9 +451,8 @@ mod tests {
         }"#;
         let s: SetupState = serde_json::from_str(carol_era).unwrap();
         assert_eq!(s.fund_mode, FundMode::Transfer);
-        // The carol-era JSON also predates the burner/reply_handle fields.
+        // The carol-era JSON also predates the burner field.
         assert!(!s.burner);
-        assert!(s.reply_handle.is_none());
         // And it round-trips with the field present.
         let json = serde_json::to_string(&s).unwrap();
         let s2: SetupState = serde_json::from_str(&json).unwrap();
@@ -507,11 +500,10 @@ mod tests {
     fn burner_plan_is_external_and_flagged() {
         let s = SetupState::new_plan_external_burner(
             "burner-ab12cd".into(), "burner-ab12cd".into(),
-            "zkmsg-burner-ab12cd".into(), 80, Some("alice".into()),
+            "zkmsg-burner-ab12cd".into(), 80,
         );
         assert_eq!(s.fund_mode, FundMode::External);
         assert!(s.burner);
-        assert_eq!(s.reply_handle.as_deref(), Some("alice"));
         assert!(s.source_account.is_empty());
         assert_eq!(s.steps.len(), 5);
     }
