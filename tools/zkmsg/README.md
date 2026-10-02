@@ -57,6 +57,8 @@ reads it from the `UserRegistered` event and checks it against the
 store's `kem_digest`. The zk statement now proves only the sender's
 membership; the recipient finds its mail by recomputing the hybrid tag.
 
+The v2 store is the only one this client reads or writes: MessageStore v3
+and the SNIP-36 v1 store are no longer read (`inbox --legacy` is gone).
 Older profiles move with `zkmsg migrate-store [<profile>]` (or the Status
 tab's "Move to v2 store…"): it rewrites `config.json`, clears the handle
 and leaf index (registration is per store), keeps the scan key, and you
@@ -70,7 +72,7 @@ inbox decrypts it; carol's own inbox does not.
 
 ## SNIP-36 sends
 
-SNIP-36 stores (v2, and the v1 store before it), where a send is **one
+On the v2 store (as on the SNIP-36 v1 store before it) a send is **one
 transaction**: the zkmsg statement runs inside StarkWare's virtual
 Starknet OS (contract `ZkmsgSendProver`, executed only here), the S-two
 proof of that run rides in the invoke's `proof` field, and the sequencer

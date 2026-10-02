@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 
 use zkmsg_core::app;
 use zkmsg_core::chain::{Chain, felt_hex};
-use zkmsg_core::config::{Home, StoreKind, store_kind};
+use zkmsg_core::config::{Home, is_v2_store};
 use zkmsg_core::inbox;
 use zkmsg_core::state::SendState;
 
@@ -68,11 +68,7 @@ enum Command {
     /// Resume an interrupted send (its proof is saved; Publish is retried).
     Resume { id: String },
     /// Scan MessageSent events and decrypt the ones addressed to you.
-    Inbox {
-        /// Also scan the legacy MessageStore v3 (read-only history).
-        #[arg(long)]
-        legacy: bool,
-    },
+    Inbox,
     /// Config, balance, deployed addresses.
     Status,
     /// Point a profile at the v2 (post-quantum) store. Registration is per
@@ -99,7 +95,7 @@ fn main() -> Result<()> {
         Command::Register { handle } => cmd_register(&home, &handle),
         Command::Send { handle, text } => cmd_send(&home, &handle, &text),
         Command::Resume { id } => cmd_resume(&home, &id),
-        Command::Inbox { legacy } => cmd_inbox(&home, legacy),
+        Command::Inbox => cmd_inbox(&home),
         Command::Status => cmd_status(&home),
         Command::MigrateStore { .. } => cmd_migrate_store(&home),
     }
@@ -138,8 +134,8 @@ fn cmd_send(home: &Home, handle: &str, text: &str) -> Result<()> {
     let keys = home.load_keys()?;
     ensure!(!config.store.is_empty(), "no store address in config.json");
     ensure!(
-        app::uses_virtual_route(&config),
-        "{} is not a store this client sends to — `zkmsg migrate-store` moves the profile to v2",
+        app::on_current_store(&config),
+        "{} is not the v2 store — `zkmsg migrate-store` moves the profile",
         config.store,
     );
     keys.leaf_index.context("not registered — run `zkmsg register`")?;
@@ -169,26 +165,12 @@ fn sink() -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) {
     }
 }
 
-fn cmd_inbox(home: &Home, legacy: bool) -> Result<()> {
-    use zkmsg_core::config::{SEPOLIA_STORE_V3, same_address};
+fn cmd_inbox(home: &Home) -> Result<()> {
     let config = home.load_config()?;
     let keys = home.load_keys()?;
     ensure!(!config.store.is_empty(), "no store address in config.json");
     let chain = Chain::new(&config.rpc_url, &config.account);
-    let scan_priv = keys.scan_priv_felt()?;
-
-    let mut messages = vec![];
-    if legacy && !same_address(&config.store, SEPOLIA_STORE_V3) {
-        let history = inbox::scan(&chain, SEPOLIA_STORE_V3, &scan_priv)?;
-        if !history.is_empty() {
-            println!("-- legacy v3 store ({} message(s)) --", history.len());
-            for m in &history {
-                println!("#{:<4} {}  {}", m.nonce, &m.commitment[..18], m.text);
-            }
-            println!("-- home store --");
-        }
-    }
-    messages.extend(inbox::scan_with_keys(&chain, &config.store, &keys)?);
+    let messages = inbox::scan_with_keys(&chain, &config.store, &keys)?;
     if messages.is_empty() {
         println!("inbox empty (no envelopes match your scan key)");
         return Ok(());
@@ -220,12 +202,12 @@ fn cmd_status(home: &Home) -> Result<()> {
 
     println!("rpc      : {}", report.rpc);
     println!("account  : {}", report.account);
-    let route = match store_kind(&report.store) {
-        _ if report.store.is_empty() => "",
-        Some(StoreKind::V2) => " (v2: hybrid ML-KEM + ECDH)",
-        Some(StoreKind::Snip36V1) => " (SNIP-36 v1 — `zkmsg migrate-store` moves to v2)",
-        Some(StoreKind::V3) => " (legacy v3, read-only — `zkmsg migrate-store` moves to v2)",
-        None => "",
+    let route = if report.store.is_empty() {
+        ""
+    } else if is_v2_store(&report.store) {
+        " (v2: hybrid ML-KEM + ECDH)"
+    } else {
+        " (not read any more — `zkmsg migrate-store` moves to v2)"
     };
     println!(
         "store    : {}{route}",

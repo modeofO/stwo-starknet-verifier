@@ -9,24 +9,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
-/// MessageStore v3 — deployed 2026-07-05 (docs/zkmsg-deployment.md),
-/// class 0x04dc67c0…5745, pinned to the live registry + the
-/// messagezk_scan circuit route. Legacy: read-only inbox history
-/// (`zkmsg inbox --legacy`); nothing sends to it since lane 1 was removed.
-pub const SEPOLIA_STORE_V3: &str =
-    "0x02d66a02b2efdddb5282bf7d7931cbb7a724f191478843b1fccbf3b9729e91b7";
-pub const SEPOLIA_STORE_V3_DEPLOY_BLOCK: u64 = 11_624_399;
-
-/// MessageStoreSnip36 (contracts/messagezk_store_snip36) — the home store.
-/// Same registration/tree/event interface as v3, but `send_message` takes
-/// no fact: the tx must carry SNIP-36 proof_facts from ZkmsgSendProver.
-pub const SEPOLIA_STORE_SNIP36: &str =
-    "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f";
-pub const SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK: u64 = 15_850_710;
-/// ZkmsgSendProver — the contract proven in the virtual OS for a SNIP-36 send.
-pub const SEPOLIA_SNIP36_SEND_PROVER: &str =
-    "0x012b85a4b5e6918eb6f18a07fddc1667d67beaac0ab647928105b8ccf7ee5346";
-
 /// MessageStoreV2PQ (contracts/messagezk_store_pq), deployed 2026-10-01
 /// (docs/zkmsg-deployment.md): hybrid ML-KEM-768 + ECDH, recipient check out
 /// of the zk statement, leaf = poseidon(LEAF_V2, scan_pub, kem_digest).
@@ -38,30 +20,15 @@ pub const SEPOLIA_STORE_V2_DEPLOY_BLOCK: u64 = 15_947_092;
 pub const SEPOLIA_V2_SEND_PROVER: &str =
     "0x02d993bd9e1229367fe9643151fdb7b2fb9fe06b28e6ff0d2f1d451894182d79";
 
-/// The store a fresh profile is configured with.
+/// The store a fresh profile is configured with — and the only one this
+/// client reads or writes (owner decision 2026-10-01: MessageStore v3 and the
+/// SNIP-36 v1 store are no longer read; `zkmsg migrate-store` moves a
+/// profile still pointing at one of them).
 pub const SEPOLIA_STORE_DEFAULT: &str = SEPOLIA_STORE_V2;
 
-/// What a store address is, as far as this client knows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreKind {
-    /// MessageStore v3: lane-1 fact registry.
-    V3,
-    /// MessageStoreSnip36: SNIP-36, ECDH only.
-    Snip36V1,
-    /// MessageStoreV2PQ: SNIP-36, hybrid ML-KEM + ECDH.
-    V2,
-}
-
-pub fn store_kind(store: &str) -> Option<StoreKind> {
-    if same_address(store, SEPOLIA_STORE_V2) {
-        Some(StoreKind::V2)
-    } else if same_address(store, SEPOLIA_STORE_SNIP36) {
-        Some(StoreKind::Snip36V1)
-    } else if same_address(store, SEPOLIA_STORE_V3) {
-        Some(StoreKind::V3)
-    } else {
-        None
-    }
+/// Whether `store` is the v2 store.
+pub fn is_v2_store(store: &str) -> bool {
+    same_address(store, SEPOLIA_STORE_V2)
 }
 
 /// Address equality as felts (tolerates leading zeros / case).
@@ -72,20 +39,10 @@ pub fn same_address(a: &str, b: &str) -> bool {
     }
 }
 
-/// First block worth scanning for `store`'s events: the deploy block of a
-/// known store, else 0. From-genesis getEvents 500s on publicnode.
+/// First block worth scanning for `store`'s events: the v2 store's deploy
+/// block, else 0. From-genesis getEvents 500s on publicnode.
 pub fn store_deploy_block(store: &str) -> u64 {
-    match store_kind(store) {
-        Some(StoreKind::V2) => SEPOLIA_STORE_V2_DEPLOY_BLOCK,
-        Some(StoreKind::Snip36V1) => SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK,
-        Some(StoreKind::V3) => SEPOLIA_STORE_V3_DEPLOY_BLOCK,
-        None => 0,
-    }
-}
-
-/// Whether `store` is a SNIP-36 store — one this client sends to.
-pub fn is_snip36_store(store: &str) -> bool {
-    matches!(store_kind(store), Some(StoreKind::Snip36V1 | StoreKind::V2))
+    if is_v2_store(store) { SEPOLIA_STORE_V2_DEPLOY_BLOCK } else { 0 }
 }
 
 pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.com";
@@ -360,15 +317,12 @@ mod tests {
     #[test]
     fn store_routing() {
         assert_eq!(Config::default_sepolia(Path::new("/r")).store, SEPOLIA_STORE_V2);
-        assert_eq!(store_kind(SEPOLIA_STORE_V2), Some(StoreKind::V2));
-        assert_eq!(store_deploy_block(SEPOLIA_STORE_V2), SEPOLIA_STORE_V2_DEPLOY_BLOCK);
-        assert!(is_snip36_store(SEPOLIA_STORE_V2));
         // Leading-zero / case differences still match.
-        assert_eq!(
-            store_deploy_block("0x2B9C6F617B3197DFED76401C32AA3B4B597EBDD01A7EBA4B5657236BC8084F"),
-            SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK,
-        );
-        assert_eq!(store_deploy_block(SEPOLIA_STORE_V3), SEPOLIA_STORE_V3_DEPLOY_BLOCK);
-        assert_eq!(store_deploy_block("0x123"), 0);
+        assert!(is_v2_store("0x4DC92EF9A90D336A79188C5408CDF9CE480F3ECD5B1CE55EF2CA207F2C3AFE8"));
+        assert_eq!(store_deploy_block(SEPOLIA_STORE_V2), SEPOLIA_STORE_V2_DEPLOY_BLOCK);
+        // The retired stores are just unknown addresses now.
+        let snip36_v1 = "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f";
+        assert!(!is_v2_store(snip36_v1));
+        assert_eq!(store_deploy_block(snip36_v1), 0);
     }
 }

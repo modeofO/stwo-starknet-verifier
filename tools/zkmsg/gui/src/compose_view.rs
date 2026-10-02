@@ -158,7 +158,7 @@ impl ProfileSession {
             }
         });
         if !self.is_virtual_route() {
-            ui.label("this profile's store is read-only — move it to the v2 store on the Status tab");
+            ui.label("this profile's store is retired — move it to the v2 store on the Status tab");
         }
         if locked {
             ui.label("a profile setup is running — sending is paused until it finishes");
@@ -212,7 +212,7 @@ impl ProfileSession {
     }
 
     fn is_virtual_route(&self) -> bool {
-        self.config.as_ref().is_some_and(zkmsg_core::app::uses_virtual_route)
+        self.config.as_ref().is_some_and(zkmsg_core::app::on_current_store)
     }
 
     fn cost_line(&self) -> String {

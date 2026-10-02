@@ -41,7 +41,7 @@ use starknet_types_core::felt::Felt;
 
 use crate::app::{Member, short_string_felt};
 use crate::chain::{Chain, bytearray_calldata, bytearray_decode, felt_hex, snkeccak};
-use crate::config::{Config, Home, Keys, STRK_TOKEN, StoreKind, store_deploy_block, store_kind};
+use crate::config::{Config, Home, Keys, STRK_TOKEN, is_v2_store, store_deploy_block};
 use crate::crypto::{SealedV2, kem_digest, leaf_v2, send_v2};
 use crate::tree::fold_path;
 use crate::invoke_v3::{Bounds, Call, InvokeV3, ResourceBounds, Signer, execute_calldata};
@@ -57,29 +57,18 @@ pub struct VirtualRoute {
     /// The contract whose virtual execution is proven.
     pub prover: Felt,
     pub chain_id: Felt,
-    /// v1 proves sender + recipient membership and the ECDH commitment; v2
-    /// proves sender membership only (the recipient check left the
-    /// statement with the hybrid KEM) and publishes `kem_ct ‖ blob`.
-    pub kind: StoreKind,
 }
 
 impl VirtualRoute {
-    /// The route for `store`, if it is a SNIP-36 store we know the prover of.
+    /// The route for `store`: the v2 store and its pinned prover. The v2
+    /// statement proves the sender's membership only (the recipient check
+    /// left it with the hybrid KEM); the store publishes `kem_ct ‖ blob`.
     pub fn for_store(store: &str) -> Option<Self> {
-        use crate::config::{
-            SEPOLIA_SNIP36_SEND_PROVER, SEPOLIA_STORE_SNIP36, SEPOLIA_STORE_V2,
-            SEPOLIA_V2_SEND_PROVER,
-        };
-        let (store, prover, kind) = match store_kind(store)? {
-            StoreKind::V2 => (SEPOLIA_STORE_V2, SEPOLIA_V2_SEND_PROVER, StoreKind::V2),
-            StoreKind::Snip36V1 => (SEPOLIA_STORE_SNIP36, SEPOLIA_SNIP36_SEND_PROVER, StoreKind::Snip36V1),
-            StoreKind::V3 => return None,
-        };
-        Some(Self {
-            store: Felt::from_hex(store).expect("constant"),
-            prover: Felt::from_hex(prover).expect("constant"),
+        use crate::config::{SEPOLIA_STORE_V2, SEPOLIA_V2_SEND_PROVER};
+        is_v2_store(store).then(|| Self {
+            store: Felt::from_hex(SEPOLIA_STORE_V2).expect("constant"),
+            prover: Felt::from_hex(SEPOLIA_V2_SEND_PROVER).expect("constant"),
             chain_id: crate::invoke_v3::short_string("SN_SEPOLIA"),
-            kind,
         })
     }
 }
@@ -93,14 +82,13 @@ struct Prepared {
     commitment: Felt,
     ephemeral: Felt,
     root: Felt,
-    /// The ByteArray `send_message` publishes: v1 the AES-GCM blob, v2
-    /// `kem_ct ‖ blob`.
+    /// The ByteArray `send_message` publishes: `kem_ct ‖ blob`.
     content: Vec<u8>,
     content_hash: Felt,
     prove_calldata: Vec<Felt>,
 }
 
-/// Same id rule as `send::build_send`: the commitment's first 10 hex digits.
+/// A send's id: the commitment's first 10 hex digits.
 fn send_id(commitment: &Felt) -> String {
     format!("{:.10}", felt_hex(commitment).trim_start_matches("0x"))
 }
@@ -175,20 +163,6 @@ pub fn message_hash(route: &VirtualRoute, commitment: Felt, ephemeral: Felt, roo
     let mut fields = vec![route.prover, Felt::ZERO, Felt::from(payload.len() as u64)];
     fields.extend_from_slice(&payload);
     poseidon_hash_many(&fields)
-}
-
-/// `prove_send` calldata from the circuit's 46-felt witness
-/// (`[root, sender_priv, recipient_pub, ephemeral_priv, sender_index,
-/// recipient_index, s0…s19, r0…r19]`, as `send::build_send` makes it).
-pub fn prove_send_calldata(store: Felt, content_hash: Felt, witness: &[Felt]) -> Result<Vec<Felt>> {
-    ensure!(witness.len() == 46, "witness has {} felts, not 46", witness.len());
-    let mut out = vec![store, content_hash];
-    out.extend_from_slice(&witness[..6]);
-    out.push(Felt::from(20u64));
-    out.extend_from_slice(&witness[6..26]);
-    out.push(Felt::from(20u64));
-    out.extend_from_slice(&witness[26..46]);
-    Ok(out)
 }
 
 /// The facts must attest exactly `expected`, proven on `block`.
@@ -304,7 +278,9 @@ pub struct VirtualSender<'a> {
 impl<'a> VirtualSender<'a> {
     pub fn new(home: &'a Home, config: &Config) -> Result<Self> {
         let route = VirtualRoute::for_store(&config.store)
-            .with_context(|| format!("{} is not a SNIP-36 store this build knows", config.store))?;
+            .with_context(|| {
+                format!("{} is not the v2 store — `zkmsg migrate-store` moves this profile", config.store)
+            })?;
         Ok(Self {
             home,
             route,
@@ -327,10 +303,7 @@ impl<'a> VirtualSender<'a> {
 
         // 1. Prepare, all at one block.
         sink(PipelineEvent::StepStarted { index: 0, total, kind: StepKind::Prepare });
-        let p = match self.route.kind {
-            StoreKind::V2 => self.prepare_v2(keys, handle, text)?,
-            _ => self.prepare_v1(keys, handle, text)?,
-        };
+        let p = self.prepare(keys, handle, text)?;
         let block = p.block;
         let mut state = SendState::new_virtual_plan(
             p.id.clone(),
@@ -378,57 +351,10 @@ impl<'a> VirtualSender<'a> {
         Ok(state)
     }
 
-    /// v1: both members' paths and the ECDH envelope; the circuit witness
-    /// is the 46-felt `build_send` args.
-    fn prepare_v1(&self, keys: &Keys, handle: &str, text: &str) -> Result<Prepared> {
-        let sender_handle = keys.handle.as_deref().context("not registered — run `zkmsg register`")?;
-        let block = self.block_number()?;
-        let recipient = self.member(handle, block)?;
-        let sender = self.member(sender_handle, block)?;
-        ensure!(
-            sender.scan_pub == keys.scan_pub_felt()?,
-            "'{sender_handle}' is registered to a different scan key in this store",
-        );
-        let root = self.root(block)?;
-        let recipient_path = self.path(recipient.leaf_index, block)?;
-        let sender_path = self.path(sender.leaf_index, block)?;
-        let nonce = self.nonce(Some(block))?;
-
-        let material = crate::send::build_send(&crate::send::SendInputs {
-            merkle_root: root,
-            sender_scan_priv: keys.scan_priv_felt()?,
-            recipient_scan_pub: recipient.scan_pub,
-            sender_leaf_index: sender.leaf_index,
-            recipient_leaf_index: recipient.leaf_index,
-            sender_path: &sender_path,
-            recipient_path: &recipient_path,
-            text,
-            ephemeral_priv: None,
-        })?;
-        let witness: Vec<Felt> = material
-            .args
-            .iter()
-            .map(|a| Felt::from_hex(a).context("witness felt"))
-            .collect::<Result<_>>()?;
-        let content = hex::decode(&material.ciphertext)?;
-        let content_hash = content_hash(&content);
-        Ok(Prepared {
-            id: material.id,
-            block,
-            nonce,
-            commitment: Felt::from_hex(&material.commitment)?,
-            ephemeral: Felt::from_hex(&material.ephemeral_pubkey)?,
-            root,
-            prove_calldata: prove_send_calldata(self.route.store, content_hash, &witness)?,
-            content,
-            content_hash,
-        })
-    }
-
-    /// v2: only the sender's membership is proven. The recipient's ML-KEM
-    /// key comes from its registration event and must hash to the
-    /// `kem_digest` the store holds for it at block N.
-    fn prepare_v2(&self, keys: &Keys, handle: &str, text: &str) -> Result<Prepared> {
+    /// Only the sender's membership is proven. The recipient's ML-KEM key
+    /// comes from its registration event and must hash to the `kem_digest`
+    /// the store holds for it at block N.
+    fn prepare(&self, keys: &Keys, handle: &str, text: &str) -> Result<Prepared> {
         let sender_handle = keys.handle.as_deref().context("not registered — run `zkmsg register`")?;
         let scan_priv = keys.scan_priv_felt()?;
         let scan_pub = keys.scan_pub_felt()?;
@@ -438,7 +364,7 @@ impl<'a> VirtualSender<'a> {
         let recipient = self.member(handle, block)?;
         let sender = self.member(sender_handle, block)?;
         ensure!(
-            sender.scan_pub == scan_pub && sender.kem_digest == Some(own_digest),
+            sender.scan_pub == scan_pub && sender.kem_digest == own_digest,
             "'{sender_handle}' is registered to different keys in this store",
         );
         let root = self.root(block)?;
@@ -451,7 +377,7 @@ impl<'a> VirtualSender<'a> {
 
         let recipient_ek = self.registered_kem_key(handle)?;
         ensure!(
-            Some(kem_digest(&recipient_ek)) == recipient.kem_digest,
+            kem_digest(&recipient_ek) == recipient.kem_digest,
             "'{handle}': the registered ML-KEM key does not match the store's kem_digest",
         );
         let sealed = send_v2(&recipient.scan_pub, &recipient_ek, text.as_bytes())?;
@@ -722,7 +648,7 @@ impl<'a> VirtualSender<'a> {
         let user = self
             .store_call("get_user", &[short_string_felt(handle)?], Some(block))
             .with_context(|| format!("'{handle}' is not registered in this store"))?;
-        Member::from_felts(self.route.kind == StoreKind::V2, &user)
+        Member::from_felts(&user)
     }
 
     fn root(&self, block: u64) -> Result<Felt> {
@@ -771,7 +697,13 @@ mod tests {
         let tx: Value = serde_json::from_str(include_str!("../testdata/snip36_send_tx.json")).unwrap();
         let calldata = felts(&tx["calldata"]);
         let facts = felts(&tx["proof_facts"]);
-        let route = VirtualRoute::for_store(crate::config::SEPOLIA_STORE_SNIP36).unwrap();
+        // The phone's send on the SNIP-36 v1 deployment: same facts layout and
+        // message-hash rule as v2, which is what this pins.
+        let route = VirtualRoute {
+            store: Felt::from_hex("0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f").unwrap(),
+            prover: Felt::from_hex("0x012b85a4b5e6918eb6f18a07fddc1667d67beaac0ab647928105b8ccf7ee5346").unwrap(),
+            chain_id: crate::invoke_v3::short_string("SN_SEPOLIA"),
+        };
         assert_eq!(calldata[1], route.store);
         // send_message args: commitment, ephemeral, root, then the ciphertext
         // ByteArray, whose serialization is exactly what content_hash hashes.
@@ -788,20 +720,6 @@ mod tests {
         assert!(check_facts(&facts, expected, block + 1).is_err());
         assert!(check_facts(&facts, Felt::ONE, block).is_err());
         assert!(check_facts(&facts[..8], expected, block).is_err());
-    }
-
-    #[test]
-    fn prove_send_calldata_layout() {
-        let witness: Vec<Felt> = (0..46u64).map(Felt::from).collect();
-        let out = prove_send_calldata(Felt::from(100u64), Felt::from(200u64), &witness).unwrap();
-        assert_eq!(out.len(), 2 + 6 + 1 + 20 + 1 + 20);
-        assert_eq!(&out[..2], &[Felt::from(100u64), Felt::from(200u64)]);
-        assert_eq!(&out[2..8], &witness[..6]);
-        assert_eq!(out[8], Felt::from(20u64));
-        assert_eq!(&out[9..29], &witness[6..26]);
-        assert_eq!(out[29], Felt::from(20u64));
-        assert_eq!(&out[30..], &witness[26..]);
-        assert!(prove_send_calldata(Felt::ZERO, Felt::ZERO, &witness[..45]).is_err());
     }
 
     #[test]
@@ -869,11 +787,9 @@ mod tests {
     }
 
     #[test]
-    fn only_known_snip36_stores_route() {
-        assert!(VirtualRoute::for_store(crate::config::SEPOLIA_STORE_SNIP36).is_some());
+    fn only_the_v2_store_routes() {
         let v2 = VirtualRoute::for_store(crate::config::SEPOLIA_STORE_V2).unwrap();
-        assert_eq!(v2.kind, StoreKind::V2);
         assert_eq!(v2.prover, Felt::from_hex(crate::config::SEPOLIA_V2_SEND_PROVER).unwrap());
-        assert!(VirtualRoute::for_store(crate::config::SEPOLIA_STORE_V3).is_none());
+        assert!(VirtualRoute::for_store("0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f").is_none());
     }
 }

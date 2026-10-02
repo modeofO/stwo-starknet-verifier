@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use starknet_types_core::felt::Felt;
 
 use crate::chain::{Chain, account_address, bytearray_calldata, felt_hex, felt_to_u64};
-use crate::config::{Config, Home, Keys, STRK_TOKEN, StoreKind, store_kind};
+use crate::config::{Config, Home, Keys, STRK_TOKEN, is_v2_store};
 use crate::crypto::{kem_digest, scan_keygen};
 use crate::state::{SendState, StepKind};
 
@@ -110,16 +110,19 @@ pub enum RegisterOutcome {
 /// just syncs local state instead of re-registering.
 pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let config = home.load_config()?;
-    ensure!(!config.store.is_empty(), "no store address in config.json");
-    let v2 = store_kind(&config.store) == Some(StoreKind::V2);
-    // v2 registers the ML-KEM key too; an older profile gets its seed now,
-    // written to keys.json before anything reaches the chain.
-    let mut keys = if v2 { home.ensure_kem_seed()? } else { home.load_keys()? };
+    ensure!(
+        is_v2_store(&config.store),
+        "{} is not the v2 store — `zkmsg migrate-store` first",
+        config.store
+    );
+    // Registration publishes the ML-KEM key too; an older profile gets its
+    // seed now, written to keys.json before anything reaches the chain.
+    let mut keys = home.ensure_kem_seed()?;
     if let Some(existing) = &keys.handle {
         bail!("already registered as '{existing}'");
     }
-    let ek = if v2 { Some(keys.kem_keypair()?.1) } else { None };
-    let digest = ek.as_deref().map(kem_digest);
+    let ek = keys.kem_keypair()?.1;
+    let digest = kem_digest(&ek);
 
     let chain = Chain::new(&config.rpc_url, &config.account);
     let handle_felt = short_string_felt(handle)?;
@@ -129,13 +132,11 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let already = chain
         .call(&config.store, "get_user", &[felt_hex(&handle_felt)])
         .ok()
-        .and_then(|u| Member::parse(&config.store, &u).ok())
+        .and_then(|u| Member::parse(&u).ok())
         .filter(|u| ours(u));
     let tx_hash = if already.is_none() {
         let mut calldata = vec![felt_hex(&handle_felt), keys.scan_pub.clone()];
-        if let Some(ek) = &ek {
-            calldata.extend(bytearray_calldata(ek));
-        }
+        calldata.extend(bytearray_calldata(&ek));
         let tx = chain.invoke(&config.store, "register", &calldata, &Default::default())?;
         chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
         Some(tx)
@@ -143,10 +144,7 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
         None
     };
 
-    let user = Member::parse(
-        &config.store,
-        &chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)])?,
-    )?;
+    let user = Member::parse(&chain.call(&config.store, "get_user", &[felt_hex(&handle_felt)])?)?;
     ensure!(ours(&user), "'{handle}' is registered, but not to this profile's keys");
     let leaf_index = user.leaf_index;
     keys.handle = Some(handle.to_string());
@@ -163,35 +161,29 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     pub scan_pub: Felt,
-    /// v2 only: poseidon over the registered ML-KEM key's ByteArray.
-    pub kem_digest: Option<Felt>,
+    /// Poseidon over the registered ML-KEM key's ByteArray.
+    pub kem_digest: Felt,
     pub leaf_index: u32,
 }
 
 impl Member {
-    /// `get_user` returns `(owner, scan_pubkey, leaf_index)` on v1 stores and
-    /// `(owner, scan_pubkey, kem_digest, leaf_index)` on v2.
-    pub fn parse(store: &str, user: &[String]) -> Result<Self> {
+    /// `get_user` returns `(owner, scan_pubkey, kem_digest, leaf_index)`.
+    pub fn parse(user: &[String]) -> Result<Self> {
         let felts: Vec<Felt> =
             user.iter().map(|s| Felt::from_hex(s).context("get_user felt")).collect::<Result<_>>()?;
-        Self::from_felts(store_kind(store) == Some(StoreKind::V2), &felts)
+        Self::from_felts(&felts)
     }
 
-    pub fn from_felts(v2: bool, user: &[Felt]) -> Result<Self> {
-        let want = if v2 { 4 } else { 3 };
-        ensure!(user.len() == want, "get_user returned {} felts, expected {want}", user.len());
-        Ok(Self {
-            scan_pub: user[1],
-            kem_digest: v2.then_some(user[2]),
-            leaf_index: felt_to_u64(&user[want - 1])? as u32,
-        })
+    pub fn from_felts(user: &[Felt]) -> Result<Self> {
+        ensure!(user.len() == 4, "get_user returned {} felts, expected 4", user.len());
+        Ok(Self { scan_pub: user[1], kem_digest: user[2], leaf_index: felt_to_u64(&user[3])? as u32 })
     }
 }
 
 /// Looks up a handle's scan pubkey + leaf index in the store.
 pub fn resolve_recipient(chain: &Chain, store: &str, handle: &str) -> Result<(Felt, u32)> {
     let handle_felt = short_string_felt(handle)?;
-    let user = Member::parse(store, &chain.call(store, "get_user", &[felt_hex(&handle_felt)])?)?;
+    let user = Member::parse(&chain.call(store, "get_user", &[felt_hex(&handle_felt)])?)?;
     Ok((user.scan_pub, user.leaf_index))
 }
 
@@ -210,10 +202,7 @@ pub struct StoreMigration {
 /// Refused while a send is incomplete: its proof is bound to the old store.
 pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
     let mut config = home.load_config()?;
-    ensure!(
-        store_kind(&config.store) != Some(StoreKind::V2),
-        "this profile already uses the v2 store",
-    );
+    ensure!(!is_v2_store(&config.store), "this profile already uses the v2 store");
     let pending = pending_sends(home)?;
     ensure!(
         pending.is_empty(),
@@ -236,11 +225,10 @@ pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
     Ok(migration)
 }
 
-/// Whether `config`'s store can be sent to (a SNIP-36 store). The legacy v3
-/// store can still be read with `inbox --legacy`, but its lane-1 send route
-/// was removed 2026-10-01.
-pub fn uses_virtual_route(config: &Config) -> bool {
-    crate::config::is_snip36_store(&config.store)
+/// Whether `config` points at the store this client reads and writes (v2).
+/// Anything else needs `migrate_store` first.
+pub fn on_current_store(config: &Config) -> bool {
+    is_v2_store(&config.store)
 }
 
 /// A fresh send, end to end: prepare, prove and publish in one call,
@@ -318,13 +306,16 @@ mod tests {
             starknet_types_core::felt::Felt::from_hex("0x7a6b6d7367").unwrap());
         assert!(short_string_felt("x".repeat(40).as_str()).is_err());
     }
+    /// The retired SNIP-36 v1 store.
+    const OLD_STORE: &str = "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f";
+
     #[test]
     fn migrate_store_moves_to_v2_and_clears_registration() {
         let dir = std::env::temp_dir().join(format!("zkmsg-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = Home::new(dir.clone());
         let mut config = Config::default_sepolia(Path::new("/r"));
-        config.store = crate::config::SEPOLIA_STORE_SNIP36.into();
+        config.store = OLD_STORE.into();
         home.save_config(&config).unwrap();
         home.save_new_keys(&Keys {
             scan_priv: "0x5".into(),
@@ -337,12 +328,12 @@ mod tests {
 
         let m = migrate_store(&home).unwrap();
         assert_eq!(m.previous_handle.as_deref(), Some("carol"));
-        assert!(crate::config::is_snip36_store(&m.previous_store));
+        assert_eq!(m.previous_store, OLD_STORE);
         let keys = home.load_keys().unwrap();
         assert_eq!((keys.handle, keys.leaf_index), (None, None));
         assert_eq!(keys.scan_priv, "0x5", "the scan key survives");
         assert!(keys.kem_seed.is_some());
-        assert_eq!(store_kind(&home.load_config().unwrap().store), Some(StoreKind::V2));
+        assert!(is_v2_store(&home.load_config().unwrap().store));
         // Twice is refused.
         assert!(migrate_store(&home).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -354,7 +345,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let home = Home::new(dir.clone());
         let mut config = Config::default_sepolia(Path::new("/r"));
-        config.store = crate::config::SEPOLIA_STORE_SNIP36.into();
+        config.store = OLD_STORE.into();
         home.save_config(&config).unwrap();
         let s = SendState::new_virtual_plan(
             "p1".into(), "mode2".into(), "00".into(), ("0xa".into(), "0xb".into(), "0xc".into()), 1,
