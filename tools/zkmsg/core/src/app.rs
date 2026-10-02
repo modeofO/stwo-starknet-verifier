@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail, ensure};
 use starknet_types_core::felt::Felt;
 
 use crate::chain::{Chain, account_address, bytearray_calldata, felt_hex, felt_to_u64};
-use crate::config::{Config, Home, Keys, STRK_TOKEN, is_v2_store};
-use crate::crypto::{kem_digest, scan_keygen};
+use crate::config::{Config, Home, Keys, STRK_TOKEN, is_current_store};
+use crate::crypto::{kem_digest, member_commit, scan_keygen};
 use crate::state::{SendState, StepKind};
 
 pub struct StatusReport {
@@ -80,6 +80,7 @@ pub fn init_identity(
         handle: None,
         leaf_index: None,
         kem_seed: Some(crate::config::kem_seed_hex(&crate::crypto::kem_seed_gen())),
+        member_secret: Some(crate::config::member_secret_hex(&crate::crypto::member_secret_gen())),
     })?;
     #[cfg(unix)]
     {
@@ -116,23 +117,27 @@ pub enum RegisterOutcome {
 pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let config = home.load_config()?;
     ensure!(
-        is_v2_store(&config.store),
-        "{} is not the v2 store — `zkmsg migrate-store` first",
+        is_current_store(&config.store),
+        "{} is not the v3 store — `zkmsg migrate-store` first",
         config.store
     );
     if let Some(existing) = &home.load_keys()?.handle {
         bail!("already registered as '{existing}'");
     }
-    // Registration publishes the ML-KEM key too; an older profile gets its
-    // seed now, written to keys.json before anything reaches the chain.
-    let mut keys = home.ensure_kem_seed()?;
+    // Registration publishes the ML-KEM key and the membership commitment;
+    // an older profile gets its seed and secret now, written to keys.json
+    // before anything reaches the chain.
+    let mut keys = home.ensure_register_keys()?;
     let ek = keys.kem_keypair()?.1;
     let digest = kem_digest(&ek);
+    let m_commit = member_commit(&keys.member_secret_felt()?);
 
     let chain = Chain::new(&config.rpc_url, &config.account);
     let handle_felt = short_string_felt(handle)?;
     let ours = |user: &Member| {
-        Some(user.scan_pub) == keys.scan_pub_felt().ok() && user.kem_digest == digest
+        Some(user.scan_pub) == keys.scan_pub_felt().ok()
+            && user.kem_digest == digest
+            && user.m_commit == m_commit
     };
     // Only the store's own "unknown handle" means unregistered; any other
     // failure (RPC down, timeout) stops here rather than paying for a
@@ -145,6 +150,7 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let tx_hash = if already.is_none() {
         let mut calldata = vec![felt_hex(&handle_felt), keys.scan_pub.clone()];
         calldata.extend(bytearray_calldata(&ek));
+        calldata.push(felt_hex(&m_commit));
         let tx = chain.invoke(&config.store, "register", &calldata, &Default::default())?;
         chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
         Some(tx)
@@ -177,11 +183,14 @@ pub struct Member {
     pub scan_pub: Felt,
     /// Poseidon over the registered ML-KEM key's ByteArray.
     pub kem_digest: Felt,
+    /// poseidon(MEMBER_V3, m): the membership secret's commitment.
+    pub m_commit: Felt,
     pub leaf_index: u32,
 }
 
 impl Member {
-    /// `get_user` returns `(owner, scan_pubkey, kem_digest, leaf_index)`.
+    /// `get_user` returns `(owner, scan_pubkey, kem_digest, m_commit,
+    /// leaf_index)`.
     pub fn parse(user: &[String]) -> Result<Self> {
         let felts: Vec<Felt> =
             user.iter().map(|s| Felt::from_hex(s).context("get_user felt")).collect::<Result<_>>()?;
@@ -189,8 +198,13 @@ impl Member {
     }
 
     pub fn from_felts(user: &[Felt]) -> Result<Self> {
-        ensure!(user.len() == 4, "get_user returned {} felts, expected 4", user.len());
-        Ok(Self { scan_pub: user[1], kem_digest: user[2], leaf_index: u32::try_from(felt_to_u64(&user[3])?).context("leaf index")? })
+        ensure!(user.len() == 5, "get_user returned {} felts, expected 5", user.len());
+        Ok(Self {
+            scan_pub: user[1],
+            kem_digest: user[2],
+            m_commit: user[3],
+            leaf_index: u32::try_from(felt_to_u64(&user[4])?).context("leaf index")?,
+        })
     }
 }
 
@@ -210,13 +224,15 @@ pub struct StoreMigration {
     pub previous_handle: Option<String>,
 }
 
-/// Points a profile at the v2 store. Registration is per store, so the
+/// Points a profile at the v3 store. Registration is per store, so the
 /// handle and leaf index are cleared and the user registers again; the
-/// profile gets its ML-KEM seed now if it predates v2. The scan key is kept.
+/// profile gets its ML-KEM seed now if it predates v2, and a FRESH
+/// membership secret (one per identity per store, never reused). The scan
+/// key is kept.
 /// Refused while a send is incomplete: its proof is bound to the old store.
 pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
     let mut config = home.load_config()?;
-    ensure!(!is_v2_store(&config.store), "this profile already uses the v2 store");
+    ensure!(!is_current_store(&config.store), "this profile already uses the v3 store");
     let pending = pending_sends(home)?;
     ensure!(
         pending.is_empty(),
@@ -235,8 +251,9 @@ pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
     if keys.kem_seed.is_none() {
         keys.kem_seed = Some(crate::config::kem_seed_hex(&crate::crypto::kem_seed_gen()));
     }
+    keys.member_secret = Some(crate::config::member_secret_hex(&crate::crypto::member_secret_gen()));
     home.update_keys(&keys)?;
-    config.store = crate::config::SEPOLIA_STORE_V2.to_string();
+    config.store = crate::config::SEPOLIA_STORE_V3.to_string();
     home.save_config(&config)?;
     // The cached inbox belongs to the old store.
     let _ = std::fs::remove_file(home.inbox_cache_path());
@@ -246,7 +263,7 @@ pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
 /// Whether `config` points at the store this client reads and writes (v2).
 /// Anything else needs `migrate_store` first.
 pub fn on_current_store(config: &Config) -> bool {
-    is_v2_store(&config.store)
+    is_current_store(&config.store)
 }
 
 /// A fresh send, end to end: prepare, prove and publish in one call,
@@ -320,7 +337,7 @@ mod tests {
     use super::*;
     #[test]
     fn recognises_the_unknown_handle_revert() {
-        // Verbatim from sncast 0.61 against the v2 store, 2026-10-01.
+        // Verbatim from sncast 0.61 against the v3 store, 2026-10-01.
         assert!(is_unknown_handle(
             r#"sncast error: "An error occurred in the called contract = ContractErrorData { revert_error: Message(\"0x756e6b6e6f776e2068616e646c65\") }""#
         ));
@@ -350,6 +367,7 @@ mod tests {
             handle: Some("carol".into()),
             leaf_index: Some(0),
             kem_seed: None,
+            member_secret: None,
         })
         .unwrap();
 
@@ -357,10 +375,11 @@ mod tests {
         assert_eq!(m.previous_handle.as_deref(), Some("carol"));
         assert_eq!(m.previous_store, OLD_STORE);
         let keys = home.load_keys().unwrap();
-        assert_eq!((keys.handle, keys.leaf_index), (None, None));
+        assert_eq!((keys.handle.as_deref(), keys.leaf_index), (None, None));
         assert_eq!(keys.scan_priv, "0x5", "the scan key survives");
         assert!(keys.kem_seed.is_some());
-        assert!(is_v2_store(&home.load_config().unwrap().store));
+        assert!(keys.member_secret_felt().is_ok(), "a fresh membership secret for the new store");
+        assert!(is_current_store(&home.load_config().unwrap().store));
         // Twice is refused.
         assert!(migrate_store(&home).is_err());
         std::fs::remove_dir_all(&dir).unwrap();

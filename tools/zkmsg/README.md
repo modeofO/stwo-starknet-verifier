@@ -44,7 +44,25 @@ the publish hash is recorded the moment the gateway accepts it, so
 `zkmsg resume <id>` polls that hash before it would ever resubmit. A send
 that fails before proving has nothing to resume — send it again.
 
-## v2: post-quantum key exchange (the default store, 2026-10-01)
+## v3: post-quantum membership (the current store, 2026-10-01)
+
+`MessageStoreV3` (`docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`)
+makes the sender's membership proof hash-only. Each identity holds a
+membership secret `m` (`keys.json` `member_secret`, `0x` + 64 hex, < 2^251,
+never 0 — the SEND credential, irreplaceable like the other keys). The
+leaf commits to `poseidon(MEMBER_V3, m)` beside the scan pubkey and the
+ML-KEM digest, and `prove_send` proves knowledge of `m` under the root:
+no elliptic-curve step, so the membership argument rests on Poseidon
+alone. The scan private key is no longer a proving input; it only opens
+mail. Content and recipient detection are v2's hybrid ML-KEM + ECDH,
+unchanged.
+
+`m` is minted on `init`, and fresh for every store a profile moves to
+(`zkmsg migrate-store`, which v2 profiles need: registration is per
+store). It is never re-minted for a profile that already holds a handle.
+Only the v3 store is read.
+
+## v2: post-quantum key exchange (2026-10-01)
 
 Fresh profiles use `MessageStoreV2PQ`
 (`docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`): the
@@ -57,8 +75,7 @@ reads it from the `UserRegistered` event and checks it against the
 store's `kem_digest`. The zk statement now proves only the sender's
 membership; the recipient finds its mail by recomputing the hybrid tag.
 
-The v2 store is the only one this client reads or writes: MessageStore v3
-and the SNIP-36 v1 store are no longer read (`inbox --legacy` is gone).
+(v2 was then the only store read; v3 has since replaced it, see above.)
 Older profiles move with `zkmsg migrate-store [<profile>]` (or the Status
 tab's "Move to v2 store…"): it rewrites `config.json`, clears the handle
 and leaf index (registration is per store), keeps the scan key, and you

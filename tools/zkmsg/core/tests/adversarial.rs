@@ -287,23 +287,23 @@ fn shared_secret_is_nondegenerate() {
 // `#[ignore]` by default: needs network. Run with:
 //     cargo test -p zkmsg-core --test adversarial -- --ignored live_
 //
-// Proves the deployed v2 store is what the client trusts: it is pinned to the
+// Proves the deployed current store is what the client trusts: it is pinned to the
 // prover contract whose virtual execution the client proves. A store pinned
 // elsewhere would accept proofs of some other statement.
 
 #[test]
 #[ignore = "hits Sepolia; run with --ignored"]
-fn live_v2_store_is_pinned_to_our_prover() {
+fn live_current_store_is_pinned_to_our_prover() {
     use serde_json::json;
     use zkmsg_core::chain::{snkeccak, Chain};
-    use zkmsg_core::config::{SEPOLIA_PROVER_RPC, SEPOLIA_STORE_V2, SEPOLIA_V2_SEND_PROVER};
+    use zkmsg_core::config::{SEPOLIA_PROVER_RPC, SEPOLIA_STORE_V3, SEPOLIA_V3_SEND_PROVER};
 
     let chain = Chain::new(SEPOLIA_PROVER_RPC, "unused-for-read-only");
     let result = chain
         .rpc(
             "starknet_call",
             json!([
-                { "contract_address": SEPOLIA_STORE_V2,
+                { "contract_address": SEPOLIA_STORE_V3,
                   "entry_point_selector": format!("{:#x}", snkeccak("prover")),
                   "calldata": [] },
                 "latest"
@@ -311,5 +311,5 @@ fn live_v2_store_is_pinned_to_our_prover() {
         )
         .unwrap_or_else(|e| panic!("live call prover() failed: {e}"));
     let prover = Felt::from_hex(result[0].as_str().unwrap()).unwrap();
-    assert_eq!(prover, Felt::from_hex(SEPOLIA_V2_SEND_PROVER).unwrap(), "store re-pinned");
+    assert_eq!(prover, Felt::from_hex(SEPOLIA_V3_SEND_PROVER).unwrap(), "store re-pinned");
 }
