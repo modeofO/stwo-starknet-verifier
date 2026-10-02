@@ -236,8 +236,7 @@ pub fn spawn_inbox(home_dir: PathBuf, ctx: egui::Context) -> Receiver<InboxWorke
             let config = home.load_config().map_err(|e| format!("{e:#}"))?;
             let keys = home.load_keys().map_err(|e| format!("{e:#}"))?;
             let chain = Chain::new(&config.rpc_url, &config.account);
-            let scan_priv = keys.scan_priv_felt().map_err(|e| format!("{e:#}"))?;
-            inbox::scan(&chain, &config.store, &scan_priv).map_err(|e| format!("{e:#}"))
+            inbox::scan_with_keys(&chain, &config.store, &keys).map_err(|e| format!("{e:#}"))
         })();
         let _ = tx.send(InboxWorkerMsg::Scan(result));
         ctx.request_repaint();

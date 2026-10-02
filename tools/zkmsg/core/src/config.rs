@@ -32,8 +32,42 @@ pub const SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK: u64 = 15_850_710;
 pub const SEPOLIA_SNIP36_SEND_PROVER: &str =
     "0x012b85a4b5e6918eb6f18a07fddc1667d67beaac0ab647928105b8ccf7ee5346";
 
+/// MessageStoreV2PQ (contracts/messagezk_store_pq), deployed 2026-10-01
+/// (docs/zkmsg-deployment.md): hybrid ML-KEM-768 + ECDH, recipient check out
+/// of the zk statement, leaf = poseidon(LEAF_V2, scan_pub, kem_digest).
+/// Registration carries the 1184-byte ML-KEM encapsulation key.
+pub const SEPOLIA_STORE_V2: &str =
+    "0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8";
+pub const SEPOLIA_STORE_V2_DEPLOY_BLOCK: u64 = 15_947_092;
+/// ZkmsgSendProverV2 — the v2 store's pinned virtual-OS prover contract.
+pub const SEPOLIA_V2_SEND_PROVER: &str =
+    "0x02d993bd9e1229367fe9643151fdb7b2fb9fe06b28e6ff0d2f1d451894182d79";
+
 /// The store a fresh profile is configured with.
-pub const SEPOLIA_STORE_DEFAULT: &str = SEPOLIA_STORE_SNIP36;
+pub const SEPOLIA_STORE_DEFAULT: &str = SEPOLIA_STORE_V2;
+
+/// What a store address is, as far as this client knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreKind {
+    /// MessageStore v3: lane-1 fact registry.
+    V3,
+    /// MessageStoreSnip36: SNIP-36, ECDH only.
+    Snip36V1,
+    /// MessageStoreV2PQ: SNIP-36, hybrid ML-KEM + ECDH.
+    V2,
+}
+
+pub fn store_kind(store: &str) -> Option<StoreKind> {
+    if same_address(store, SEPOLIA_STORE_V2) {
+        Some(StoreKind::V2)
+    } else if same_address(store, SEPOLIA_STORE_SNIP36) {
+        Some(StoreKind::Snip36V1)
+    } else if same_address(store, SEPOLIA_STORE_V3) {
+        Some(StoreKind::V3)
+    } else {
+        None
+    }
+}
 
 /// Address equality as felts (tolerates leading zeros / case).
 pub fn same_address(a: &str, b: &str) -> bool {
@@ -46,19 +80,18 @@ pub fn same_address(a: &str, b: &str) -> bool {
 /// First block worth scanning for `store`'s events: the deploy block of a
 /// known store, else 0. From-genesis getEvents 500s on publicnode.
 pub fn store_deploy_block(store: &str) -> u64 {
-    if same_address(store, SEPOLIA_STORE_SNIP36) {
-        SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK
-    } else if same_address(store, SEPOLIA_STORE_V3) {
-        SEPOLIA_STORE_V3_DEPLOY_BLOCK
-    } else {
-        0
+    match store_kind(store) {
+        Some(StoreKind::V2) => SEPOLIA_STORE_V2_DEPLOY_BLOCK,
+        Some(StoreKind::Snip36V1) => SEPOLIA_STORE_SNIP36_DEPLOY_BLOCK,
+        Some(StoreKind::V3) => SEPOLIA_STORE_V3_DEPLOY_BLOCK,
+        None => 0,
     }
 }
 
-/// Whether `store` is the SNIP-36 store (its `send_message` needs
+/// Whether `store` is a SNIP-36 store (its `send_message` needs
 /// proof_facts the lane-1 pipeline cannot produce).
 pub fn is_snip36_store(store: &str) -> bool {
-    same_address(store, SEPOLIA_STORE_SNIP36)
+    matches!(store_kind(store), Some(StoreKind::Snip36V1 | StoreKind::V2))
 }
 
 /// Refuses a desktop send against the SNIP-36 store with a pointer to the
@@ -166,9 +199,30 @@ pub struct Keys {
     pub scan_pub: String,
     pub handle: Option<String>,
     pub leaf_index: Option<u32>,
+    /// ML-KEM-768 seed `d ‖ z`, 64 bytes as `0x` + 128 hex digits (the
+    /// scan key's style; zkmsg-ios `zkmsgtool` reads it, with or without the
+    /// prefix, to carry it into a phone backup) — the v2 store's second
+    /// recipient key. Generated on `init`, and added to older profiles the
+    /// first time a v2 operation needs it (`Home::ensure_kem_seed`). Like the
+    /// scan key, losing it loses the v2 inbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_seed: Option<String>,
 }
 
 impl Keys {
+    pub fn kem_seed_bytes(&self) -> Result<[u8; crate::crypto::KEM_SEED_LEN]> {
+        let hex = self.kem_seed.as_deref().context("keys.json has no kem_seed")?;
+        hex::decode(hex.trim_start_matches("0x"))
+            .context("keys.json kem_seed hex")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("keys.json kem_seed is not 64 bytes"))
+    }
+
+    /// `(dk, ek)` from the stored seed.
+    pub fn kem_keypair(&self) -> Result<(ml_kem::DecapsulationKey768, Vec<u8>)> {
+        Ok(crate::crypto::kem_keygen_from_seed(&self.kem_seed_bytes()?))
+    }
+
     pub fn scan_priv_felt(&self) -> Result<Felt> {
         Felt::from_hex(&self.scan_priv).context("keys.json scan_priv")
     }
@@ -176,6 +230,11 @@ impl Keys {
     pub fn scan_pub_felt(&self) -> Result<Felt> {
         Felt::from_hex(&self.scan_pub).context("keys.json scan_pub")
     }
+}
+
+/// The keys.json form of a KEM seed: `0x` + 128 lowercase hex digits.
+pub fn kem_seed_hex(seed: &[u8; crate::crypto::KEM_SEED_LEN]) -> String {
+    format!("0x{}", hex::encode(seed))
 }
 
 pub struct Home {
@@ -242,6 +301,18 @@ impl Home {
         fs::write(self.keys_path(), serde_json::to_string_pretty(keys)?)?;
         Ok(())
     }
+
+    /// Loads keys, adding a fresh ML-KEM seed first if the profile predates
+    /// v2. The seed is written before it is returned, so a key the chain
+    /// might learn (via `register`) is never one that only lived in memory.
+    pub fn ensure_kem_seed(&self) -> Result<Keys> {
+        let mut keys = self.load_keys()?;
+        if keys.kem_seed.is_none() {
+            keys.kem_seed = Some(kem_seed_hex(&crate::crypto::kem_seed_gen()));
+            self.update_keys(&keys)?;
+        }
+        Ok(keys)
+    }
 }
 
 #[cfg(test)]
@@ -258,11 +329,30 @@ mod tests {
             scan_pub: "0x6".into(),
             handle: None,
             leaf_index: None,
+            kem_seed: None,
         };
         home.save_new_keys(&keys).unwrap();
         assert!(home.save_new_keys(&keys).is_err());
         let loaded = home.load_keys().unwrap();
         assert_eq!(loaded.scan_priv, "0x5");
+
+        // An older profile gains a KEM seed once, and keeps it.
+        assert!(loaded.kem_seed.is_none());
+        let seeded = home.ensure_kem_seed().unwrap();
+        assert_eq!(seeded.kem_seed_bytes().unwrap().len(), 64);
+        let stored = seeded.kem_seed.as_deref().unwrap();
+        assert!(stored.starts_with("0x") && stored.len() == 130, "pinned format: {stored}");
+        // Read with or without the prefix.
+        let bare = Keys { kem_seed: Some(stored[2..].to_string()), ..home.load_keys().unwrap() };
+        assert_eq!(bare.kem_seed_bytes().unwrap(), seeded.kem_seed_bytes().unwrap());
+        assert_eq!(home.ensure_kem_seed().unwrap().kem_seed, seeded.kem_seed);
+        assert_eq!(home.load_keys().unwrap().kem_seed, seeded.kem_seed);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(home.keys_path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "rewriting keys.json keeps it owner-only");
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -310,7 +400,10 @@ mod tests {
 
     #[test]
     fn store_routing() {
-        assert_eq!(Config::default_sepolia(Path::new("/r")).store, SEPOLIA_STORE_SNIP36);
+        assert_eq!(Config::default_sepolia(Path::new("/r")).store, SEPOLIA_STORE_V2);
+        assert_eq!(store_kind(SEPOLIA_STORE_V2), Some(StoreKind::V2));
+        assert_eq!(store_deploy_block(SEPOLIA_STORE_V2), SEPOLIA_STORE_V2_DEPLOY_BLOCK);
+        assert!(is_snip36_store(SEPOLIA_STORE_V2));
         // Leading-zero / case differences still match.
         assert_eq!(
             store_deploy_block("0x2B9C6F617B3197DFED76401C32AA3B4B597EBDD01A7EBA4B5657236BC8084F"),

@@ -45,9 +45,33 @@ transactions. Two pre-spend gates abort BEFORE any money moves if the
 proof doesn't carry exactly the expected public tuple or the wrap's
 inner circuit root drifts from the pinned route.
 
-## SNIP-36 sends (the default store, 2026-10-01)
+## v2: post-quantum key exchange (the default store, 2026-10-01)
 
-Fresh profiles use `MessageStoreSnip36`, where a send is **one
+Fresh profiles use `MessageStoreV2PQ`
+(`docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`): the
+content key and the recipient tag come from ML-KEM-768 **and** Stark-curve
+ECDH, so a future quantum attacker who records today's chain still needs
+to break ML-KEM. `keys.json` gains `kem_seed` (64 bytes, `0x` hex; made
+on `init`, or on first v2 use for an older profile — irreplaceable, like
+the scan key). Registering publishes the 1184-byte ML-KEM key; a sender
+reads it from the `UserRegistered` event and checks it against the
+store's `kem_digest`. The zk statement now proves only the sender's
+membership; the recipient finds its mail by recomputing the hybrid tag.
+
+Older profiles move with `zkmsg migrate-store [<profile>]` (or the Status
+tab's "Move to v2 store…"): it rewrites `config.json`, clears the handle
+and leaf index (registration is per store), keeps the scan key, and you
+`zkmsg register <handle>` again.
+
+First desktop v2 run, 2026-10-01: carol registered at leaf 1
+(`0x03e1ddad…bbb7`, 0.18 STRK) and sent to `mode`
+(`0x452a95d9…592b`, **32 s wall, prove 16 s, 1.60 STRK**, 77.6M L2 gas;
+content 1,179 bytes = kem_ct 1088 ‖ AES-GCM blob). `mode`'s desktop
+inbox decrypts it; carol's own inbox does not.
+
+## SNIP-36 sends
+
+SNIP-36 stores (v2, and the v1 store before it), where a send is **one
 transaction**: the zkmsg statement runs inside StarkWare's virtual
 Starknet OS (contract `ZkmsgSendProver`, executed only here), the S-two
 proof of that run rides in the invoke's `proof` field, and the sequencer

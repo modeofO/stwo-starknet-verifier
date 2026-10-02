@@ -89,6 +89,13 @@ enum Command {
     },
     /// Config, balance, projected cost, deployed addresses.
     Status,
+    /// Point a profile at the v2 (post-quantum) store. Registration is per
+    /// store: the handle is cleared and you register again. The scan key is
+    /// kept; an ML-KEM key is added if the profile predates v2.
+    MigrateStore {
+        /// Profile name under the profile root (default: the current one).
+        profile: Option<String>,
+    },
     /// Internal: write the milestone-1 synthetic-tree args file.
     #[command(hide = true, name = "dev-args")]
     DevArgs { out: PathBuf },
@@ -96,6 +103,11 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::MigrateStore { profile: Some(name) } = &cli.command {
+        let dir = cli.home_dir().join(format!("{}{name}", zkmsg_core::profiles::PROFILE_PREFIX));
+        ensure!(dir.join("config.json").exists(), "no profile '{name}' at {}", dir.display());
+        return cmd_migrate_store(&Home::new(dir));
+    }
     let dir = zkmsg_core::profiles::resolve_cli_home(&cli.home_dir())?;
     let home = Home::new(dir);
 
@@ -106,6 +118,7 @@ fn main() -> Result<()> {
         Command::Resume { id } => cmd_resume(&home, &id),
         Command::Inbox { legacy } => cmd_inbox(&home, legacy),
         Command::Status => cmd_status(&home),
+        Command::MigrateStore { .. } => cmd_migrate_store(&home),
         Command::DevArgs { out } => cmd_dev_args(&out),
     }
 }
@@ -237,7 +250,7 @@ fn cmd_inbox(home: &Home, legacy: bool) -> Result<()> {
             println!("-- home store --");
         }
     }
-    messages.extend(inbox::scan(&chain, &config.store, &scan_priv)?);
+    messages.extend(inbox::scan_with_keys(&chain, &config.store, &keys)?);
     if messages.is_empty() {
         println!("inbox empty (no envelopes match your scan key)");
         return Ok(());
@@ -249,6 +262,16 @@ fn cmd_inbox(home: &Home, legacy: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_migrate_store(home: &Home) -> Result<()> {
+    let m = app::migrate_store(home)?;
+    println!("{}: store {} -> {}", home.dir.display(), m.previous_store, zkmsg_core::config::SEPOLIA_STORE_V2);
+    match m.previous_handle {
+        Some(h) => println!("registration is per store — run `zkmsg register {h}` to register again"),
+        None => println!("registration is per store — run `zkmsg register <handle>`"),
+    }
+    Ok(())
+}
+
 fn cmd_status(home: &Home) -> Result<()> {
     let report = app::status(home)?;
 
@@ -257,8 +280,10 @@ fn cmd_status(home: &Home) -> Result<()> {
     println!("registry : {} (live lane-1)", report.registry);
     let route = if report.store.is_empty() {
         ""
+    } else if zkmsg_core::config::store_kind(&report.store) == Some(zkmsg_core::config::StoreKind::V2) {
+        " (v2: hybrid ML-KEM + ECDH, SNIP-36 sends)"
     } else if zkmsg_core::config::is_snip36_store(&report.store) {
-        " (SNIP-36, one-transaction sends)"
+        " (SNIP-36 v1 — `zkmsg migrate-store` moves to v2)"
     } else if zkmsg_core::config::same_address(&report.store, zkmsg_core::config::SEPOLIA_STORE_V3) {
         " (legacy v3, lane-1)"
     } else {
