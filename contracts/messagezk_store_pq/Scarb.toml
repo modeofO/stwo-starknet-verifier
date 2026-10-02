@@ -1,0 +1,29 @@
+[package]
+license = "Apache-2.0"
+name = "messagezk_store_pq"
+version = "0.1.0"
+edition = "2024_07"
+
+# zkmsg v2 on the SNIP-36 route (docs/superpowers/specs/
+# 2026-10-01-zkmsg-pq-hybrid-kem-design.md). ../messagezk_store_snip36 with a
+# hybrid ML-KEM-768 + ECDH key exchange: every identity registers an ML-KEM
+# encapsulation key, the leaf binds it, and the recipient check leaves the zk
+# statement (the prover proves sender membership only). Same one-transaction
+# send, same proof-facts binding; src/merkle.cairo is a verbatim copy.
+
+[dependencies]
+starknet = "2.18.0"
+
+[[target.starknet-contract]]
+sierra = true
+allowed-libfuncs-list.name = "audited"
+
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
