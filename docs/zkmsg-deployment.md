@@ -199,3 +199,32 @@ Total 10.83 STRK. Checked after deploy: `prover()` returns the prover
 address, the root is 0, and `n_messages` is 0. No users are registered yet.
 Every identity must register again with `register(handle, scan_pubkey,
 kem_pubkey)`; the v1 store (`0x002b9c6f…8084f`) is no longer read.
+
+### First v2 send (Mac prove, 2026-10-01)
+
+Test identity `mode`: scan key from the desktop `.zkmsg-mode` keys, a fresh
+ML-KEM seed, registered from `deployer` at leaf 0. The register tx
+`0x02d8e350e7662c8dcc58e4158d8d1c88498b06053e9192d34750c0d5310e4a0c` cost
+0.36 STRK and 17.6M L2 gas. `get_user('mode')` returns the same
+`kem_digest` as the client computes from the `ek` in the event.
+
+The message went from `mode` to itself, built with
+`cargo run -p zkmsg-core --example v2_cli -- send`. It was proved with
+snip36-phone-ffi's `prove_cli` on the Mac and published with `snip36 submit`:
+
+| | v2 | v1 (2026-09-29) |
+|---|---|---|
+| virtual OS steps | 142,905 (ec_op 4, poseidon 151) | ~148k |
+| Mac prove wall | 19 s (precompute 1.2 s + run and prove 16.9 s), footprint 335 MB, spill 13.8 GB | 15–16 s |
+| publish tx | `0x135dec2b9689f390761d086a5b750e74468385c8287c9fcdec12dfd9d17612b`, SUCCEEDED | |
+| fee | 1.60 STRK, 78.0M L2 gas, 384 L1 data gas | 1.60 STRK, 77M L2 gas |
+| content | 1,167 bytes (kem_ct 1088 ‖ nonce 12 ‖ 51 ‖ tag 16) | |
+
+`v2_cli open` with `mode`'s keys decrypts the event. A different scan key
+gives "not ours". The proof's facts are pinned in
+`contracts/messagezk_store_pq/tests/mac_proof.cairo`.
+
+The v1 prover's ~148k steps already included two Merkle paths and an ECDH.
+Dropping one path and the ECDH saves only ~5k steps, because the virtual
+OS's fixed cost dominates. The fee is the same, so the extra 1088 bytes of
+`kem_ct` are negligible.
