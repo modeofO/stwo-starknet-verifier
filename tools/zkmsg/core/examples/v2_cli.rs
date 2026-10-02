@@ -4,6 +4,7 @@
 //!     v2_cli register <keys.json>                     -> register calldata
 //!     v2_cli send <keys.json> <send.json>             -> prove + publish calldata
 //!     v2_cli open <keys.json> <event.json>            -> plaintext or "not ours"
+//!     v2_cli digest <ek_hex_file>                     -> kem_digest of an ek
 //!
 //! keys.json: {"scan_priv", "kem_seed_hex", "handle"}.
 //! send.json: {"store", "prover", "merkle_root", "leaf_index", "path": [20],
@@ -129,6 +130,10 @@ fn main() {
                 Some(Ok(text)) => json!({ "ours": true, "text": String::from_utf8_lossy(&text) }),
                 Some(Err(e)) => json!({ "ours": true, "error": e.to_string() }),
             }
+        }
+        "digest" => {
+            let ek = hex::decode(std::fs::read_to_string(&args[2]).unwrap().trim()).unwrap();
+            json!({ "len": ek.len(), "kem_digest": felt_hex(&kem_digest(&ek)) })
         }
         other => panic!("unknown command {other}"),
     };

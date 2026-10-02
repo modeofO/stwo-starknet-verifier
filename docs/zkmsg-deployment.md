@@ -228,3 +228,21 @@ The v1 prover's ~148k steps already included two Merkle paths and an ECDH.
 Dropping one path and the ECDH saves only ~5k steps, because the virtual
 OS's fixed cost dominates. The fee is the same, so the extra 1088 bytes of
 `kem_ct` are negligible.
+
+### First phone v2 registration and send (iPhone 14 Pro, 2026-10-01)
+
+zkmsg-ios `pq-v2` at 332fbf4. The phone's original profile kept its scan
+key and gained a KEM seed on launch.
+
+| | tx | result |
+|---|---|---|
+| register `mode2` (leaf 2) from the phone's own account | `0x4ab780bcff07a5d60d81c6801242db16b777df0d73a4f63faabe18652fd4c95` | 0.185 STRK, 9.15M L2 gas, 2,368 data gas. The event ek's digest (`v2_cli digest`) equals the stored `kem_digest` |
+| desktop `carol` → `mode2` | `0x757d2f311f088aac984372a91e23152239f2dadfc11682439337154770099e3` | 1.559 STRK, 77.6M L2 gas. The phone Inbox decrypts it |
+| phone `mode2` → `carol` | `0x1c6f7006110ed5ca4623d9c40ea7edf77af953597766e07b2326a363ec57e5b` | 1.554 STRK, 77.5M L2 gas, 352 data gas. carol's desktop inbox decrypts "new store test 21:11" |
+
+Phone send: proved against block 15950141 and published in block 15950293.
+The chain time between those two blocks is 261 s, which covers prove and
+publish; the virtual OS ran at the prepare block. The proof was 317,092
+base64 bytes. The prove note reads "spill class A". The content was 1,136
+bytes. The publish transaction was signed and saved before the POST
+(nonce 0x8), per the double-pay fix.
