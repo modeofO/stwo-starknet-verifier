@@ -43,6 +43,10 @@ pub enum PipelineEvent {
     TxSubmitted { kind: StepKind, tx_hash: String },
     StepCompleted { kind: StepKind, tx_hash: Option<String>, note: Option<String> },
     Completed { fact: Option<String> },
+    /// The send's state was first written to disk under `id`; from here on it
+    /// can be resumed. A lane-1 plan is saved before it runs, so only the
+    /// SNIP-36 route (saved once its proof exists) emits this.
+    Checkpointed { id: String },
 }
 
 /// Emits a StepStarted for each still-pending step without executing —
@@ -90,6 +94,11 @@ impl<'a> Pipeline<'a> {
         sink: &mut dyn FnMut(PipelineEvent),
     ) -> Result<()> {
         crate::config::ensure_lane1_send_store(&self.config.store)?;
+        ensure!(
+            !state.is_virtual(),
+            "send '{}' is a SNIP-36 send; the lane-1 pipeline does not adopt it",
+            state.id
+        );
         fs::create_dir_all(self.workdir(state))?;
         while let Some(index) = state.next_pending() {
             let kind = state.steps[index].kind.clone();
@@ -120,6 +129,7 @@ impl<'a> Pipeline<'a> {
             StepKind::Phase1 => self.step_phase1(state),
             StepKind::Phase2 => self.step_phase2(state),
             StepKind::SendMessage => self.step_send(state),
+            StepKind::Prepare | StepKind::Publish => bail!("{kind:?} is a SNIP-36 step"),
         }
     }
 

@@ -41,6 +41,17 @@ PATH=$PWD/../sequencer_venv/bin:$PATH RUSTC_WRAPPER= \
 simulator build: `tikv-jemalloc-sys` fails to configure for
 `aarch64-apple-ios-sim`.
 
+Desktop: the `snip36-prove` binary (`src/bin/snip36-prove.rs`) is the same code
+path for zkmsg-core's SNIP-36 send, run as a subprocess. It reads the request on
+stdin (the virtual transaction's calldata is the send's witness, so it never
+touches disk) and writes the result to the path it's given:
+
+```sh
+cd .prover/sequencer
+PATH=$PWD/../sequencer_venv/bin:$PATH RUSTC_WRAPPER= \
+  cargo +nightly-2026-01-15 build --release -p snip36_phone_ffi --bin snip36-prove
+```
+
 Check before a device run: `cargo run --release -p snip36_phone_ffi --example
 prove_cli <request.json> <out>` on the Mac produces a proof byte-identical to
 StarkWare's prebuilt prover for the same request (verified 2026-09-29); the

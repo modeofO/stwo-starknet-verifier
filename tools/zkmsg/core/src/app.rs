@@ -206,6 +206,41 @@ pub fn prepare_send(
     Ok(send_state)
 }
 
+/// Whether sends on `config`'s store go through SNIP-36 (one transaction,
+/// virtual-OS proof) rather than the lane-1 fact-registry pipeline.
+pub fn uses_virtual_route(config: &Config) -> bool {
+    crate::config::is_snip36_store(&config.store)
+}
+
+/// A fresh SNIP-36 send, end to end. The lane-1 counterpart is
+/// `prepare_send` + `Pipeline::run`; this one can't be split the same way,
+/// because the witness it prepares is never written down.
+pub fn send_virtual(
+    home: &Home,
+    config: &Config,
+    keys: &Keys,
+    handle: &str,
+    text: &str,
+    sink: &mut dyn FnMut(crate::pipeline::PipelineEvent),
+) -> Result<SendState> {
+    crate::virtual_send::VirtualSender::new(home, config)?.send(keys, handle, text, sink)
+}
+
+/// Resumes a saved send on whichever route made it. Neither route adopts the
+/// other's state.
+pub fn resume_send(
+    home: &Home,
+    config: &Config,
+    state: &mut SendState,
+    sink: &mut dyn FnMut(crate::pipeline::PipelineEvent),
+) -> Result<()> {
+    if state.is_virtual() {
+        crate::virtual_send::VirtualSender::new(home, config)?.resume(state, sink)
+    } else {
+        crate::pipeline::Pipeline::new(home, config).run(state, sink)
+    }
+}
+
 /// Incomplete sends under `home` — id + the kind of their next pending
 /// step, for a resume banner / list.
 pub fn pending_sends(home: &Home) -> Result<Vec<(String, StepKind)>> {

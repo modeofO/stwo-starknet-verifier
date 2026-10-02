@@ -15,7 +15,7 @@ use zkmsg_core::app::{self, RegisterOutcome, StatusReport};
 use zkmsg_core::chain::Chain;
 use zkmsg_core::config::{Config, Home};
 use zkmsg_core::inbox::{self, ReceivedMessage};
-use zkmsg_core::pipeline::{Pipeline, PipelineEvent};
+use zkmsg_core::pipeline::PipelineEvent;
 use zkmsg_core::setup::{SetupEvent, SetupRunner, SetupState};
 use zkmsg_core::state::SendState;
 
@@ -80,8 +80,9 @@ pub fn spawn_setup(
     rx
 }
 
-/// Runs (or resumes) a send on a worker thread; the returned receiver
-/// yields progress until Done. `ctx` is repainted on each message.
+/// Runs (or resumes) a saved send on a worker thread, on whichever route
+/// made it; the returned receiver yields progress until Done. `ctx` is
+/// repainted on each message.
 pub fn spawn_send(
     home: Home, config: Config, mut state: SendState, ctx: egui::Context,
 ) -> Receiver<WorkerMsg> {
@@ -93,7 +94,32 @@ pub fn spawn_send(
             let _ = tx2.send(WorkerMsg::Progress(e));
             ctx2.request_repaint();
         };
-        let result = Pipeline::new(&home, &config).run(&mut state, &mut sink);
+        let result = app::resume_send(&home, &config, &mut state, &mut sink);
+        let _ = tx.send(WorkerMsg::Done(result.map_err(|e| format!("{e:#}"))));
+        ctx.request_repaint();
+    });
+    rx
+}
+
+/// A fresh SNIP-36 send — prepare, prove and publish in one worker, because
+/// the witness Prepare builds lives in memory only until Prove consumes it.
+pub fn spawn_virtual_send(
+    home_dir: PathBuf, handle: String, text: String, ctx: egui::Context,
+) -> Receiver<WorkerMsg> {
+    let (tx, rx): (Sender<WorkerMsg>, Receiver<WorkerMsg>) = channel();
+    thread::spawn(move || {
+        let tx2 = tx.clone();
+        let ctx2 = ctx.clone();
+        let mut sink = move |e: PipelineEvent| {
+            let _ = tx2.send(WorkerMsg::Progress(e));
+            ctx2.request_repaint();
+        };
+        let home = Home::new(home_dir);
+        let result = (|| {
+            let config = home.load_config()?;
+            let keys = home.load_keys()?;
+            app::send_virtual(&home, &config, &keys, &handle, &text, &mut sink).map(|_| ())
+        })();
         let _ = tx.send(WorkerMsg::Done(result.map_err(|e| format!("{e:#}"))));
         ctx.request_repaint();
     });

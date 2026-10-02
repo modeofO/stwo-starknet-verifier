@@ -77,6 +77,9 @@ pub fn ensure_lane1_send_store(store: &str) -> Result<()> {
     Ok(())
 }
 pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.com";
+/// Serves `starknet_getStorageProof` for recent blocks (refuses blocks older
+/// than ~6 minutes), which the virtual-OS prover needs.
+pub const SEPOLIA_PROVER_RPC: &str = "https://api.zan.top/public/starknet-sepolia/rpc/v0_10";
 
 /// STRK token (same address on Sepolia and mainnet) — the fee/transfer
 /// token used by the setup wizard's fund step and the status balance read.
@@ -106,6 +109,17 @@ pub struct Config {
     /// Local-only; nothing on-chain marks a burner.
     #[serde(default)]
     pub burner: bool,
+    /// SNIP-36 route: the `snip36-prove` binary (tools/snip36-phone-ffi,
+    /// built from the sequencer workspace). Absent in configs older than the
+    /// route; `virtual_prover_bin()` names the default then.
+    #[serde(default)]
+    pub virtual_prover_bin: Option<PathBuf>,
+    /// SNIP-36 route: the RPC every read of a virtual send goes through, and
+    /// the one the prover fetches state from. It must serve
+    /// `starknet_getStorageProof` for recent blocks (zan does, publicnode
+    /// doesn't). Absent: `SEPOLIA_PROVER_RPC`.
+    #[serde(default)]
+    pub prover_rpc_url: Option<String>,
 }
 
 impl Config {
@@ -120,8 +134,30 @@ impl Config {
             circuit_executable: repo_root
                 .join("fixtures/target/dev/messagezk_scan.executable.json"),
             burner: false,
+            virtual_prover_bin: Some(default_virtual_prover_bin(repo_root)),
+            prover_rpc_url: None,
         }
     }
+
+    /// The `snip36-prove` binary: the configured one, else the default build
+    /// location beside the lane-1 bridge (both live under the repo's
+    /// gitignored `.prover/`).
+    pub fn virtual_prover_bin(&self) -> PathBuf {
+        if let Some(bin) = &self.virtual_prover_bin {
+            return bin.clone();
+        }
+        // bridge_bin = <repo>/.prover/proving-utils/target/release/<bin>
+        let repo_root = self.bridge_bin.ancestors().nth(5).unwrap_or(Path::new("."));
+        default_virtual_prover_bin(repo_root)
+    }
+
+    pub fn prover_rpc_url(&self) -> &str {
+        self.prover_rpc_url.as_deref().unwrap_or(SEPOLIA_PROVER_RPC)
+    }
+}
+
+fn default_virtual_prover_bin(repo_root: &Path) -> PathBuf {
+    repo_root.join(".prover/sequencer/target/release/snip36-prove")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -254,6 +290,22 @@ mod tests {
         }"#;
         let c: Config = serde_json::from_str(old).unwrap();
         assert!(c.burner);
+    }
+
+    #[test]
+    fn prover_bin_defaults_beside_the_bridge() {
+        let c = Config::default_sepolia(Path::new("/repo"));
+        assert_eq!(
+            c.virtual_prover_bin(),
+            PathBuf::from("/repo/.prover/sequencer/target/release/snip36-prove")
+        );
+        // An older config without the key derives the same path.
+        let old = Config { virtual_prover_bin: None, ..c };
+        assert_eq!(
+            old.virtual_prover_bin(),
+            PathBuf::from("/repo/.prover/sequencer/target/release/snip36-prove")
+        );
+        assert_eq!(old.prover_rpc_url(), SEPOLIA_PROVER_RPC);
     }
 
     #[test]

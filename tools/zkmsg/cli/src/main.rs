@@ -2,8 +2,8 @@
 //! locally-proven ZK statement (sender+recipient membership, ephemeral
 //! ECDH, commitment), verified on Starknet Sepolia through the live
 //! `StwoFactRegistry`, then published to MessageStore v3. Fresh profiles
-//! default to the SNIP-36 store (register/inbox/status work; send is
-//! phone-only for now — see config::ensure_lane1_send_store).
+//! default to the SNIP-36 store, where a send is one transaction carrying a
+//! virtual-OS proof (core/src/virtual_send.rs).
 //!
 //! Spec: docs/superpowers/specs/2026-07-05-zkmsg-lane1-port-design.md.
 
@@ -69,9 +69,9 @@ enum Command {
     },
     /// Register a handle on-chain (one tx).
     Register { handle: String },
-    /// Prove + verify + publish a private message (~50 STRK on Sepolia).
-    /// Lane-1 route: only works when the configured store is the legacy v3
-    /// store; the SNIP-36 store is sent to from the phone / `snip36` CLI.
+    /// Prove + publish a private message. SNIP-36 store: one transaction
+    /// (~1.6 STRK; the account must hold ~4 STRK of fee ceiling). Legacy v3
+    /// store: the lane-1 pipeline (~50 STRK).
     Send {
         handle: String,
         text: String,
@@ -142,8 +142,15 @@ fn cmd_send(home: &Home, handle: &str, text: &str, force: bool) -> Result<()> {
     let config = home.load_config()?;
     let keys = home.load_keys()?;
     ensure!(!config.store.is_empty(), "no store address in config.json");
-    zkmsg_core::config::ensure_lane1_send_store(&config.store)?;
     let sender_leaf = keys.leaf_index.context("not registered — run `zkmsg register`")?;
+
+    if app::uses_virtual_route(&config) {
+        // The fee-ceiling check runs inside, against live prices, before
+        // proving; `--force` has nothing to skip here.
+        let state = app::send_virtual(home, &config, &keys, handle, text, &mut virtual_sink())?;
+        println!("send '{}' -> {handle} published", state.id);
+        return Ok(());
+    }
 
     if !force {
         let chain = Chain::new(&config.rpc_url, &config.account);
@@ -163,8 +170,25 @@ fn cmd_resume(home: &Home, id: &str) -> Result<()> {
     let config = home.load_config()?;
     let mut send_state = SendState::load(home, id)?;
     let id = send_state.id.clone();
+    if send_state.is_virtual() {
+        return app::resume_send(home, &config, &mut send_state, &mut virtual_sink());
+    }
     let result = Pipeline::new(home, &config).run(&mut send_state, &mut cli_sink(&id));
     result
+}
+
+/// SNIP-36 progress: the send id is only known once Prepare has built the
+/// commitment, so lines are keyed by step, and the publish hash is printed
+/// the moment the gateway takes it.
+fn virtual_sink() -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) {
+    use zkmsg_core::pipeline::PipelineEvent as E;
+    move |event| match event {
+        E::StepStarted { index, total, kind } => println!("[snip36] step {}/{total}: {kind:?}", index + 1),
+        E::StepCompleted { kind, .. } => println!("[snip36] {kind:?} done"),
+        E::Checkpointed { id } => println!("[snip36] proof saved — resumable as `zkmsg resume {id}`"),
+        E::TxSubmitted { tx_hash, .. } => println!("[snip36] submitted {tx_hash}"),
+        E::Completed { .. } => {}
+    }
 }
 
 fn format_step_line(id: &str, index: usize, total: usize, kind: &zkmsg_core::state::StepKind) -> String {
@@ -187,6 +211,7 @@ fn cli_sink(id: &str) -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) + '_ {
         }
         E::TxSubmitted { .. } => {}
         E::StepCompleted { .. } => {}
+        E::Checkpointed { .. } => {}
         E::Completed { fact } => {
             println!("{}", format_complete_line(id, fact.as_deref()));
         }
@@ -233,7 +258,7 @@ fn cmd_status(home: &Home) -> Result<()> {
     let route = if report.store.is_empty() {
         ""
     } else if zkmsg_core::config::is_snip36_store(&report.store) {
-        " (SNIP-36; desktop send unsupported)"
+        " (SNIP-36, one-transaction sends)"
     } else if zkmsg_core::config::same_address(&report.store, zkmsg_core::config::SEPOLIA_STORE_V3) {
         " (legacy v3, lane-1)"
     } else {
@@ -254,6 +279,9 @@ fn cmd_status(home: &Home) -> Result<()> {
         println!("messages : {n}");
     }
     match report.balance_strk {
+        Some(strk) if zkmsg_core::config::is_snip36_store(&report.store) => {
+            println!("balance  : ~{strk} STRK (a send costs ~1.6; needs ~4 of fee ceiling)")
+        }
         Some(strk) => println!("balance  : ~{strk} STRK (a send costs ~50 at spiky prices)"),
         None => {
             let e = report.balance_error.as_deref().unwrap_or("?");

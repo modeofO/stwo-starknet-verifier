@@ -25,6 +25,12 @@ pub struct SendFlow {
     pub steps: Vec<StepView>,
     pub fact: Option<String>,
     pub error: Option<String>,
+    /// Set by `Completed`. A SNIP-36 send finishes with no fact, so this —
+    /// not `fact` — is what says the message is out.
+    pub published: bool,
+    /// The saved state's id once one exists (`Checkpointed`). A SNIP-36 send
+    /// that fails before its proof is saved has nothing to resume.
+    pub checkpoint: Option<String>,
 }
 
 impl SendFlow {
@@ -38,7 +44,17 @@ impl SendFlow {
                 tx_hash: s.tx_hash.clone(),
             })
             .collect();
-        Self { steps, fact: state.fact.clone(), error: None }
+        let published = !state.steps.is_empty() && state.steps.iter().all(|s| s.done);
+        Self { steps, fact: state.fact.clone(), error: None, published, checkpoint: None }
+    }
+
+    /// The SNIP-36 checklist, before Prepare has produced a state.
+    pub fn virtual_plan() -> Self {
+        let steps = [StepKind::Prepare, StepKind::Prove, StepKind::Publish]
+            .into_iter()
+            .map(|kind| StepView { kind, status: StepStatus::Pending, tx_hash: None })
+            .collect();
+        Self { steps, fact: None, error: None, published: false, checkpoint: None }
     }
 
     /// The first not-yet-Done step matching `kind` — plans can repeat a
@@ -76,7 +92,9 @@ impl SendFlow {
                         step.status = StepStatus::Done;
                     }
                 }
+                self.published = true;
             }
+            PipelineEvent::Checkpointed { id } => self.checkpoint = Some(id),
         }
     }
 
@@ -104,6 +122,8 @@ mod tests {
             ],
             fact: None,
             error: None,
+            published: false,
+            checkpoint: None,
         };
         f.apply(E::StepStarted { index: 0, total: 2, kind: StepKind::Prove });
         assert!(matches!(f.steps[0].status, StepStatus::Running));
@@ -113,6 +133,22 @@ mod tests {
         assert_eq!(f.steps[1].tx_hash.as_deref(), Some("0xabc"));
         f.apply(E::Completed { fact: Some("0xf".into()) });
         assert_eq!(f.fact.as_deref(), Some("0xf"));
+        assert!(f.published);
+    }
+
+    #[test]
+    fn virtual_send_publishes_without_a_fact() {
+        use zkmsg_core::pipeline::PipelineEvent as E;
+        let mut f = SendFlow::virtual_plan();
+        f.apply(E::StepStarted { index: 0, total: 3, kind: StepKind::Prepare });
+        f.apply(E::StepCompleted { kind: StepKind::Prepare, tx_hash: None, note: None });
+        f.apply(E::Checkpointed { id: "abc".into() });
+        assert_eq!(f.checkpoint.as_deref(), Some("abc"));
+        f.apply(E::TxSubmitted { kind: StepKind::Publish, tx_hash: "0x1".into() });
+        assert_eq!(f.steps[2].tx_hash.as_deref(), Some("0x1"));
+        f.apply(E::Completed { fact: None });
+        assert!(f.published);
+        assert!(f.fact.is_none());
     }
 
     #[test]
@@ -126,6 +162,8 @@ mod tests {
             ],
             fact: None,
             error: None,
+            published: false,
+            checkpoint: None,
         };
         f.apply(E::StepStarted { index: 0, total: 2, kind: StepKind::Prove });
         f.fail("bridge prove failed".to_string());

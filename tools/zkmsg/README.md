@@ -45,6 +45,39 @@ transactions. Two pre-spend gates abort BEFORE any money moves if the
 proof doesn't carry exactly the expected public tuple or the wrap's
 inner circuit root drifts from the pinned route.
 
+## SNIP-36 sends (the default store, 2026-10-01)
+
+Fresh profiles use `MessageStoreSnip36`, where a send is **one
+transaction**: the zkmsg statement runs inside StarkWare's virtual
+Starknet OS (contract `ZkmsgSendProver`, executed only here), the S-two
+proof of that run rides in the invoke's `proof` field, and the sequencer
+verifies it natively before `send_message` checks the proof's one L2→L1
+message against the public tuple. No wrap, no staging, no fact registry.
+`core/src/virtual_send.rs` is a port of the phone's
+`VirtualSendExecutor`, rules included: tree/paths/nonce read at one block,
+witness only in memory (it reaches the prover on stdin), facts checked
+before signing, `is_known_root` before publish, the publish hash saved the
+moment the gateway takes it.
+
+Needs the prover binary, built once from the sequencer checkout (see
+`tools/snip36-phone-ffi/README.md`, "Desktop"):
+`.prover/sequencer/target/release/snip36-prove` (config key
+`virtual_prover_bin`). Reads and proving go through an RPC that serves
+`starknet_getStorageProof` for recent blocks (`prover_rpc_url`, default
+zan); the publish goes to the Sepolia gateway, because JSON-RPC can't
+carry `proof` / `proof_facts`.
+
+**Signing key decision:** the publish leg signs natively
+(`core/src/invoke_v3.rs`: INVOKE v3 hash with `proof_facts` appended, per
+SNIP-36), with the key read from sncast's accounts file — the one place
+every desktop account key already lives (`sncast account create` made
+them all). `keys.json` stays the scan key only.
+
+First desktop send, 2026-10-01: carol → mode2 on the v1 store, tx
+`0x7106fea0…e4a7`, **35 s wall on an M-series Mac (prove 19 s), 1.58 STRK**
+(76.9M L2 gas, 352 data gas). The account must hold ~4 STRK of fee
+ceiling (120M L2 gas × price × 1.5), not just the ~1.6 a send costs.
+
 ## GUI
 
 The same product as a native egui app (macOS/Apple Silicon):

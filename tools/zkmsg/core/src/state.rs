@@ -27,6 +27,14 @@ pub enum StepKind {
     Phase2,
     /// MessageStore v3 send_message.
     SendMessage,
+    /// SNIP-36 route: read the tree, both members and the nonce at one block.
+    /// Never checkpointed on its own — the witness it builds is kept in
+    /// memory only, so there is nothing to resume before the proof exists.
+    Prepare,
+    /// SNIP-36 route: the one paid transaction, `send_message` carrying the
+    /// proof and its facts. Its hash is recorded the moment the gateway
+    /// takes it, before `done`, so a resume polls it instead of resubmitting.
+    Publish,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +64,9 @@ pub struct SendState {
     /// Filled after Phase2 (the registered fact).
     pub fact: Option<String>,
     pub steps: Vec<StepRecord>,
+    /// SNIP-36 route: the block the send was prepared and proven on.
+    #[serde(default)]
+    pub base_block: Option<u64>,
 }
 
 impl SendState {
@@ -90,7 +101,51 @@ impl SendState {
             fri_offset: None,
             fact: None,
             steps,
+            base_block: None,
         }
+    }
+
+    /// The SNIP-36 plan: Prepare → Prove → Publish. The witness is not part
+    /// of it (`args_hex` stays empty): it lives in memory between Prepare and
+    /// Prove, and only the public tuple, the ciphertext and (in the workdir)
+    /// the proof are written down.
+    pub fn new_virtual_plan(
+        id: String,
+        recipient_handle: String,
+        ciphertext_hex: String,
+        expected: (String, String, String),
+        base_block: u64,
+    ) -> Self {
+        let steps = [StepKind::Prepare, StepKind::Prove, StepKind::Publish]
+            .into_iter()
+            .map(|kind| StepRecord { kind, done: false, tx_hash: None, note: None })
+            .collect();
+        Self {
+            id,
+            recipient_handle,
+            ciphertext_hex,
+            args_hex: vec![],
+            expected_commitment: expected.0,
+            expected_ephemeral_pubkey: expected.1,
+            expected_merkle_root: expected.2,
+            proof_id: String::new(),
+            fri_offset: None,
+            fact: None,
+            steps,
+            base_block: Some(base_block),
+        }
+    }
+
+    /// Whether this is a SNIP-36 send. The two routes never adopt each
+    /// other's state: a lane-1 plan has no Publish step, a virtual one has
+    /// no Wrap.
+    pub fn is_virtual(&self) -> bool {
+        self.steps.iter().any(|s| s.kind == StepKind::Publish)
+    }
+
+    /// Records a submitted (not yet accepted) transaction on step `index`.
+    pub fn record_submission(&mut self, index: usize, tx_hash: String) {
+        self.steps[index].tx_hash = Some(tx_hash);
     }
 
     /// Inserts the Stage{offset} steps (idempotent) once Pack has
@@ -194,6 +249,30 @@ mod tests {
             .filter(|r| matches!(r.kind, StepKind::Stage { .. }))
             .count();
         assert_eq!(stages, 1);
+    }
+
+    #[test]
+    fn virtual_plan_shape() {
+        let s = SendState::new_virtual_plan(
+            "v1".into(),
+            "mode2".into(),
+            "00".into(),
+            ("0xa".into(), "0xb".into(), "0xc".into()),
+            42,
+        );
+        assert!(s.is_virtual());
+        assert!(!plan().is_virtual());
+        assert!(s.args_hex.is_empty(), "the witness is never part of a virtual state");
+        let kinds: Vec<_> = s.steps.iter().map(|r| r.kind.clone()).collect();
+        assert_eq!(kinds, vec![StepKind::Prepare, StepKind::Prove, StepKind::Publish]);
+    }
+
+    #[test]
+    fn lane1_state_without_base_block_still_loads() {
+        let mut v = serde_json::to_value(plan()).unwrap();
+        v.as_object_mut().unwrap().remove("base_block");
+        let s: SendState = serde_json::from_value(v).unwrap();
+        assert_eq!(s.base_block, None);
     }
 
     #[test]

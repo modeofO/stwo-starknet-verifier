@@ -12,6 +12,7 @@ use eframe::egui;
 
 use zkmsg_core::chain::felt_hex;
 use zkmsg_core::config::Home;
+use zkmsg_core::pipeline::PipelineEvent;
 use zkmsg_core::state::{SendState, StepKind};
 
 use crate::send_flow::{SendFlow, StepStatus};
@@ -19,11 +20,13 @@ use crate::session::ProfileSession;
 use crate::worker::{self, PrepareWorkerMsg, ResolveWorkerMsg, WorkerMsg};
 
 const BYTE_SOFT_CAP: usize = 1_000;
-/// Display-only estimate (docs/lane1-results.md measured lane-1 Sepolia
-/// cost) — NOT what gates the spend; the pipeline's own gas bounds are
-/// the real enforcement. This is what the confirm dialog and cost line
-/// show the user before they commit.
-const ESTIMATED_COST_STRK: u32 = 48;
+/// Display-only estimates — NOT what gates the spend; each route's own gas
+/// bounds are the real enforcement. Lane 1: docs/lane1-results.md's measured
+/// Sepolia cost. SNIP-36: the phone's measured send, and the fee ceiling the
+/// account must hold for it (virtual_send::GAS_POLICY at 2026-09 prices).
+const LANE1_COST_STRK: &str = "48";
+const VIRTUAL_COST_STRK: &str = "1.6";
+const VIRTUAL_CEILING_STRK: &str = "4";
 
 impl ProfileSession {
     pub(crate) fn poll_compose_worker(&mut self, ctx: &egui::Context) {
@@ -51,6 +54,9 @@ impl ProfileSession {
         let Ok(msg) = rx.try_recv() else { return };
         match msg {
             WorkerMsg::Progress(event) => {
+                if let PipelineEvent::Checkpointed { id } = &event {
+                    self.send_state_id = Some(id.clone());
+                }
                 if let Some(flow) = &mut self.send_flow {
                     flow.apply(event);
                 }
@@ -146,11 +152,10 @@ impl ProfileSession {
         ui.colored_label(counter_color, format!("{n_bytes} / {BYTE_SOFT_CAP} bytes"));
 
         ui.separator();
+        let cost = self.cost_line();
         let balance_line = match self.status.as_ref().and_then(|r| r.balance_strk) {
-            Some(strk) => format!("send costs ~{ESTIMATED_COST_STRK} STRK · balance ~{strk} STRK"),
-            None => format!(
-                "send costs ~{ESTIMATED_COST_STRK} STRK · balance unknown (see Status tab)"
-            ),
+            Some(strk) => format!("{cost} · balance ~{strk} STRK"),
+            None => format!("{cost} · balance unknown (see Status tab)"),
         };
         ui.label(balance_line);
 
@@ -194,9 +199,10 @@ impl ProfileSession {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
+                let cost = if self.is_virtual_route() { VIRTUAL_COST_STRK } else { LANE1_COST_STRK };
                 ui.label(format!(
                     "Publish this message to {recipient}? This spends \
-                     ~{ESTIMATED_COST_STRK} STRK on Sepolia and cannot be undone."
+                     ~{cost} STRK on Sepolia and cannot be undone."
                 ));
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
@@ -217,16 +223,54 @@ impl ProfileSession {
         }
     }
 
+    fn is_virtual_route(&self) -> bool {
+        self.config.as_ref().is_some_and(zkmsg_core::app::uses_virtual_route)
+    }
+
+    fn cost_line(&self) -> String {
+        if self.is_virtual_route() {
+            format!(
+                "send costs ~{VIRTUAL_COST_STRK} STRK (one transaction; the account must hold \
+                 ~{VIRTUAL_CEILING_STRK} STRK of fee ceiling)"
+            )
+        } else {
+            format!("send costs ~{LANE1_COST_STRK} STRK")
+        }
+    }
+
     fn start_prepare(&mut self, ctx: &egui::Context) {
         let Some(sender_leaf) = self.keys.as_ref().and_then(|k| k.leaf_index) else {
             self.last_error = Some("not registered".to_string());
             return;
         };
+        if self.is_virtual_route() {
+            self.start_virtual_send(ctx);
+            return;
+        }
         self.compose_preparing = true;
         self.last_error = None;
         self.compose_prepare_rx = Some(worker::spawn_prepare(
             self.home_dir(),
             sender_leaf,
+            self.compose_handle.trim().to_string(),
+            self.compose_text.clone(),
+            ctx.clone(),
+        ));
+    }
+
+    /// SNIP-36: prepare, prove and publish run as one worker (the witness
+    /// never leaves memory), so there is no separate prepare window — the
+    /// checklist opens at once on the fixed three-step plan.
+    fn start_virtual_send(&mut self, ctx: &egui::Context) {
+        if self.work_in_flight() {
+            self.last_error = Some("a send is already running".to_string());
+            return;
+        }
+        self.last_error = None;
+        self.send_state_id = None;
+        self.send_flow = Some(SendFlow::virtual_plan());
+        self.send_rx = Some(worker::spawn_virtual_send(
+            self.home_dir(),
             self.compose_handle.trim().to_string(),
             self.compose_text.clone(),
             ctx.clone(),
@@ -323,6 +367,9 @@ impl ProfileSession {
                 format!("published — fact {fact}"),
             );
             ui.separator();
+        } else if flow.published {
+            ui.colored_label(egui::Color32::from_rgb(60, 180, 60), "published");
+            ui.separator();
         }
         if let Some(err) = &flow.error {
             ui.colored_label(egui::Color32::RED, err.as_str());
@@ -361,13 +408,24 @@ impl ProfileSession {
         }
 
         let has_failed = flow.steps.iter().any(|s| s.status == StepStatus::Failed);
-        let is_done = flow.fact.is_some();
+        let is_done = flow.published;
 
         ui.separator();
-        if has_failed && !locked && ui.button("Resume").clicked() {
+        // A failed send resumes from its saved state when there is one. A
+        // SNIP-36 send that failed before its proof was saved has none (the
+        // witness is never written down): it goes back to the form, message
+        // intact, to be sent again.
+        let resumable = self.send_state_id.as_deref().is_some_and(|id| {
+            SendState::path(&Home::new(self.home_dir()), id).exists()
+        });
+        if has_failed && !locked && resumable && ui.button("Resume").clicked() {
             if let Some(id) = self.send_state_id.clone() {
                 self.resume_send(&id, ctx);
             }
+        }
+        if has_failed && !resumable && ui.button("Back to message").clicked() {
+            self.send_flow = None;
+            self.send_state_id = None;
         }
         if is_done && ui.button("Compose another").clicked() {
             self.reset_compose();
@@ -390,6 +448,8 @@ fn step_label(kind: &StepKind) -> String {
         StepKind::Phase1 => "verify phase 1".to_string(),
         StepKind::Phase2 => "verify phase 2".to_string(),
         StepKind::SendMessage => "send message".to_string(),
+        StepKind::Prepare => "prepare (tree, paths, nonce at one block)".to_string(),
+        StepKind::Publish => "publish (one transaction, proof attached)".to_string(),
     }
 }
 
