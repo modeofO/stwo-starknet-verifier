@@ -67,3 +67,9 @@ virtual OS program hash is `0x53f6c9fc…6daa1`.
 The phone needs the `com.apple.developer.kernel.extended-virtual-addressing`
 entitlement (paid developer team): without it iOS refuses mappings past
 ~6.75 GB.
+
+Those numbers are the unpatched stack. [`memory-opt/`](memory-opt/README.md)
+patches stwo, stwo-circuits and proving-utils to cut peak spill to ~3.1 GiB
+with a byte-identical proof; build with `memory-opt/setup.sh` instead of the
+steps above. The optimizations are on by default and `SNIP36_OPTIMIZE=0` turns
+them off.
