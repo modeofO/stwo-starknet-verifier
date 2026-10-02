@@ -32,8 +32,10 @@ enum PickerAction {
     /// Resume an incomplete profile's setup wizard (from its checkpoint dir;
     /// the name is read back from `setup.json`).
     Resume(PathBuf),
-    /// Retire a burner profile (open the archive dialog).
-    Retire(String),
+    /// Archive a profile (open the archive dialog).
+    Archive(String),
+    /// Move an archived profile back into the picker.
+    Unarchive(String),
 }
 
 pub struct ZkmsgApp {
@@ -226,19 +228,15 @@ impl ZkmsgApp {
                             }
                             continue;
                         }
-                        // A burner entry gets a small "retire…" button beside
-                        // its row; the config read is a cheap local fs read.
-                        let is_burner = Home::new(entry.dir.clone())
-                            .load_config()
-                            .map(|c| c.burner)
-                            .unwrap_or(false);
+                        // Every profile can be archived (hidden here, directory
+                        // and keys kept); nothing is ever deleted.
                         ui.horizontal(|ui| {
                             let selected = entry.name == active_name;
                             if ui.selectable_label(selected, picker_label(entry)).clicked() && !selected {
                                 action = PickerAction::Switch(entry.name.clone(), entry.dir.clone());
                             }
-                            if is_burner && ui.small_button("retire…").clicked() {
-                                action = PickerAction::Retire(entry.name.clone());
+                            if ui.small_button("archive…").clicked() {
+                                action = PickerAction::Archive(entry.name.clone());
                             }
                         });
                     }
@@ -270,6 +268,24 @@ impl ZkmsgApp {
                             "open a configured profile first — its RPC endpoint drives the setup \
                              (no funds are drawn from it)",
                         );
+                    }
+                    let archived = self
+                        .root
+                        .as_deref()
+                        .map(zkmsg_core::profiles::list_archived)
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    if !archived.is_empty() {
+                        ui.separator();
+                        ui.label(format!("archived ({})", archived.len()));
+                        for entry in &archived {
+                            ui.horizontal(|ui| {
+                                ui.add_enabled(false, egui::Label::new(picker_label(entry)));
+                                if ui.small_button("unarchive").clicked() {
+                                    action = PickerAction::Unarchive(entry.name.clone());
+                                }
+                            });
+                        }
                     }
                 },
             );
@@ -505,9 +521,26 @@ impl eframe::App for ZkmsgApp {
                 }
                 Err(e) => self.picker_error = Some(e),
             },
-            PickerAction::Retire(name) => {
+            PickerAction::Archive(name) => {
                 self.picker_error = None;
-                self.retire = Some(RetireUi::new(name));
+                let is_burner = self
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == name)
+                    .and_then(|p| Home::new(p.dir.clone()).load_config().ok())
+                    .is_some_and(|c| c.burner);
+                self.retire = Some(RetireUi::new(name, is_burner));
+            }
+            PickerAction::Unarchive(name) => {
+                if let Some(root) = self.root.clone() {
+                    match zkmsg_core::profiles::unarchive_profile(&root, &name) {
+                        Ok(_) => {
+                            self.picker_error = None;
+                            self.profiles = list_profiles(&root).unwrap_or_default();
+                        }
+                        Err(e) => self.picker_error = Some(format!("{e:#}")),
+                    }
+                }
             }
         }
 
@@ -577,7 +610,7 @@ impl eframe::App for ZkmsgApp {
             }
             if self.retire.is_none() && self.root.is_some() {
                 let name = self.session.as_ref().unwrap().name.clone();
-                self.retire = Some(RetireUi::new(name));
+                self.retire = Some(RetireUi::new(name, true));
             }
         }
 

@@ -146,9 +146,10 @@ funding target computed from live gas prices (the flat default died
 with carol's stall), and none of your existing accounts ever signs
 anything for it. While parked it holds no lock — switch profiles,
 read inboxes, come back and hit Refresh when the deposit lands.
-After the send, a retire prompt archives the profile by rename into
-`~/.zkmsg/archive/` — keys are never deleted; un-archive by moving
-the dir back. There is no sweep: leftover STRK stays on the burner,
+After the send, a prompt offers to archive the burner. Any profile can be
+archived from the picker ("archive…"): its directory is renamed into
+`~/.zkmsg/archive/` — keys are never deleted — and the picker's
+"archived" list moves it back ("unarchive"). There is no sweep: leftover STRK stays on the burner,
 because moving it anywhere would draw the on-chain edge the burner
 exists to avoid. (Retired 2026-10-01, along with the optional
 `from:` line: messages carry no sender line.)

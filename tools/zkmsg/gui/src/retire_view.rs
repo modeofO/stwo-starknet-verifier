@@ -1,6 +1,8 @@
-//! The burner retirement dialog: archive-by-rename. There is no sweep —
-//! any STRK left on the burner stays there, because moving it anywhere
-//! would be a public on-chain edge linking the burner to the target.
+//! The archive dialog: hide a profile from the picker by renaming its
+//! directory under `archive/` (keys and all; the picker's archived list
+//! moves it back). Nothing is deleted. For a burner there is no sweep —
+//! any STRK left on it stays there, because moving it anywhere would be a
+//! public on-chain edge linking the burner to the target.
 //! Owned by ZkmsgApp (it outlives the session it may close).
 
 use std::path::Path;
@@ -28,6 +30,7 @@ enum RetireAct {
 
 pub struct RetireUi {
     profile_name: String,
+    is_burner: bool,
     error: Option<String>,
     /// App-level work_in_flight snapshot, fed per-frame by the app. Archive
     /// waits while a send or setup is running on any profile, so a rename
@@ -36,11 +39,11 @@ pub struct RetireUi {
 }
 
 impl RetireUi {
-    pub fn new(profile_name: String) -> Self {
-        Self { profile_name, error: None, app_busy: false }
+    pub fn new(profile_name: String, is_burner: bool) -> Self {
+        Self { profile_name, is_burner, error: None, app_busy: false }
     }
 
-    /// Archives the burner by rename. On success the app drops the session
+    /// Archives the profile by rename. On success the app drops the session
     /// and rescans; on failure the error is surfaced and the dialog stays.
     fn archive(&mut self, root: &Path) -> RetireOutcome {
         match archive_profile(root, &self.profile_name) {
@@ -54,16 +57,19 @@ impl RetireUi {
 
     pub fn update(&mut self, ctx: &egui::Context, root: &Path) -> RetireOutcome {
         let mut act = RetireAct::None;
-        egui::Window::new(format!("Retire burner '{}'", self.profile_name))
+        egui::Window::new(format!("Archive '{}'", self.profile_name))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(
-                    "Archiving hides this burner from the profile list and keeps its directory \
-                     (scan key included) under the archive folder. Any STRK left on its account \
-                     stays there.",
+                    "Archiving hides this profile from the profile list and keeps its directory \
+                     (keys included) under the archive folder; \"unarchive\" in the list brings \
+                     it back.",
                 );
+                if self.is_burner {
+                    ui.label("Any STRK left on this burner's account stays there.");
+                }
                 if let Some(err) = &self.error {
                     ui.colored_label(egui::Color32::RED, err.as_str());
                 }
