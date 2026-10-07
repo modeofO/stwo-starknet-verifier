@@ -8,7 +8,8 @@ virtual Starknet OS, and rides inside the one transaction that publishes
 the message; the sequencer verifies it natively (SNIP-36). No browser, no
 proving service, no relay.
 
-Specs: `docs/superpowers/specs/2026-10-01-zkmsg-desktop-snip36-pq-design.md`,
+Specs: `docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`
+(current), `docs/superpowers/specs/2026-10-01-zkmsg-desktop-snip36-pq-design.md`,
 `docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`.
 Deployment record: `docs/zkmsg-deployment.md`. (The first route, lane 1 —
 prove, wrap, then verify through the `StwoFactRegistry` in several ~24 STRK
@@ -30,7 +31,7 @@ transactions — shipped 2026-07-05 and was removed from this client
 cd tools/zkmsg && cargo build --release
 alias zkmsg=$PWD/target/release/zkmsg
 
-zkmsg init --account <your-sncast-account>   # scan key + ML-KEM seed + config
+zkmsg init --account <your-sncast-account>   # scan key + ML-KEM seed + member secret + config
 zkmsg register <your-handle>                 # one cheap tx (~0.2 STRK)
 zkmsg status                                 # balance, addresses, count
 
@@ -77,9 +78,9 @@ membership; the recipient finds its mail by recomputing the hybrid tag.
 
 (v2 was then the only store read; v3 has since replaced it, see above.)
 Older profiles move with `zkmsg migrate-store [<profile>]` (or the Status
-tab's "Move to v2 store…"): it rewrites `config.json`, clears the handle
-and leaf index (registration is per store), keeps the scan key, and you
-`zkmsg register <handle>` again.
+tab's "Move to v3 store…"): it rewrites `config.json`, clears the handle
+and leaf index (registration is per store), keeps the scan key, mints a
+fresh member secret, and you `zkmsg register <handle>` again.
 
 First desktop v2 run, 2026-10-01: carol registered at leaf 1
 (`0x03e1ddad…bbb7`, 0.18 STRK) and sent to `mode`
@@ -89,9 +90,9 @@ inbox decrypts it; carol's own inbox does not.
 
 ## SNIP-36 sends
 
-On the v2 store (as on the SNIP-36 v1 store before it) a send is **one
-transaction**: the zkmsg statement runs inside StarkWare's virtual
-Starknet OS (contract `ZkmsgSendProver`, executed only here), the S-two
+On the v3 store (as on the v2 and SNIP-36 v1 stores before it) a send is
+**one transaction**: the zkmsg statement runs inside StarkWare's virtual
+Starknet OS (contract `ZkmsgSendProverV3`, executed only here), the S-two
 proof of that run rides in the invoke's `proof` field, and the sequencer
 verifies it natively before `send_message` checks the proof's one L2→L1
 message against the public tuple. No wrap, no staging, no fact registry.
@@ -113,7 +114,8 @@ carry `proof` / `proof_facts`.
 (`core/src/invoke_v3.rs`: INVOKE v3 hash with `proof_facts` appended, per
 SNIP-36), with the key read from sncast's accounts file — the one place
 every desktop account key already lives (`sncast account create` made
-them all). `keys.json` stays the scan key only.
+them all). `keys.json` holds no account key: it carries the scan key,
+`kem_seed` and `member_secret` (plus handle and leaf index).
 
 First desktop send, 2026-10-01: carol → mode2 on the v1 store, tx
 `0x7106fea0…e4a7`, **35 s wall on an M-series Mac (prove 19 s), 1.58 STRK**
@@ -182,17 +184,22 @@ unlinkable loop 2026-07-10 — external deposit, send to alice (fact
 `0x4535d688…c46a`), sweep + archive: see
 `docs/zkmsg-deployment.md`.
 
-## What's public, what's private (v1, honest)
+## What's public, what's private (v2/v3, honest)
 
-- **Private, cryptographically**: message content (AES-256-GCM under the
-  ephemeral ECDH secret) and the RECIPIENT — observers can't tell who a
-  message is for, or that any particular registered user received one.
-  Recipients find their mail by trial-ECDH against every envelope; that
-  asymmetry is the anonymity.
-- **Public**: that *some* registered account sent something, the
-  registered-user set, and timing. With a normal profile that account
-  is YOURS (same as messagezk's live V1). With a **burner** (shipped
-  2026-07-10) the sending account is a fresh, externally-funded
+- **Private, cryptographically**: message content (AES-256-GCM under a
+  key derived from BOTH ML-KEM-768 and ephemeral Stark-curve ECDH — a
+  recorded ciphertext stays sealed unless both are broken) and the
+  RECIPIENT — the detection tag comes from the same hybrid secret, so
+  observers can't tell who a message is for; recipients find their mail
+  by recomputing the tag against every envelope.
+- **Sender, among members**: the proof shows *a* registered member sent
+  the message, not which. Under v3 the witness is the member secret `m`,
+  the sender's scan PUBLIC key, `kem_digest`, leaf index and path — the
+  scan private key is not in it. The witness never leaves the device.
+- **Public**: that *some* account paid for a send, the registered-user
+  set (handles, scan pubkeys, ML-KEM keys, `m_commit`s), timing and
+  ciphertext length. With a normal profile the paying account is YOURS.
+  With a **burner** the sending account is a fresh, externally-funded
   throwaway with no on-chain edge to any account you own — the app
   never draws one.
 - **Burner caveats, honestly**: the anonymity set is the registered-user
@@ -200,7 +207,19 @@ unlinkable loop 2026-07-10 — external deposit, send to alice (fact
   before a send); reusing a burner links its sends to each other. Fund
   a burner from your own account and you've drawn the very
   edge it exists to avoid.
-- **Caveats**: scan-key compromise exposes past content (the
-  double-ratchet layer is deferred); Stwo proofs are not formally ZK and
-  ride in public calldata permanently — the scan key is the only
-  long-lived witness secret, rotate by re-registering a new handle.
+- **Membership integrity is a sequencer trust**: on SNIP-36 the gateway
+  and consensus validators verify the proof; the settling block proof
+  checks only the facts' header (v2 spec, "Current system"). A send with
+  an invalid membership proof would have to get past the
+  sequencer/validators, but L1 settlement would not catch it. The retired
+  lane-1 route had settlement coverage.
+- **The proof**: it rides in the publish transaction's `proof` field.
+  Whether it stays retrievable from the chain after verification is not
+  established in this repo's docs. The docs also disagree on whether S-two
+  proofs are zero-knowledge (the v2/v3 specs say they are; the top-level
+  README says Stwo proofs are not formally ZK). Under v3 the only
+  long-lived secret in the witness is `m`.
+- **Caveats**: `keys.json` compromise (scan key + KEM seed) exposes past
+  content (the double-ratchet layer is deferred); a leaked `m` lets its
+  holder send as a member, not read mail. Rotate by re-registering a new
+  handle.

@@ -1,5 +1,10 @@
 # zkmsg v2: hybrid post-quantum key exchange (ML-KEM-768 + ECDH) (2026-10-01)
 
+Status: **shipped 2026-10-01** on Sepolia alpha, phone and desktop (merged
+`09834e0`; deployment and runs in `docs/zkmsg-deployment.md`). The hybrid
+content key and recipient tag carry forward unchanged; membership is superseded
+by v3 (`2026-10-01-zkmsg-v3-pq-membership-design.md`).
+
 Owner decision: **option B**. The content key and the recipient tag come from a
 hybrid of ML-KEM-768 and the existing Stark-curve ECDH. The recipient check
 leaves the zk statement, which keeps only sender membership. New prover

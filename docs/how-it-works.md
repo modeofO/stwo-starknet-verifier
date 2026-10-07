@@ -140,7 +140,11 @@ values are themselves a blake2s chain ending in
 `[n_tasks, output_len, app_program_hash, app_outputs…]` — so the fact binds
 *which program* ran and *what it output*. A consumer contract (messagezk's
 `MessageStore`) recomputes the expected chain for its known program hash and
-claimed outputs and calls `is_valid(fact)`. One storage read.
+claimed outputs and calls `is_valid(fact)`. One storage read. (That is
+the lane-1 consumer. Since 2026-10-01 zkmsg itself no longer uses the
+registry: it sends via SNIP-36, where the sequencer verifies a virtual-OS
+proof and the store checks the transaction's `proof_facts` — see
+`docs/zkmsg-deployment.md`, "zkmsg v3".)
 
 **Trust model.** The client proves (witness never leaves). The wrapper
 compresses (untrusted — can only refuse, never forge). The chain verifies
@@ -237,12 +241,14 @@ rejection; per-phase cost probes. On-chain: phase 1
 [`0x06b7f69f…8730`](https://sepolia.voyager.online/tx/0x06b7f69fcc931cf1e93cbae5a14e254de539e6f91609fceed60b3f93b8188730)
 (815,669,840 gas).
 
-**Where each piece runs today**: proving + wrapping are native Rust
+**Where each piece runs (as of 2026-07-03; lane 1)**: proving + wrapping are native Rust
 (laptop: ~2–3 minutes). The base proof can already be made in-browser (the
 Stwo WASM prover); moving the *wrap* into clients is the open WASM
 feasibility question (memory is the risk), and a native client app dodges
 that ceiling entirely. The chain does not know or care where a proof was
-made — only whether it verifies.
+made — only whether it verifies. (zkmsg's sends have since moved off this
+route: on SNIP-36 the desktop and the phone each prove their own one-
+transaction send, with no wrap step.)
 
 ## Pointers for going deeper
 

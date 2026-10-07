@@ -1,5 +1,11 @@
 # Phone-first zkmsg — design for the qm31 era
 
+> **Superseded by the SNIP-36 route (2026-09/10).** The phone now proves
+> its own sends in StarkWare's virtual Starknet OS (`tools/snip36-phone-ffi`,
+> memory-optimized: peak spill ~3.1 GiB) and publishes in one transaction
+> for ~1.54 STRK (`docs/zkmsg-deployment.md`, "zkmsg v3"). The design and
+> measurements below remain valid records of the lane-1 / qm31 route.
+
 Written 2026-07-29, the day qm31 landed on sepolia-integration
 (tools/qm31-gate-probe/README.md). Goal: **everything — identity, send,
 receive — from a phone, with minimal STRK**, eliminating the desktop as

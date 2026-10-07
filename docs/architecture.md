@@ -15,6 +15,16 @@ StwoFactRegistry  ◄── lane 1: recursion route (shipped first)
                   ◄── lane 2: sovereign route (the desired end state)
 ```
 
+> **Status 2026-10-01:** zkmsg no longer consumes the registry. Its sends
+> moved to SNIP-36: one transaction whose virtual-OS proof the sequencer
+> verifies, with the store checking the transaction's `proof_facts`
+> instead of calling `is_valid(fact)` (store `MessageStoreV3`
+> `0x0103de67…3d9d`; [`zkmsg-deployment.md`](./zkmsg-deployment.md),
+> "zkmsg v3"). The lane-1 send route and its store (`0x02d66a02…91b7`)
+> are retired. The registry remains the sovereign lane's destination —
+> and the only route here whose verification L1 settlement re-checks;
+> under SNIP-36, membership integrity rests on the sequencer/validators.
+
 A **fact** binds the application program's hash and its public outputs
 (for messagezk: `(commitment, ephemeral_pubkey, merkle_root)`). Lane 1
 registers `poseidon(output_hash words)` where `output_hash` reaches the
@@ -46,7 +56,8 @@ StwoFactRegistry.verify_and_register    (~3.8M steps ≈ 38% of one tx)
   deployment limits, audited libfuncs only. Measured end-to-end costs in
   [`lane1-results.md`](./lane1-results.md): **3 transactions per fact**
   (2 packed staging txs + one ~8.9e8-gas verify tx, 81% of the per-tx cap).
-- The wrap step currently runs natively (2–3 min on a laptop). Who runs it:
+- The wrap step runs natively (2–3 min on a laptop; zkmsg's desktop client
+  ran prove+wrap natively until 2026-10-01). Who runs it:
   - a permissionless relayer (can't forge, can't read secrets; sees
     submission metadata — the trust cost),
   - or, pending the WASM feasibility probe, **the client's browser** —
@@ -94,7 +105,17 @@ piece of it — registry, staging, fact format, consumer integration — is
 reused verbatim by lane 2. The sovereign lane is the destination; lane 1 is
 the road that happens to pass through it.
 
-## Client architecture (decided direction, not yet built)
+## Client architecture
+
+> **What shipped (as of 2026-10-07):** a desktop native app,
+> `tools/zkmsg` (Rust core + CLI + egui GUI; first send 2026-07-05), and
+> an iOS app (`zkmsg-ios`, pure-Swift core) whose phone proves its own
+> sends. Both now send via SNIP-36: the desktop runs the `snip36-prove`
+> binary as a subprocess, the phone links the memory-optimized prover
+> (`tools/snip36-phone-ffi`). The Cartridge Controller session design
+> below was not built — keys live in sncast's accounts file (desktop) and
+> the iOS Keychain (phone). The text below is the pre-build direction,
+> kept as the record.
 
 Desktop-first native app (Rust + egui), deferred until the research below
 progresses. Rationale and design:
@@ -128,7 +149,8 @@ progresses. Rationale and design:
     `session_authorization` (~hundreds of felts) — do the session's first
     use on a cheap call, not on `verify_phase1`.
 - Mobile is explicitly deferred (egui is weak there; desktop/laptop is the
-  target).
+  target). *(Superseded: mobile shipped as a native Swift app, not egui —
+  see the status note above and `docs/phone-first-design.md`.)*
 
 **Build order gate:** no app scaffolding until at least one of these lands —
 (a) proof-only wrapping (client hands the middleman a *proof*, not a

@@ -1,5 +1,13 @@
 # zkmsg SHIPPED on Sepolia — the first natively-proven private message (2026-07-05)
 
+> **Current: v3 on the SNIP-36 route** — `MessageStoreV3`
+> `0x0103de67…3d9d` + `ZkmsgSendProverV3`; see "zkmsg v3: hash-based
+> membership, SNIP-36 route" at the end of this file. Everything above
+> that section is the record of retired routes and stores: the lane-1
+> send route and its store (sections through "Repro / try it"), the
+> SNIP-36 v1 store, and v2. The `pq-v2` and `pq-v3` work is merged to
+> `main` (`09834e0`; v3 through `d4d9da7`).
+
 The full messagezk model — sender/recipient membership in a registered-user
 Merkle tree + ephemeral ECDH + Poseidon commitment — proven in a native
 Rust app (`tools/zkmsg`), verified on the PUBLIC network through the live
@@ -11,7 +19,7 @@ The recipient found and decrypted it by trial-ECDH; the sender's own inbox
 
 | What | Value |
 |---|---|
-| `MessageStoreV3` | `0x02d66a02b2efdddb5282bf7d7931cbb7a724f191478843b1fccbf3b9729e91b7` |
+| lane-1 `MessageStoreV3` (retired 2026-10-01; not the v3 store below) | `0x02d66a02b2efdddb5282bf7d7931cbb7a724f191478843b1fccbf3b9729e91b7` |
 | class hash | `0x04dc67c0ad76d9674a80d6dcb717cec7334014f2d5df986c440ed1aa62765745` |
 | declare / deploy tx | `0x0086f065…e6b8` (17.58 STRK) / `0x0097dc39…7e5d` |
 | pinned registry | `0x0194f44002b4af71e58ba7d30667ed565f1d420d3fb1e7c578de35170309c6aa` (live lane-1) |
@@ -167,13 +175,33 @@ line is an unauthenticated plaintext claim.
 
 ## Repro / try it
 
-See `tools/zkmsg/README.md` (quickstart). The deployed store address is
-baked into `zkmsg init`'s defaults.
+See `tools/zkmsg/README.md` (quickstart). `zkmsg init` now defaults to
+the v3 store (`SEPOLIA_STORE_DEFAULT` in `tools/zkmsg/core/src/config.rs`);
+the lane-1 store above is no longer read, and the lane-1 send route was
+removed from the client 2026-10-01.
+
+## SNIP-36 v1 store (Sepolia alpha, 2026-09-29; retired)
+
+`MessageStoreSnip36` + `ZkmsgSendProver` (`contracts/messagezk_store_snip36`,
+commit `8e391f1`): the lane-1 store's interface with the fact-registry
+check replaced by a `proof_facts` check — the first one-transaction route.
+
+| What | Value |
+|---|---|
+| `MessageStoreSnip36` | `0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f` |
+| store deploy block | 15850710 |
+| `ZkmsgSendProver` | `0x012b85a4b5e6918eb6f18a07fddc1667d67beaac0ab647928105b8ccf7ee5346` |
+
+Addresses and block from commits `8e391f1` and `ff4cb9d`. The declare and
+deploy transactions and their fees were not recorded. Measured v1 sends
+appear in the v2 comparison table below and in `tools/zkmsg/README.md`
+(first desktop send).
 
 ## zkmsg v2: hybrid ML-KEM-768 + ECDH, SNIP-36 route (Sepolia alpha, 2026-10-01)
 
 Design: `docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`.
-Code: `contracts/messagezk_store_pq` (Scarb 2.18, sierra 1.8), branch `pq-v2`.
+Code: `contracts/messagezk_store_pq` (Scarb 2.18, sierra 1.8), branch `pq-v2`
+(merged to `main` in `09834e0`).
 Declared and deployed from account `deployer`
 (`0x6f3eee3cc01225d84e31c1696411afb129201a60ea44c06f96e0e422d8fa1ce`) via
 `https://api.zan.top/public/starknet-sepolia/rpc/v0_10`.
@@ -250,7 +278,8 @@ bytes. The publish transaction was signed and saved before the POST
 ## zkmsg v3: hash-based membership, SNIP-36 route (Sepolia alpha, 2026-10-01)
 
 Design: `docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`.
-Code: `contracts/messagezk_store_v3` (Scarb 2.18), branch `pq-v3`. Declared
+Code: `contracts/messagezk_store_v3` (Scarb 2.18), branch `pq-v3` (on `main`
+through `d4d9da7`). Declared
 and deployed from `deployer` via zan.
 
 | What | Value |
