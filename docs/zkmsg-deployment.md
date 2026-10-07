@@ -314,7 +314,7 @@ ABI (pinned in the spec):
 
 Test identity `mode` (leaf 0, owner `deployer`): the scan key from
 `.zkmsg-mode`, plus a fresh KEM seed and member secret (keys in
-`.prover/v3-test-keys/`, gitignored).
+`~/.zkmsg-test-keys/mode-v3/`, outside the repo).
 
 - Register tx `0x03a4838356b7784d0d8979c8bfb21093ec3a426359a199ac76909bd0246cc1a2`:
   0.365 STRK, 18.1M L2 gas. `get_user` returns the expected `m_commit`.

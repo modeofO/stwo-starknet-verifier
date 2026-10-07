@@ -322,7 +322,7 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   detection hybrid ML-KEM-768 + ECDH; v3 makes membership hash-based
   (member secret `m`, leaf `poseidon([LEAF_V3, R, kem_digest, m_commit])`,
   no EC step). Measured: desktop ~32–35 s wall, iPhone 14 Pro ~73–76 s
-  proving on the phone itself, ~1.54–1.57 STRK per send (vs ~47–50 STRK
+  prove-to-publish, proving on the phone itself, ~1.54–1.57 STRK per send (vs ~47–50 STRK
   on lane 1). Trust shift: under SNIP-36 the proof is checked by the
   sequencer/validators, not re-checked by L1 settlement — lane 1 had
   settlement coverage. Retired 2026-10-01: the lane-1 send route, the
@@ -363,8 +363,13 @@ scarb build
   settlement. The registry lanes here remain the route for arbitrary Cairo
   executables and for settlement-checked verification, accepting higher
   on-chain cost.
-- Stwo proofs are not formally ZK; this route posts the full proof into
-  public calldata permanently. Do not put long-lived secrets in witnesses.
+- The registry lanes' proofs have no ZK blinding (Stwo itself has no
+  masking or salted commitments), and these routes post the full proof into
+  public calldata permanently. Do not put long-lived secrets in their
+  witnesses. The SNIP-36 route differs: StarkWare's privacy prover wraps the
+  inner proof in a recursive proof with ZK blinding (`add_zk_blinding`, 35
+  random rows per component) and only that proof leaves the device. The
+  blinding is heuristic, not proven ZK.
 - Any `set_verifier`-style integration in consumer contracts must be
   owner-gated and eventually immutable — a swappable verifier is a rug vector.
 

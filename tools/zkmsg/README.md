@@ -12,8 +12,8 @@ Specs: `docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`
 (current), `docs/superpowers/specs/2026-10-01-zkmsg-desktop-snip36-pq-design.md`,
 `docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`.
 Deployment record: `docs/zkmsg-deployment.md`. (The first route, lane 1 —
-prove, wrap, then verify through the `StwoFactRegistry` in several ~24 STRK
-transactions — shipped 2026-07-05 and was removed from this client
+prove, wrap, then verify through the `StwoFactRegistry` in two ~24 STRK
+transactions plus staging and the publish — shipped 2026-07-05 and was removed from this client
 2026-10-01; its history is in the deployment record.)
 
 ## Prerequisites
@@ -40,7 +40,8 @@ zkmsg inbox                                  # detect and decrypt what's address
 ```
 
 `send` is resumable once its proof exists: the state is saved to
-`~/.zkmsg/sends/<id>.json` (the proof beside it; the witness never), and
+`sends/<id>.json` in the profile's home (`~/.zkmsg/.zkmsg-<name>/`; the
+proof beside it in `sends/<id>/`; the witness never), and
 the publish hash is recorded the moment the gateway accepts it, so
 `zkmsg resume <id>` polls that hash before it would ever resubmit. A send
 that fails before proving has nothing to resume — send it again.
@@ -213,12 +214,15 @@ unlinkable loop 2026-07-10 — external deposit, send to alice (fact
   an invalid membership proof would have to get past the
   sequencer/validators, but L1 settlement would not catch it. The retired
   lane-1 route had settlement coverage.
-- **The proof**: it rides in the publish transaction's `proof` field.
-  Whether it stays retrievable from the chain after verification is not
-  established in this repo's docs. The docs also disagree on whether S-two
-  proofs are zero-knowledge (the v2/v3 specs say they are; the top-level
-  README says Stwo proofs are not formally ZK). Under v3 the only
-  long-lived secret in the witness is `m`.
+- **The proof**: it rides in the publish transaction's `proof` field. It is
+  a recursive proof from StarkWare's privacy prover: the inner Cairo proof
+  of the virtual-OS run (not ZK) stays on the device, and the outer proof
+  that verifies it gets ZK blinding (`add_zk_blinding`, 35 random rows per
+  component). The blinding is heuristic, not proven ZK; no attack that
+  recovers the witness is known. The proof is not in public block data (the
+  feeder returns `proof_facts`, not `proof`), but the gateway stores it and
+  archives it to StarkWare's cloud storage. Under v3 the only long-lived
+  secret in the witness is `m`.
 - **Caveats**: `keys.json` compromise (scan key + KEM seed) exposes past
   content (the double-ratchet layer is deferred); a leaked `m` lets its
   holder send as a member, not read mail. Rotate by re-registering a new

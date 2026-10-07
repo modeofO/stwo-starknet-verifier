@@ -136,7 +136,8 @@ Cost per event: one Stark-curve multiplication plus one ML-KEM decapsulation
 - **Recipient:** the tag needs both shared secrets. ML-KEM ciphertexts are
   believed not to reveal the public key they were made for (ANO-CCA;
   Grubbs–Maram–Paterson 2022), so `kem_ct` doesn't identify the recipient.
-- **Sender:** unchanged. The S-two proof is zero-knowledge and hash-based.
+- **Sender:** unchanged. The S-two proof is hash-based and zero-knowledge by
+  design (heuristic blinding; corrected 2026-10-07, see `tools/zkmsg/README.md`).
   - A quantum adversary can forge *membership*: compute a member's `r` and
     prove as them. That is spam or impersonation of "a member sent this". It
     breaks neither confidentiality nor recipient privacy.

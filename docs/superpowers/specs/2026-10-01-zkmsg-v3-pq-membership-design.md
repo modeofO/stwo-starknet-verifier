@@ -21,7 +21,8 @@ What that buys the adversary:
 - **It cannot** read messages (v2 also needs the ML-KEM `dk`, which never
   appears on chain).
 - **It cannot** learn recipients, or tell which member actually sent a real
-  message (the proof is zero-knowledge).
+  message (the proof is zero-knowledge by design; see the note on the S-two
+  proof in `tools/zkmsg/README.md`: the blinding is heuristic).
 
 This is an integrity gap, not a confidentiality one. And it isn't a "harvest
 now" risk: forgery needs the quantum computer at sending time.

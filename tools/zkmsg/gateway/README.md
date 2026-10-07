@@ -20,7 +20,7 @@ Two reasons it exists:
    without this the phone can never reach the network its future depends on.
 2. **On any network it removes a trusted third party.** An RPC provider sees
    your IP alongside the exact events you ask for — the deanonymisation vector
-   `docs/THREAT_MODEL.md` calls out. A client that syncs whole blocks reveals
+   zkmsg-ios's `docs/THREAT_MODEL.md` calls out. A client that syncs whole blocks reveals
    nothing about which of them it cares about.
 
 ## The idea
@@ -63,8 +63,9 @@ rate-limits per IP**. Measured against integration:
 | 2 | **12 blocks/s** | sustained |
 | 4+ | — | HTTP 429 within a few hundred blocks |
 
-At 12 blocks/s and ~30 s block times, that is roughly **4 minutes per day of
-chain history**, or two hours per month. Practical consequences:
+At 12 blocks/s and integration's ~1.7 s block time (measured from feeder
+timestamps, 2026-07-29 and 2026-10-07), that is roughly **70 minutes per day
+of chain history**, or about 36 hours per month. Practical consequences:
 
 - Sync from the store's **deployment height**, never genesis.
 - Persist the cursor and the derived tree; only the delta matters after the
@@ -123,6 +124,6 @@ cargo test -p zkmsg-gateway -- --ignored   # live tests against integration
 
 `registry` is the payoff: it rebuilds the membership tree from events and
 prints the root, members and paths — the view calls, served locally.
-(It needs a store deployed on the target network; on integration the campaign
-deployed only the verifier and registry, so point it at alpha-sepolia's store
-or deploy one there first.)
+(It needs a store deployed on the target network: on integration, the lane-1
+store above. Pointed at the alpha-sepolia v3 store it prints a wrong root; see
+the status note.)
