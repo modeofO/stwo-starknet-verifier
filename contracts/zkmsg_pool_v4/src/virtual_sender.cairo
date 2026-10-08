@@ -66,6 +66,6 @@ pub mod ZkmsgVirtualSenderV4 {
 
     #[external(v0)]
     fn __validate_declare__(self: @ContractState, class_hash: felt252) -> felt252 {
-        panic!("virtual sender does not declare")
+        core::panic_with_felt252('virtual sender: no declare')
     }
 }

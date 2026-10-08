@@ -504,7 +504,7 @@ pub mod ZkmsgPoolV4 {
         }
 
         fn __validate_declare__(self: @ContractState, class_hash: felt252) -> felt252 {
-            panic!("pool does not declare")
+            core::panic_with_felt252('pool does not declare')
         }
     }
 
