@@ -45,14 +45,25 @@ impl GasBounds {
     }
 }
 
+/// Stands in for the HTTP round trip of `Chain::rpc`: `(method, params) ->
+/// result`. The seam tests use to serve and record every read request.
+pub type Transport = std::sync::Arc<dyn Fn(&str, &Value) -> Result<Value> + Send + Sync>;
+
 pub struct Chain {
     pub rpc_url: String,
     pub account: String,
+    /// `None`: JSON-RPC over HTTP to `rpc_url`.
+    transport: Option<Transport>,
 }
 
 impl Chain {
     pub fn new(rpc_url: &str, account: &str) -> Self {
-        Self { rpc_url: rpc_url.into(), account: account.into() }
+        Self { rpc_url: rpc_url.into(), account: account.into(), transport: None }
+    }
+
+    /// A chain whose raw RPC goes to `transport` instead of the network.
+    pub fn with_transport(rpc_url: &str, account: &str, transport: Transport) -> Self {
+        Self { transport: Some(transport), ..Self::new(rpc_url, account) }
     }
 
     // --- sncast ------------------------------------------------------------
@@ -162,6 +173,9 @@ impl Chain {
     // --- raw RPC -----------------------------------------------------------
 
     pub fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        if let Some(transport) = &self.transport {
+            return transport(method, &params);
+        }
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let reply: Value = ureq::post(&self.rpc_url)
             .set("Content-Type", "application/json")
@@ -230,12 +244,27 @@ impl Chain {
         key0: &str,
         from_block: u64,
     ) -> Result<Vec<(Vec<String>, Vec<String>)>> {
+        self.events_through(address, key0, from_block, None)
+    }
+
+    /// `events`, up to and including `to_block` (`None`: latest).
+    pub fn events_through(
+        &self,
+        address: &str,
+        key0: &str,
+        from_block: u64,
+        to_block: Option<u64>,
+    ) -> Result<Vec<(Vec<String>, Vec<String>)>> {
+        let to_block = match to_block {
+            Some(n) => json!({"block_number": n}),
+            None => json!("latest"),
+        };
         let mut out = vec![];
         let mut token: Option<String> = None;
         loop {
             let mut filter = json!({
                 "from_block": {"block_number": from_block},
-                "to_block": "latest",
+                "to_block": to_block,
                 "address": address,
                 "keys": [[key0]],
                 "chunk_size": 100,

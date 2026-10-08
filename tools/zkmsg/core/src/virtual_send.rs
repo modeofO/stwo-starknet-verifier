@@ -12,9 +12,13 @@
 //!
 //! A port of zkmsg-ios `VirtualSendExecutor`; its rules, exactly:
 //!
-//!   * Prepare reads the tree root, both members, both paths and the nonce at
-//!     ONE block N — the block the virtual OS then runs on — so the witness
-//!     can't disagree with the state the proof is about.
+//!   * Prepare reads everything at ONE block N — the block the virtual OS
+//!     then runs on — so the witness can't disagree with the state the proof
+//!     is about: every registration up to N, the root at N, the nonce.
+//!   * No read names a handle or a leaf. Both members and the sender's path
+//!     come from the tree rebuilt locally from all registrations
+//!     (`registry`), which must reproduce the store's root at N; the RPC
+//!     sees the same requests from every sender.
 //!   * The witness is never written down. The proof and its facts are public
 //!     and are, so a killed process resumes at Publish. A proof doesn't expire:
 //!     the sequencer only needs its base block to trail the head by 10.
@@ -39,13 +43,13 @@ use serde_json::{Value, json};
 use starknet_crypto::poseidon_hash_many;
 use starknet_types_core::felt::Felt;
 
-use crate::app::{Member, short_string_felt};
-use crate::chain::{Chain, bytearray_calldata, bytearray_decode, felt_hex, snkeccak};
-use crate::config::{Config, Home, Keys, STRK_TOKEN, is_current_store, store_deploy_block};
+use crate::chain::{Chain, bytearray_calldata, felt_hex, snkeccak};
+use crate::config::{Config, Home, Keys, STRK_TOKEN, is_current_store};
 use crate::crypto::{SealedV2, kem_digest, leaf_v3, member_commit, send_v2};
 use crate::tree::fold_path;
 use crate::invoke_v3::{Bounds, Call, InvokeV3, ResourceBounds, Signer, execute_calldata};
 use crate::pipeline::PipelineEvent;
+use crate::registry::Registry;
 use crate::sequencer::{Gateway, GatewayError, ProofAttachment};
 use crate::state::{SendState, StepKind};
 
@@ -356,9 +360,12 @@ impl<'a> VirtualSender<'a> {
         Ok(state)
     }
 
-    /// Only the sender's membership is proven. The recipient's ML-KEM key
-    /// comes from its registration event and must hash to the `kem_digest`
-    /// the store holds for it at block N.
+    /// Only the sender's membership is proven. Both members, the tree and
+    /// the sender's path come from the store's registration events, rebuilt
+    /// locally (`Registry`): no read names a handle or a leaf, so the RPC
+    /// can't tell who is sending to whom. The rebuilt root must equal the
+    /// store's root at block N, which also binds every registered ML-KEM key
+    /// to the `kem_digest` its leaf holds.
     fn prepare(&self, keys: &Keys, handle: &str, text: &str) -> Result<Prepared> {
         let sender_handle = keys.handle.as_deref().context("not registered — run `zkmsg register`")?;
         let scan_pub = keys.scan_pub_felt()?;
@@ -366,17 +373,16 @@ impl<'a> VirtualSender<'a> {
         let member_secret = keys.member_secret_felt()?;
         let own_m_commit = member_commit(&member_secret);
 
-        let block = self.block_number()?;
-        let recipient = self.member(handle, block)?;
-        let sender = self.member(sender_handle, block)?;
+        let (block, registry, root) = self.pinned_registry()?;
+        let recipient = registry.get(handle)?;
+        let sender = registry.get(sender_handle)?;
         ensure!(
             sender.scan_pub == scan_pub
                 && sender.kem_digest == own_digest
                 && sender.m_commit == own_m_commit,
             "'{sender_handle}' is registered to different keys in this store",
         );
-        let root = self.root(block)?;
-        let sender_path = self.path(sender.leaf_index, block)?;
+        let sender_path = registry.path(sender.leaf_index)?;
         let nonce = self.nonce(Some(block))?;
         ensure!(
             fold_path(&leaf_v3(&scan_pub, &own_digest, &own_m_commit), sender.leaf_index, &sender_path)
@@ -384,12 +390,7 @@ impl<'a> VirtualSender<'a> {
             "sender path does not fold to the root at block {block}",
         );
 
-        let recipient_ek = self.registered_kem_key(handle)?;
-        ensure!(
-            kem_digest(&recipient_ek) == recipient.kem_digest,
-            "'{handle}': the registered ML-KEM key does not match the store's kem_digest",
-        );
-        let sealed = send_v2(&recipient.scan_pub, &recipient_ek, text.as_bytes())?;
+        let sealed = send_v2(&recipient.scan_pub, &recipient.kem_pubkey, text.as_bytes())?;
         let prove_calldata = prove_send_calldata_v3(
             self.route.store,
             &sealed,
@@ -413,22 +414,30 @@ impl<'a> VirtualSender<'a> {
         })
     }
 
-    /// The 1184-byte ML-KEM key `handle` registered with, from its
-    /// `UserRegistered` event: data `[handle, scan_pubkey, leaf_index,
-    /// m_commit, kem_pubkey ByteArray…]`. A handle registers once, so the
-    /// first match is the only one.
-    fn registered_kem_key(&self, handle: &str) -> Result<Vec<u8>> {
+    /// Pins block N, rebuilds the registry from every registration up to N
+    /// and checks it against `get_merkle_root` at N — requests every client
+    /// makes alike. A mismatch (an RPC whose event index trails its state)
+    /// is retried once at a fresh block, then refused: a witness against the
+    /// wrong tree would only fail after minutes of proving.
+    fn pinned_registry(&self) -> Result<(u64, Registry, Felt)> {
         let store = felt_hex(&self.route.store);
-        let key0 = felt_hex(&snkeccak("UserRegistered"));
-        let want = short_string_felt(handle)?;
-        for (_, data) in self.chain.events(&store, &key0, store_deploy_block(&store))? {
-            let felts: Vec<Felt> =
-                data.iter().map(|s| Felt::from_hex(s).context("event felt")).collect::<Result<_>>()?;
-            if felts.len() > 4 && felts[0] == want {
-                return Ok(bytearray_decode(&felts[4..])?.0);
+        let mut mismatch = String::new();
+        for _ in 0..2 {
+            let block = self.block_number()?;
+            let registry = Registry::fetch(&self.chain, &store, Some(block))?;
+            let root = self.root(block)?;
+            if registry.root() == root {
+                return Ok((block, registry, root));
             }
+            mismatch = format!(
+                "{} registrations up to block {block} rebuild root {}, but the store's root there \
+                 is {}",
+                registry.len(),
+                felt_hex(&registry.root()),
+                felt_hex(&root),
+            );
         }
-        bail!("no registration event for '{handle}'")
+        bail!("the local membership tree disagrees with the store ({mismatch}); the RPC's event index may be behind — try again shortly")
     }
 
     /// Resumes a saved virtual send. Only Publish can be pending: the state
@@ -712,24 +721,9 @@ impl<'a> VirtualSender<'a> {
         self.call_at(self.route.store, entrypoint, calldata, block)
     }
 
-    /// `get_user(handle)` at `block`; the store panics on an unknown handle.
-    fn member(&self, handle: &str, block: u64) -> Result<Member> {
-        let user = self
-            .store_call("get_user", &[short_string_felt(handle)?], Some(block))
-            .with_context(|| format!("'{handle}' is not registered in this store"))?;
-        Member::from_felts(&user)
-    }
-
     fn root(&self, block: u64) -> Result<Felt> {
         let root = self.store_call("get_merkle_root", &[], Some(block))?;
         root.first().copied().context("get_merkle_root returned nothing")
-    }
-
-    /// `get_merkle_path(leaf) -> Array<felt252>`: length prefix + 20 siblings.
-    fn path(&self, leaf: u32, block: u64) -> Result<Vec<Felt>> {
-        let raw = self.store_call("get_merkle_path", &[Felt::from(leaf)], Some(block))?;
-        ensure!(raw.len() == 21, "get_merkle_path shape: {} felts", raw.len());
-        Ok(raw[1..].to_vec())
     }
 
     fn nonce(&self, block: Option<u64>) -> Result<Felt> {
@@ -875,6 +869,158 @@ mod tests {
         let bounds = GAS_POLICY.bounds((0, 1_000_000_000, 1_000));
         assert_eq!(bounds.l2_gas.max_price_per_unit, 1_500_000_000);
         assert_eq!(fee_ceiling_fri(&bounds), 120_000_000 * 1_500_000_000 + 4_096 * 1_500);
+    }
+
+    /// One profile of the fake store: keys.json plus its registration event.
+    fn profile(handle: &str, seed: u8, leaf_index: u32) -> (Keys, (Vec<String>, Vec<String>)) {
+        let scan_priv = Felt::from(seed as u64 + 100);
+        let scan_pub = crate::crypto::ec_mul_gen_x(&scan_priv);
+        let mut m = [seed; 32];
+        m[0] = 0;
+        let keys = Keys {
+            scan_priv: felt_hex(&scan_priv),
+            scan_pub: felt_hex(&scan_pub),
+            handle: Some(handle.into()),
+            leaf_index: Some(leaf_index),
+            kem_seed: Some(crate::config::kem_seed_hex(&[seed; 64])),
+            member_secret: Some(crate::config::member_secret_hex(&m)),
+        };
+        let ek = keys.kem_keypair().unwrap().1;
+        let m_commit = member_commit(&keys.member_secret_felt().unwrap());
+        let event = crate::registry::tests::event(
+            Felt::from(0x5000 + seed as u64), handle, scan_pub, leaf_index, m_commit, &ek,
+        );
+        (keys, event)
+    }
+
+    type Log = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+    /// A sender whose RPC is a fake v3 store at block `BLOCK` holding
+    /// `events`; `get_merkle_root` answers from `roots` (one per call, the
+    /// last repeating). Every request is recorded.
+    fn fake_sender<'a>(
+        home: &'a Home,
+        events: Vec<(Vec<String>, Vec<String>)>,
+        roots: Vec<Felt>,
+    ) -> (VirtualSender<'a>, Log) {
+        const BLOCK: u64 = 16_000_000;
+        let log: Log = Default::default();
+        let roots = std::sync::Mutex::new(roots);
+        let record = log.clone();
+        let transport: crate::chain::Transport = std::sync::Arc::new(move |method: &str, params: &Value| {
+            record.lock().unwrap().push((method.to_string(), params.clone()));
+            Ok(match method {
+                "starknet_blockNumber" => json!(BLOCK),
+                "starknet_getEvents" => {
+                    assert_eq!(params[0]["to_block"], json!({"block_number": BLOCK}), "events must stop at N");
+                    let events: Vec<Value> =
+                        events.iter().map(|(k, d)| json!({"keys": k, "data": d})).collect();
+                    json!({"events": events})
+                }
+                "starknet_call" => {
+                    assert_eq!(params[0]["entry_point_selector"], felt_hex(&snkeccak("get_merkle_root")));
+                    let mut roots = roots.lock().unwrap();
+                    let root = if roots.len() > 1 { roots.remove(0) } else { roots[0] };
+                    json!([felt_hex(&root)])
+                }
+                "starknet_getNonce" => json!("0x3"),
+                other => anyhow::bail!("unexpected rpc {other}"),
+            })
+        });
+        let sender = VirtualSender {
+            home,
+            route: VirtualRoute::for_store(crate::config::SEPOLIA_STORE_V3).unwrap(),
+            chain: Chain::with_transport("fake://rpc", "unused", transport),
+            gateway: Gateway::sepolia(),
+            signer: Signer::new(Felt::from_hex("0x5617").unwrap(), Felt::from_hex("0xabc123").unwrap()),
+            prover_bin: PathBuf::from("/nonexistent"),
+        };
+        (sender, log)
+    }
+
+    fn three_members() -> (Keys, Vec<(Vec<String>, Vec<String>)>, Felt) {
+        let (alice, a) = profile("alice", 0x11, 0);
+        let (_, b) = profile("bob", 0x22, 1);
+        let (_, c) = profile("carol", 0x33, 2);
+        let events = vec![a, b, c];
+        let root = crate::registry::Registry::from_events(&events).unwrap().root();
+        (alice, events, root)
+    }
+
+    /// The send-prep path names no handle and no leaf to the RPC: its only
+    /// requests are the head block, ALL registrations (filtered by event
+    /// selector alone), the root (no calldata) and the account's own nonce.
+    #[test]
+    fn prepare_reads_name_no_handle_or_leaf() {
+        let home = Home::new(std::env::temp_dir().join(format!("zkmsg-prep-{}", std::process::id())));
+        let (alice, events, root) = three_members();
+        let (sender, log) = fake_sender(&home, events, vec![root]);
+
+        let p = sender.prepare(&alice, "carol", "hi carol").unwrap();
+        assert_eq!(p.root, root);
+        assert_eq!(p.block, 16_000_000);
+        // The witness carries alice's locally computed path at leaf 0.
+        assert_eq!(p.prove_calldata[8], Felt::ZERO);
+
+        let log = log.lock().unwrap();
+        let methods: Vec<&str> = log.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(
+            methods,
+            ["starknet_blockNumber", "starknet_getEvents", "starknet_call", "starknet_getNonce"]
+        );
+        let handles: Vec<String> = ["alice", "bob", "carol"]
+            .iter()
+            .map(|h| felt_hex(&crate::app::short_string_felt(h).unwrap()))
+            .collect();
+        for (method, params) in log.iter() {
+            let text = params.to_string();
+            for h in &handles {
+                assert!(!text.contains(h.as_str()), "{method} names a handle: {text}");
+            }
+            assert!(!text.contains(alice.scan_pub.as_str()), "{method} names the sender's scan key");
+            match method.as_str() {
+                "starknet_getEvents" => assert_eq!(
+                    params[0]["keys"],
+                    json!([[felt_hex(&snkeccak("UserRegistered"))]]),
+                    "the event filter must not select a user"
+                ),
+                "starknet_call" => assert_eq!(params[0]["calldata"], json!([]), "no call takes an argument"),
+                "starknet_getNonce" => assert_eq!(params[1], json!(felt_hex(&sender.signer.address))),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_refuses_a_tree_that_disagrees_with_the_store() {
+        let home = Home::new(std::env::temp_dir().join(format!("zkmsg-prep2-{}", std::process::id())));
+        let (alice, events, root) = three_members();
+
+        // Wrong once: refreshed and retried at a fresh block, then fine.
+        let (sender, log) = fake_sender(&home, events.clone(), vec![Felt::from(7u64), root]);
+        sender.prepare(&alice, "bob", "hi").unwrap();
+        let n_events = log.lock().unwrap().iter().filter(|(m, _)| m == "starknet_getEvents").count();
+        assert_eq!(n_events, 2);
+
+        // Wrong twice: a clear error, before anything is sealed or proven.
+        let (sender, log) = fake_sender(&home, events, vec![Felt::from(7u64)]);
+        let err = sender.prepare(&alice, "bob", "hi").err().expect("mismatch must fail");
+        assert!(format!("{err:#}").contains("disagrees with the store"), "{err:#}");
+        assert!(!log.lock().unwrap().iter().any(|(m, _)| m == "starknet_getNonce"));
+    }
+
+    #[test]
+    fn prepare_checks_the_sender_registration_and_recipient() {
+        let home = Home::new(std::env::temp_dir().join(format!("zkmsg-prep3-{}", std::process::id())));
+        let (alice, events, root) = three_members();
+        let (sender, _) = fake_sender(&home, events, vec![root]);
+        let err = sender.prepare(&alice, "dave", "hi").err().unwrap();
+        assert!(format!("{err:#}").contains("'dave' is not registered"), "{err:#}");
+        // Local keys that differ from alice's registered record are refused.
+        let (mut other, _) = profile("alice", 0x11, 0);
+        other.member_secret = Some(crate::config::member_secret_hex(&[0x01; 32]));
+        let err = sender.prepare(&other, "bob", "hi").err().unwrap();
+        assert!(format!("{err:#}").contains("registered to different keys"), "{err:#}");
     }
 
     #[test]
