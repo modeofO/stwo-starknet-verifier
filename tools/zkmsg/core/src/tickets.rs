@@ -186,6 +186,15 @@ impl Wallet {
         if c.unspent > 0 {
             return Err(TicketNotInTreeYet { unspent: c.unspent }.into());
         }
+        if c.pending > 0 {
+            bail!(
+                "no unspent ticket: {} purchase(s) not seen on chain ({} reserved, {} spent) — \
+                 `zkmsg tickets` re-checks; if the purchase failed, buy again with `zkmsg buy-tickets`",
+                c.pending,
+                c.reserved,
+                c.spent
+            )
+        }
         bail!(
             "no unspent ticket ({} reserved, {} pending, {} spent) — buy one with `zkmsg buy-tickets`",
             c.reserved,

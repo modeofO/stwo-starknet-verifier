@@ -11,7 +11,7 @@ use crate::chain::{Chain, account_address, bytearray_calldata, felt_hex, felt_to
 use crate::config::{Config, Home, Keys, STRK_TOKEN, is_current_store};
 use crate::crypto::{kem_digest, member_commit, scan_keygen};
 use crate::state::{SendState, StepKind};
-use crate::tickets::{TicketCounts, TicketTree, Wallet};
+use crate::tickets::{TicketCounts, TicketState, TicketTree, Wallet};
 
 pub struct StatusReport {
     pub rpc: String,
@@ -364,11 +364,26 @@ pub fn buy_tickets(home: &Home, n: usize) -> Result<TicketPurchase> {
     }
     wallet.save(home)?;
 
-    let tree = TicketTree::fetch(&chain, &config.store, None)?;
-    wallet.settle(&tree)?;
+    // The receipt is in (account_tx::send waits for it), but the RPC's event
+    // index can trail it by a few seconds: retry until the new tickets show,
+    // so a `send` straight after a purchase finds them settled.
+    for attempt in 0..BUY_SETTLE_TRIES {
+        let tree = TicketTree::fetch(&chain, &config.store, None)?;
+        wallet.settle(&tree)?;
+        if wallet.tickets[first..].iter().all(|t| t.state != TicketState::Pending) {
+            break;
+        }
+        if attempt + 1 < BUY_SETTLE_TRIES {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
     wallet.save(home)?;
     Ok(TicketPurchase { buy_tx, bought: n, price_fri, counts: wallet.counts() })
 }
+
+/// How many times `buy_tickets` re-reads the purchase events (3 s apart)
+/// before reporting the new tickets as pending.
+const BUY_SETTLE_TRIES: usize = 10;
 
 /// Settles pending purchases against ALL of the pool's ticket purchases
 /// (the request names no ticket) and returns the wallet's counts.

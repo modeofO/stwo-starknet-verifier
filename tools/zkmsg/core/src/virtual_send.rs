@@ -583,7 +583,20 @@ impl<'a> VirtualSender<'a> {
         if wallet.settle(&tickets)? > 0 {
             wallet.save(self.home)?;
         }
-        let ti = wallet.pick(&tickets)?;
+        let ti = match wallet.pick(&tickets) {
+            Ok(ti) => ti,
+            // Nothing usable at the base block, but a purchase is pending: it
+            // may be newer than the base and only in the latest tree. Settle
+            // it there so `pick` reports "not yet" (which `send` waits on)
+            // instead of "no ticket". Same all-purchases event query.
+            Err(_) if wallet.counts().pending > 0 => {
+                if wallet.settle(&TicketTree::fetch(&self.chain, &store, None)?)? > 0 {
+                    wallet.save(self.home)?;
+                }
+                wallet.pick(&tickets)?
+            }
+            Err(e) => return Err(e),
+        };
         let ticket_secret = wallet.tickets[ti].secret_felt()?;
         let ticket_index = wallet.tickets[ti].index.context("picked ticket has no index")?;
         let ticket_path = tickets.path(ticket_index)?;
@@ -1186,6 +1199,8 @@ mod tests {
         /// `get_merkle_root` answers, one per call, the last repeating.
         roots: Vec<Felt>,
         ticket_root: Felt,
+        /// The latest ticket tree, when it differs from the base block's.
+        latest_tickets: Option<Vec<(Vec<String>, Vec<String>)>>,
     }
 
     /// A sender whose RPC is a fake v4 pool at block `BLOCK`. Every request
@@ -1205,12 +1220,21 @@ mod tests {
             Ok(match method {
                 "starknet_blockNumber" => json!(BLOCK),
                 "starknet_getEvents" => {
-                    assert_eq!(params[0]["to_block"], json!({"block_number": BASE}), "events must stop at N");
                     let key = params[0]["keys"][0][0].as_str().unwrap().to_string();
+                    // Pending purchases are also settled against the latest
+                    // ticket tree; every other read stops at the base block.
+                    let latest_tickets = key == felt_hex(&snkeccak("TicketBought"))
+                        && params[0]["to_block"] == json!("latest");
+                    if !latest_tickets {
+                        assert_eq!(params[0]["to_block"], json!({"block_number": BASE}), "events must stop at N");
+                    }
                     if key == felt_hex(&snkeccak("UserRegistered")) {
                         as_events(&fake.members)
                     } else if key == felt_hex(&snkeccak("TicketBought")) {
-                        as_events(&fake.tickets)
+                        match (&fake.latest_tickets, latest_tickets) {
+                            (Some(latest), true) => as_events(latest),
+                            _ => as_events(&fake.tickets),
+                        }
                     } else {
                         anyhow::bail!("unexpected event filter {key}")
                     }
@@ -1278,7 +1302,7 @@ mod tests {
         World {
             alice,
             home,
-            fake: Fake { members, tickets, roots: vec![root], ticket_root },
+            fake: Fake { members, tickets, roots: vec![root], ticket_root, latest_tickets: None },
             ticket_leaves: leaves[..2].to_vec(),
         }
     }
@@ -1365,6 +1389,31 @@ mod tests {
         assert!(format!("{err:#}").contains("no unspent ticket"), "{err:#}");
         let log = QuotaLog::load(&w.home).unwrap().unwrap();
         assert_eq!(log.used, 2);
+        fs::remove_dir_all(&w.home.dir).unwrap();
+    }
+
+    /// A purchase that landed after the base block is settled against the
+    /// latest tree and reported as "not yet", which `send` waits on, instead
+    /// of "no unspent ticket".
+    #[test]
+    fn a_purchase_newer_than_the_base_block_is_waited_for() {
+        let w = world("fresh");
+        let stranger = crate::tickets::tests::event(Felt::from(0x5157u64), 0);
+        let base = vec![stranger.clone()];
+        let latest = vec![stranger, crate::tickets::tests::event(w.ticket_leaves[0], 1)];
+        let fake = Fake {
+            ticket_root: TicketTree::from_events(&base).unwrap().root(),
+            tickets: base,
+            latest_tickets: Some(latest),
+            ..w.fake
+        };
+        let (sender, _) = fake_sender(&w.home, fake);
+        let err = sender.prepare(&w.alice, "bob", "hi").err().unwrap();
+        assert_eq!(err.downcast_ref::<TicketNotInTreeYet>(), Some(&TicketNotInTreeYet { unspent: 1 }), "{err:#}");
+        let wallet = Wallet::load(&w.home, crate::config::SEPOLIA_POOL_V4).unwrap();
+        assert_eq!(wallet.tickets[0].state, TicketState::Unspent, "settled from the latest tree");
+        assert_eq!(wallet.tickets[0].index, Some(1));
+        assert!(QuotaLog::load(&w.home).unwrap().is_none_or(|l| l.used == 0), "no quota slot taken");
         fs::remove_dir_all(&w.home.dir).unwrap();
     }
 
