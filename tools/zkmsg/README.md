@@ -5,11 +5,14 @@ registered member without saying which one, and only the recipient can
 tell it is theirs. The proof is generated on YOUR machine (the witness —
 who you are, who you're messaging — never leaves it) by StarkWare's
 virtual Starknet OS, and rides inside the one transaction that publishes
-the message; the sequencer verifies it natively (SNIP-36). No browser, no
-proving service, no relay.
+the message; the sequencer verifies it natively (SNIP-36). Since v4 that
+transaction is sent and paid by the store itself (the pool), out of a
+single-send ticket you bought earlier, so your account never touches a
+send. No browser, no proving service, no relay.
 
-Specs: `docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`
-(current), `docs/superpowers/specs/2026-10-01-zkmsg-desktop-snip36-pq-design.md`,
+Specs: `docs/superpowers/specs/2026-10-07-zkmsg-v4-pool-tickets-design.md`
+(current), `docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`,
+`docs/superpowers/specs/2026-10-01-zkmsg-desktop-snip36-pq-design.md`,
 `docs/superpowers/specs/2026-10-01-zkmsg-pq-hybrid-kem-design.md`.
 Deployment record: `docs/zkmsg-deployment.md`. (The first route, lane 1 —
 prove, wrap, then verify through the `StwoFactRegistry` in two ~24 STRK
@@ -22,8 +25,9 @@ transactions plus staging and the publish — shipped 2026-07-05 and was removed
   `.prover/sequencer/target/release/snip36-prove` (see
   `tools/snip36-phone-ffi/README.md`, "Desktop").
 - `sncast` 0.61 with a funded Sepolia account in
-  `~/.starknet_accounts/starknet_open_zeppelin_accounts.json` (~4 STRK
-  of fee ceiling per send).
+  `~/.starknet_accounts/starknet_open_zeppelin_accounts.json`. It pays
+  registration (~0.2–0.3 STRK) and ticket purchases (3 STRK per send,
+  plus ~0.2–0.4 STRK of fees per purchase), never a send itself.
 
 ## Quickstart
 
@@ -33,9 +37,11 @@ alias zkmsg=$PWD/target/release/zkmsg
 
 zkmsg init --account <your-sncast-account>   # scan key + ML-KEM seed + member secret + config
 zkmsg register <your-handle>                 # one cheap tx (~0.2 STRK)
-zkmsg status                                 # balance, addresses, count
+zkmsg buy-tickets 2                          # 2 x 3 STRK, secrets saved to tickets.json first
+zkmsg tickets                                # unspent / reserved / pending / spent
+zkmsg status                                 # balance, tickets, addresses, count
 
-zkmsg send <their-handle> "hello"            # ~30 s: prepare, prove, publish (~1.6 STRK)
+zkmsg send <their-handle> "hello"            # ~35 s: prepare, prove, publish — spends one ticket
 zkmsg inbox                                  # detect and decrypt what's addressed to you
 ```
 
@@ -46,7 +52,61 @@ the publish hash is recorded the moment the gateway accepts it, so
 `zkmsg resume <id>` polls that hash before it would ever resubmit. A send
 that fails before proving has nothing to resume — send it again.
 
-## v3: post-quantum membership (the current store, 2026-10-01)
+## v4: the pool and tickets (the current store, 2026-10-07)
+
+The 2026-10 red team found that every send was published, and paid for,
+by the account that registered the sender's handle: the chain named the
+sender outright, whatever the proof hid. `ZkmsgPoolV4`
+(`contracts/zkmsg_pool_v4`, spec
+`docs/superpowers/specs/2026-10-07-zkmsg-v4-pool-tickets-design.md`) takes
+every member's account out of the send:
+
+- **The store is the account that publishes.** A send is an INVOKE v3
+  whose `sender_address` is the pool and whose signature is empty. The
+  pool's `__validate__` admits exactly one proven `send_message` (facts,
+  roots, nullifiers, epoch, content size, fee policy) and nothing else —
+  no transfer, no other call.
+- **Tickets pay.** `zkmsg buy-tickets <n>` picks n fresh secrets t,
+  writes them to `tickets.json` (0600, bearer value) and only then calls
+  `buy_tickets(leaves)` at 3 STRK per leaf poseidon(TICKET_V4, t). A send
+  proves knowledge of some ticket's t under the ticket root and reveals
+  only poseidon(TICKET_NULL_V4, store, t); `__validate__` burns it and
+  caps the transaction's worst-case fee at the ticket price, so the pool
+  can never pay out more than tickets brought in. What a send doesn't
+  use (~1.55 of the 3 STRK) stays in the pool — a refund would need a
+  destination, which would re-link the send. The purchase shows that your
+  account bought tickets; nothing ties a send to the tickets it spent.
+- **The proof runs from a shared account.** The virtual `prove_send`
+  invoke comes from `ZkmsgVirtualSenderV4` (zero fee only, nonce 0
+  forever), so the prover's state requests name no member's account.
+- **A quota per member.** Each send also reveals
+  poseidon(NULLIFIER_V4, store, m, epoch, slot) for a private slot
+  `< quota` (10 per 5,000-block epoch, ≈2.4 h): a member can send at most
+  10 per epoch, and two sends of one member stay unlinkable. The client
+  keeps the epoch's used slots in `quota.json`.
+- **No read names you.** The member tree and the ticket tree are both
+  rebuilt locally from all events; the send path's RPC requests are the
+  same for every sender (`virtual_send::tests::
+  prepare_reads_name_no_handle_leaf_ticket_or_account`).
+
+`zkmsg migrate-store [<profile>] [--account <name>]` moves a profile to
+the pool with a FRESH scan key, ML-KEM seed and member secret (the old
+keys are overwritten — copy the profile directory first), then
+`zkmsg register <handle>` and `zkmsg buy-tickets`. A send that the pool
+refuses in validate costs nothing (its ticket goes back to the wallet
+unless the refusal was "ticket spent"); a lost race for the pool's nonce
+is resubmitted at the next nonce with the same proof.
+
+Golden vectors for ports: `core/testdata/v4_vectors.json`
+(`core/tests/v4_vectors.rs`; the same values are asserted against the
+contracts in `contracts/zkmsg_pool_v4/tests/test_vectors_v4.cairo`).
+
+First live run, 2026-10-07: carol ↔ mode, four sends through the pool
+(two of them concurrent, at pool nonces 2 and 3), 1.43–1.44 STRK each from
+tickets, ~79.5M L2 gas, ~35 s wall; every recipient decrypts, neither
+user's account appears in any publish. See `docs/zkmsg-deployment.md`.
+
+## v3: post-quantum membership (2026-10-01)
 
 `MessageStoreV3` (`docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`)
 makes the sender's membership proof hash-only. Each identity holds a
@@ -60,9 +120,9 @@ mail. Content and recipient detection are v2's hybrid ML-KEM + ECDH,
 unchanged.
 
 `m` is minted on `init`, and fresh for every store a profile moves to
-(`zkmsg migrate-store`, which v2 profiles need: registration is per
-store). It is never re-minted for a profile that already holds a handle.
-Only the v3 store is read.
+(`zkmsg migrate-store`: registration is per store). It is never re-minted
+for a profile that already holds a handle. (v3 was then the only store
+read; the v4 pool has since replaced it and keeps its leaf.)
 
 ## v2: post-quantum key exchange (2026-10-01)
 
@@ -91,17 +151,17 @@ inbox decrypts it; carol's own inbox does not.
 
 ## SNIP-36 sends
 
-On the v3 store (as on the v2 and SNIP-36 v1 stores before it) a send is
-**one transaction**: the zkmsg statement runs inside StarkWare's virtual
-Starknet OS (contract `ZkmsgSendProverV3`, executed only here), the S-two
-proof of that run rides in the invoke's `proof` field, and the sequencer
-verifies it natively before `send_message` checks the proof's one L2→L1
-message against the public tuple. No wrap, no staging, no fact registry.
-`core/src/virtual_send.rs` is a port of the phone's
-`VirtualSendExecutor`, rules included: tree/paths/nonce read at one block,
+On the v4 pool (as on the v3, v2 and SNIP-36 v1 stores before it) a send
+is **one transaction**: the zkmsg statement runs inside StarkWare's
+virtual Starknet OS (contract `ZkmsgSendProverV4`, executed only here),
+the S-two proof of that run rides in the invoke's `proof` field, and the
+sequencer verifies it natively before the pool checks the proof's one
+L2→L1 message against the public tuple. No wrap, no staging, no fact
+registry. `core/src/virtual_send.rs` started as a port of the phone's
+`VirtualSendExecutor`, rules included: trees/paths read at one block,
 witness only in memory (it reaches the prover on stdin), facts checked
-before signing, `is_known_root` before publish, the publish hash saved the
-moment the gateway takes it.
+before publishing, `is_known_root` before publish, the publish hash saved
+the moment before the gateway takes it.
 
 Needs the prover binary, built once from the sequencer checkout (see
 `tools/snip36-phone-ffi/README.md`, "Desktop"):
@@ -111,17 +171,19 @@ Needs the prover binary, built once from the sequencer checkout (see
 zan); the publish goes to the Sepolia gateway, because JSON-RPC can't
 carry `proof` / `proof_facts`.
 
-**Signing key decision:** the publish leg signs natively
-(`core/src/invoke_v3.rs`: INVOKE v3 hash with `proof_facts` appended, per
-SNIP-36), with the key read from sncast's accounts file — the one place
-every desktop account key already lives (`sncast account create` made
-them all). `keys.json` holds no account key: it carries the scan key,
-`kem_seed` and `member_secret` (plus handle and leaf index).
+**Signing:** since v4 the publish is not signed at all (the pool
+authorizes by proof); `core/src/invoke_v3.rs` still computes its INVOKE v3
+hash, with `proof_facts` appended per SNIP-36, so the client knows the
+hash before the POST. Account keys stay where sncast put them
+(`~/.starknet_accounts/…`) and only sign registration and ticket
+purchases, through sncast. `keys.json` carries the scan key, `kem_seed`
+and `member_secret` (plus handle and leaf index); `tickets.json` the
+ticket secrets.
 
 First desktop send, 2026-10-01: carol → mode2 on the v1 store, tx
 `0x7106fea0…e4a7`, **35 s wall on an M-series Mac (prove 19 s), 1.58 STRK**
-(76.9M L2 gas, 352 data gas). The account must hold ~4 STRK of fee
-ceiling (120M L2 gas × price × 1.5), not just the ~1.6 a send costs.
+(76.9M L2 gas, 352 data gas). (Before v4 the account had to hold ~4 STRK
+of fee ceiling per send; now the pool holds it, out of tickets.)
 
 ## GUI
 
@@ -131,10 +193,10 @@ The same product as a native egui app (macOS/Apple Silicon):
 cargo run --release -p zkmsg-gui -- --home ~/.zkmsg   # same --home as the CLI
 ```
 
-Three tabs — **Status** (identity, balances, addresses; doubles as
-init/register onboarding), **Compose** (recipient resolve, byte counter,
-and a send gated behind an explicit confirm dialog stating the STRK
-cost), **Inbox** (trial-decrypt scan with manual Refresh + optional 30 s
+Three tabs — **Status** (identity, balances, tickets with a "Buy 1
+ticket" button, addresses; doubles as init/register onboarding),
+**Compose** (recipient resolve, byte counter, and a send gated behind an
+explicit confirm dialog stating that it spends a ticket), **Inbox** (trial-decrypt scan with manual Refresh + optional 30 s
 auto-refresh). During a send the compose view becomes a live checklist —
 one row per step (prepare, prove, publish), the publish hash as a
 Voyager link the moment it is submitted.
@@ -185,7 +247,7 @@ unlinkable loop 2026-07-10 — external deposit, send to alice (fact
 `0x4535d688…c46a`), sweep + archive: see
 `docs/zkmsg-deployment.md`.
 
-## What's public, what's private (v2/v3, honest)
+## What's public, what's private (v4, honest)
 
 - **Private, cryptographically**: message content (AES-256-GCM under a
   key derived from BOTH ML-KEM-768 and ephemeral Stark-curve ECDH — a
@@ -197,12 +259,17 @@ unlinkable loop 2026-07-10 — external deposit, send to alice (fact
   the message, not which. Under v3 the witness is the member secret `m`,
   the sender's scan PUBLIC key, `kem_digest`, leaf index and path — the
   scan private key is not in it. The witness never leaves the device.
-- **Public**: that *some* account paid for a send, the registered-user
-  set (handles, scan pubkeys, ML-KEM keys, `m_commit`s), timing and
-  ciphertext length. With a normal profile the paying account is YOURS.
-  With a **burner** the sending account is a fresh, externally-funded
-  throwaway with no on-chain edge to any account you own — the app
-  never draws one.
+- **Public**: that *a member* sent something, through the pool; the
+  registered-user set (handles, scan pubkeys, ML-KEM keys, `m_commit`s —
+  each registered from its owner's account); which accounts bought how
+  many tickets, and when; each send's quota and ticket nullifiers (which
+  link to nothing), its epoch and base block, timing and ciphertext
+  length. Before v4 the paying account was YOURS; since v4 every send's
+  sender is the pool. With few members and few ticket buyers, timing
+  (a purchase shortly before a send, a send right after a registration)
+  still narrows things down.
+- **Burners** are pre-v4: their point was an unlinked paying account,
+  which the pool now gives every profile.
 - **Burner caveats, honestly**: the anonymity set is the registered-user
   count (tiny on Sepolia); timing correlates (a registration shortly
   before a send); reusing a burner links its sends to each other. Fund

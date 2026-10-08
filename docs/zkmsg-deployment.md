@@ -1,12 +1,12 @@
 # zkmsg SHIPPED on Sepolia — the first natively-proven private message (2026-07-05)
 
-> **Current: v3 on the SNIP-36 route** — `MessageStoreV3`
-> `0x0103de67…3d9d` + `ZkmsgSendProverV3`; see "zkmsg v3: hash-based
-> membership, SNIP-36 route" at the end of this file. Everything above
-> that section is the record of retired routes and stores: the lane-1
-> send route and its store (sections through "Repro / try it"), the
-> SNIP-36 v1 store, and v2. The `pq-v2` and `pq-v3` work is merged to
-> `main` (`09834e0`; v3 through `d4d9da7`).
+> **Current: v4, the pool** — `ZkmsgPoolV4` `0x050f98ee…69b9` (store AND
+> publishing account, paid by single-send tickets) + `ZkmsgSendProverV4` +
+> `ZkmsgVirtualSenderV4`; see "zkmsg v4: the pool and tickets" at the end
+> of this file. Everything above that section is the record of retired
+> routes and stores: the lane-1 send route and its store (sections through
+> "Repro / try it"), the SNIP-36 v1 store, v2 and v3 (retired 2026-10-07:
+> every v3 send was published by the sender's own registering account).
 
 The full messagezk model — sender/recipient membership in a registered-user
 Merkle tree + ephemeral ECDH + Poseidon commitment — proven in a native
@@ -176,7 +176,7 @@ line is an unauthenticated plaintext claim.
 ## Repro / try it
 
 See `tools/zkmsg/README.md` (quickstart). `zkmsg init` now defaults to
-the v3 store (`SEPOLIA_STORE_DEFAULT` in `tools/zkmsg/core/src/config.rs`);
+the v4 pool (`SEPOLIA_STORE_DEFAULT` in `tools/zkmsg/core/src/config.rs`);
 the lane-1 store above is no longer read, and the lane-1 send route was
 removed from the client 2026-10-01.
 
@@ -275,7 +275,7 @@ base64 bytes. The prove note reads "spill class A". The content was 1,136
 bytes. The publish transaction was signed and saved before the POST
 (nonce 0x8), per the double-pay fix.
 
-## zkmsg v3: hash-based membership, SNIP-36 route (Sepolia alpha, 2026-10-01)
+## zkmsg v3: hash-based membership, SNIP-36 route (Sepolia alpha, 2026-10-01; retired 2026-10-07)
 
 Design: `docs/superpowers/specs/2026-10-01-zkmsg-v3-pq-membership-design.md`.
 Code: `contracts/messagezk_store_v3` (Scarb 2.18), branch `pq-v3` (on `main`
@@ -341,3 +341,128 @@ KEM seed from v2 and gained a member secret on launch.
 
 Membership in both sends was proved by knowledge of `m`, with no EC step,
 and the scan private key was not in the witness.
+
+## zkmsg v4: the pool and tickets (Sepolia alpha, 2026-10-07)
+
+Design: `docs/superpowers/specs/2026-10-07-zkmsg-v4-pool-tickets-design.md`.
+Code: `contracts/zkmsg_pool_v4` (Scarb 2.18, sierra 1.8; 87 snforge tests,
+`scripts/devnet_e2e.sh`), client `tools/zkmsg` — branch `pool-spike`.
+Declared and deployed from `deployer` (`0x6f3eee3c…a1ce`) via zan.
+
+Why: the 2026-10 red team showed every v1–v3 send was published, and paid
+for, by the same account that registered the sender's handle, so the chain
+named the sender. In v4 the store is itself the account that publishes
+every send (unsigned; its `__validate__` admits only a proven
+`send_message`), paid from single-send tickets bought earlier at a fixed
+price; the virtual proof runs from a shared zero-fee account. No member's
+account signs, pays for or appears in a send.
+
+| What | Value |
+|---|---|
+| `ZkmsgPoolV4` (store + account) | `0x050f98ee98a0c1a583529c115f394ad79d18686ff66dc1ee25ba0f7bc53669b9` |
+| pool class hash | `0x031324653c4269f8f3356e28817a7d8b63f5afc471a62336f0275d64087cc343` |
+| pool deploy block | **16257012** (scan start) |
+| `ZkmsgSendProverV4` | `0x0496b7e39ea515c48e8f37dd588ed1ff16c86b3ff7619c6a30ae7b473f902973` |
+| prover class hash | `0x07f3d3ab8cc1d1ced37217846eaa356962e0647c09ed8a3dfddc0949e0cda8d2` |
+| prover deploy block | 16256600 |
+| `ZkmsgVirtualSenderV4` | `0x01e9fefc5d5848690330af81644736e90cc1e7192357d06fe40080da2ddd94a4` |
+| virtual sender class hash | `0x00edf5292ff19af31c8c54c28d728a42d92b1e8ee08b9a2d1319ed68095e889a` |
+| virtual sender deploy block | 16256605 (nonce 0 forever) |
+
+Constructor (read back with `prover()`, `ticket_price()`, `rate_limit()`,
+`fee_policy()`): prover = the prover above; STRK =
+`0x04718f5a…c938d`; `ticket_price` 3 STRK (3e18 fri); `epoch_blocks`
+5,000 (≈2.4 h at Sepolia's ~1.7 s blocks; a multiple of the 100-block
+validate rounding); `max_epoch_lag` 1; `quota` 10 sends per member per
+epoch; fee policy `max_fee` 3 STRK (= the ticket price: one send can never
+cost the pool more than the ticket it burns), `max_tip` 1e9 fri,
+`min_l2_gas` 100M. Fee math at 2026-10-07 prices (L2 18.09 gfri): a
+publish measured 79.3–79.7M L2 gas (snforge/devnet put the pool's own
+validate+execute at ~4.6M on top of the ~75M proof), so the 100M floor
+leaves ~25% margin; worst case 100M × 30 gfri = 3.0 STRK fits the ticket
+while allowing the price to rise 1.66×; actual cost ≈1.43 STRK, the rest
+stays in the pool (no refunds: a refund needs a destination).
+
+Pre-deploy hardening (this branch): the store's replay key is now the
+envelope, poseidon(commitment, content_hash), not the commitment alone, so
+a member who front-runs a pending send with its commitment over other
+content no longer blocks it (red team 04-crypto F9; snforge
+`a_front_run_commitment_does_not_block_the_real_send`).
+
+Read-only checks after deploy: `prover()` = the prover; `ticket_price()` =
+3e18; `rate_limit()` = (5000, 1, 10); `fee_policy()` = (3e18, 1e9, 100M);
+both roots = zero_hash(20); `n_tickets()` = `n_messages()` = 0. The real
+`snip36-prove` proved a `prove_send` from the virtual sender at nonce 0
+before the pool existed (`core/examples/v4_prove_probe.rs`, 22 s, facts
+attest the v4 message hash), and `adversarial::live_current_store_is_pinned_to_our_prover`
+passes against the deployed pool.
+
+### Deployment transactions (from `deployer`)
+
+| tx | hash | block | fee |
+|---|---|---|---|
+| declare prover | `0x0600dc7693ff7da77fcee49229c8caca00a4da7c0b337092db2c7cb51c9a8a85` | 16256572 | 2.1631 STRK |
+| declare virtual sender | `0x07f606955b1a1d4088f2bb1a3e1daba914ad269a193f5938b7d3cd0121747b20` | 16256591 | 1.2425 STRK |
+| deploy prover | `0x063c242cc0301ad88768ea0c9e5bbb0abfd2b6476f047c96f86df414c1feedd2` | 16256600 | 0.0227 STRK |
+| deploy virtual sender | `0x01912a0ab01c5d8212efc05076e563dec9d317ebf11f9b73623c9327723768c3` | 16256605 | 0.0227 STRK |
+| declare pool | `0x06ce4f4136a2d238ddad181be6c8b697f9ce9e6cfcc6b55b73d02a642aa99425` | 16257002 | 16.6450 STRK |
+| deploy pool | `0x05f183fe07455e5c36002d31dee9c54f9b1f0c22f81cf5835274c292a0974b15` | 16257012 | 0.1243 STRK |
+
+Deploy total 20.22 STRK (the pool class is ~7k sierra felts; its declare
+alone is 16.6 STRK at these prices).
+
+### Re-key, registrations and tickets (2026-10-07)
+
+carol (`~/.zkmsg/.zkmsg-carol`, account `zkmsg-carol`) and mode
+(`~/.zkmsg/.zkmsg-mode`, now account `deployer`) were first copied to
+`~/.zkmsg-test-keys/{carol,mode}-v3-final-2026-10-07/` (700/600, `diff -r`
+clean), then moved with `zkmsg migrate-store` to fresh scan keys, ML-KEM
+seeds and member secrets (the red team's prefetch finding means every
+earlier key must be treated as exposed). mode2 (the phone) was not touched.
+
+| tx | hash | block | fee |
+|---|---|---|---|
+| register carol (leaf 0) | `0x06951b6f71090d843f9f8a4218ff61aab488baa68f298964e292229caae27a53` | 16257132 | 0.3199 STRK |
+| register mode (leaf 1) | `0x061e587f843affe5dadfac1f606134e9e8572d7c582d820f2a7bc73c47455561` | 16257135 | 0.1682 STRK |
+| carol approve 6 STRK | `0x07afc51a8dd402a83bf494880c3442aff96ce24a5424988ba6877ec9e46ac423` | 16257144 | 0.0290 STRK |
+| carol `buy_tickets` × 2 | `0x07bb8277fe35e2686f12e7cbe936cf868afcbd96f851c2264b2a6a034eb89459` | 16257147 | 0.3447 STRK + 6 STRK |
+| mode approve 6 STRK | `0x05dda4dd1ac2ddfb0167161b754c2c005db2981dd178d1584d1792dc24a9c728` | 16257215 | 0.0290 STRK |
+| mode `buy_tickets` × 2 | `0x076a22677b370aaf3fc2f67deec735ce3baba2e73844528ce77f78d13f73f7f0` | 16257216 | 0.1916 STRK + 6 STRK |
+
+### Sends through the pool
+
+Every publish: `sender_address` = the pool, `signature` = `[]`, tip 0,
+bounds L2 100M @ ≤30 gfri / L1 data 4,096 / L1 0, one call to the pool's
+own `send_message`; neither `zkmsg-carol` (`0x12466d1c…7f80`) nor
+`deployer` (`0x6f3eee3c…a1ce`) appears anywhere in the transaction or its
+receipt. Each recipient's `zkmsg inbox` decrypts; each sender's does not.
+After each, `is_ticket_spent(ticket_nullifier)` and
+`is_nullifier_spent(nullifier)` read 1.
+
+| send | publish tx | pool nonce | base → block | fee (from the ticket) | L2 gas |
+|---|---|---|---|---|---|
+| carol → mode "v4 pool test carol->mode 23:27" | `0x7f4e68b7385d34c40cb45e76cd515eea4782132f9d90e8ab62e35332d22470` | 0 | 16257164 → 16257185 | 1.4390 STRK | 79,735,400 |
+| mode → carol "v4 pool test mode->carol 23:31" | `0x7eb39d960bda032108aef2a8d88f0f9e450acb88ef23572fa97641bca9a36a5` | 1 | 16257228 → 16257248 | 1.4317 STRK | 79,333,400 |
+| mode → carol (concurrent) | `0x6a4e3423c1e62bac2fbb87b67624f9472d132f4228faf1abadbeb354da814f1` | 2 | 16257263 → 16257284 | 1.4317 STRK | 79,333,400 |
+| carol → mode (concurrent) | `0x6f0110c3801233361e0e06619a29b26dd6937778087e8151948ea6122b0ed08` | 3 | 16257263 → 16257287 | 1.4317 STRK | 79,333,400 |
+
+~36 s wall per send (prove 19–23 s). The last two ran at the same time,
+proved on the same base block and both landed, at consecutive pool nonces.
+The first send's feeder record is pinned as
+`tools/zkmsg/core/testdata/v4_pool_publish_tx.json`
+(`core/tests/v4_vectors.rs::live_pool_publish_reproduces` rebuilds its hash
+and facts from its calldata).
+
+Pool accounting after the run: 4 tickets bought (12 STRK in), 4 burnt,
+fees 5.7341 STRK, balance 6.2659 STRK = 12 − 5.7341; `n_messages` 4,
+nonce 4. The surplus can only ever pay for future sends (no owner, no
+withdraw).
+
+Total spent on v4, everything included: 33.30 STRK (deploy 20.22,
+registrations 0.49, tickets 12.00, approve/buy fees 0.59).
+
+Golden vectors for the iOS port: `tools/zkmsg/core/testdata/v4_vectors.json`
+(built and checked by `tools/zkmsg/core/tests/v4_vectors.rs`; the same
+values asserted against the contracts in
+`contracts/zkmsg_pool_v4/tests/test_vectors_v4.cairo`, which also replays
+the vectors' `prove_send` calldata through the prover).
