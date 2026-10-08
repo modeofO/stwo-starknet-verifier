@@ -55,6 +55,21 @@ pub struct SendState {
     pub publish_nonce: Option<String>,
     #[serde(default)]
     pub publish_bounds: Option<crate::invoke_v3::Bounds>,
+    /// What a v4 proof binds besides the envelope (absent in older states,
+    /// which the v4 client no longer publishes).
+    #[serde(default)]
+    pub binding: Option<V4Binding>,
+}
+
+/// The rest of a v4 send's public tuple (hex felts): the quota nullifier,
+/// the store-derived epoch and quota, and the ticket spend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V4Binding {
+    pub nullifier: String,
+    pub epoch: u64,
+    pub quota: u32,
+    pub ticket_root: String,
+    pub ticket_nullifier: String,
 }
 
 impl SendState {
@@ -80,6 +95,7 @@ impl SendState {
             base_block: Some(base_block),
             publish_nonce: None,
             publish_bounds: None,
+            binding: None,
         }
     }
 

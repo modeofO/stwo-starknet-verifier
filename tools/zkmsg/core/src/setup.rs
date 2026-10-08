@@ -360,16 +360,20 @@ pub const FALLBACK_FUNDING_STRK: u64 = 10;
 const FLAT_SETUP_FRI: u128 = 1_000_000_000_000_000_000;
 const FRI_PER_STRK: u128 = 1_000_000_000_000_000_000;
 
+/// L2 gas of the account's own transactions besides deploy: register
+/// (measured 9.7–18.1M) plus a ticket purchase's approve + buy, generously.
+const SETUP_L2_GAS: u128 = 40_000_000;
+
 /// Recommended funding for one send from a fresh account, in whole STRK,
 /// from live (l1, l2, l1_data) gas prices in fri.
 ///
-/// The binding constraint is validation against the publish's whole fee
-/// ceiling (`virtual_send::GAS_POLICY`: amounts × 1.5× prices), not the
-/// ~1.6 STRK a send ends up costing: the account must hold the ceiling when
-/// the gateway checks it. Plus setup fees, +10% margin, ceil.
-pub fn recommended_funding_strk(prices: (u128, u128, u128)) -> u64 {
-    let ceiling = crate::virtual_send::fee_ceiling_fri(&crate::virtual_send::GAS_POLICY.bounds(prices));
-    let with_margin = (ceiling + FLAT_SETUP_FRI) * 11 / 10;
+/// On the v4 pool the account never pays for a send: it registers and buys
+/// the send's ticket (`SEPOLIA_V4_TICKET_PRICE_FRI`), and the pool pays the
+/// publish out of that. So: one ticket, the setup transactions at 1.5× the
+/// L2 price plus the flat deploy/registration floor, +10% margin, ceil.
+pub fn recommended_funding_strk((_, l2, _): (u128, u128, u128)) -> u64 {
+    let setup_gas = SETUP_L2_GAS * l2.saturating_mul(3) / 2;
+    let with_margin = (crate::config::SEPOLIA_V4_TICKET_PRICE_FRI + setup_gas + FLAT_SETUP_FRI) * 11 / 10;
     with_margin.div_ceil(FRI_PER_STRK) as u64
 }
 
@@ -460,20 +464,19 @@ mod tests {
 
     #[test]
     fn recommended_funding_tracks_l2_price() {
-        // Pure-l2 price points (l1/data zero to keep arithmetic exact).
-        // 20 Gfri: ceiling 120M * 30e9 = 3.6e18; + 1 STRK flat = 4.6e18;
-        // *1.1 = 5.06e18 -> ceil 6 STRK.
+        // 20 Gfri: setup 40M * 30e9 = 1.2e18; + 3 STRK ticket + 1 STRK flat
+        // = 5.2e18; *1.1 = 5.72e18 -> ceil 6 STRK.
         assert_eq!(recommended_funding_strk((0, 20_000_000_000, 0)), 6);
-        // carol's 2026-07 spike, 43.9 Gfri: 120M * 65.85e9 = 7.902e18 + 1e18
-        // = 8.902e18; *1.1 = 9.7922e18 -> ceil 10 STRK.
-        assert_eq!(recommended_funding_strk((0, 43_900_000_000, 0)), 10);
+        // carol's 2026-07 spike, 43.9 Gfri: 40M * 65.85e9 = 2.634e18 + 4e18
+        // = 6.634e18; *1.1 = 7.2974e18 -> ceil 8 STRK.
+        assert_eq!(recommended_funding_strk((0, 43_900_000_000, 0)), 8);
         // Monotonic in l2 price.
         assert!(
             recommended_funding_strk((0, 50_000_000_000, 0))
                 > recommended_funding_strk((0, 20_000_000_000, 0))
         );
-        // Zero prices still demand the flat fee floor (deploy+register+margin).
-        assert!(recommended_funding_strk((0, 0, 0)) >= 2);
+        // Zero prices still demand a ticket and the flat fee floor.
+        assert_eq!(recommended_funding_strk((0, 0, 0)), 5);
     }
 
     #[test]

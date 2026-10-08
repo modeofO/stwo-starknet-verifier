@@ -1,5 +1,6 @@
-//! The v3 store's registrations, rebuilt locally from its `UserRegistered`
-//! events: handle lookups, the membership tree and Merkle paths.
+//! The store's registrations (the v4 pool's are v3's), rebuilt locally from
+//! its `UserRegistered` events: handle lookups, the membership tree and
+//! Merkle paths.
 //!
 //! Why not `get_user(handle)` / `get_merkle_path(leaf)`: those reads tell the
 //! RPC provider which handles a client cares about — while preparing a send,
@@ -300,23 +301,23 @@ pub(crate) mod tests {
     }
 
     /// Live, read-only: the tree rebuilt from the real v3 store's events
-    /// equals `get_merkle_root` at the same block.
+    /// equals `get_merkle_root` at the same block (the current store).
     /// `cargo test -p zkmsg-core live_registry -- --ignored`
     #[test]
     #[ignore = "network: reads Sepolia"]
     fn live_registry_root_matches_the_store() {
-        use crate::config::{SEPOLIA_PROVER_RPC, SEPOLIA_STORE_V3};
+        use crate::config::{SEPOLIA_POOL_V4 as SEPOLIA_STORE, SEPOLIA_PROVER_RPC};
         use serde_json::json;
         let rpc = std::env::var("ZKMSG_RPC").unwrap_or_else(|_| SEPOLIA_PROVER_RPC.into());
         let chain = Chain::new(&rpc, "unused");
         let block = chain.rpc("starknet_blockNumber", json!([])).unwrap().as_u64().unwrap();
-        let reg = Registry::fetch(&chain, SEPOLIA_STORE_V3, Some(block)).unwrap();
+        let reg = Registry::fetch(&chain, SEPOLIA_STORE, Some(block)).unwrap();
         let root = chain
             .rpc(
                 "starknet_call",
                 json!([
                     {
-                        "contract_address": SEPOLIA_STORE_V3,
+                        "contract_address": SEPOLIA_STORE,
                         "entry_point_selector": felt_hex(&snkeccak("get_merkle_root")),
                         "calldata": [],
                     },
@@ -336,7 +337,7 @@ pub(crate) mod tests {
                     "starknet_call",
                     json!([
                         {
-                            "contract_address": SEPOLIA_STORE_V3,
+                            "contract_address": SEPOLIA_STORE,
                             "entry_point_selector": felt_hex(&snkeccak("get_merkle_path")),
                             "calldata": [felt_hex(&Felt::from(leaf))],
                         },

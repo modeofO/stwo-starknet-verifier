@@ -69,6 +69,17 @@ impl GatewayError {
         rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
     }
 
+    /// The account's `__validate__` refused with this Cairo reason (the v4
+    /// pool's `'ticket spent'`, …). The gateway quotes it as text and/or as
+    /// its hex encoding; either matches.
+    pub fn refused_with(&self, reason: &str) -> bool {
+        matches!(
+            self,
+            Self::Rejected { message, .. }
+                if message.contains(reason) || message.contains(&hex::encode(reason))
+        )
+    }
+
     /// The proof's base block is still within 10 blocks of the head; waiting
     /// fixes it.
     pub fn too_recent(&self) -> bool {
@@ -108,8 +119,9 @@ pub struct ProofAttachment<'a> {
     pub proof_facts: &'a [Felt],
 }
 
-/// An INVOKE v3 signed and ready to submit. Kept whole so a retry resubmits
-/// the identical transaction (same hash, so it can only ever land once).
+/// An INVOKE v3 built (and signed, unless its account takes no signature)
+/// and ready to submit. Kept whole so a retry resubmits the identical
+/// transaction (same hash, so it can only ever land once).
 pub struct SignedInvoke {
     pub hash: Felt,
     body: Value,
@@ -140,10 +152,38 @@ impl Gateway {
         bounds: Bounds,
         attachment: Option<&ProofAttachment<'_>>,
     ) -> Result<SignedInvoke> {
+        let mut invoke = self.invoke(signer.address, calls, nonce, bounds, attachment);
+        let [r, s] = signer.sign(&invoke.hash)?;
+        invoke.body["signature"] = json!([felt_hex(&r), felt_hex(&s)]);
+        Ok(invoke)
+    }
+
+    /// One INVOKE v3 from an account that authorizes by proof, not by
+    /// signature (the v4 pool): the signature is empty. Like `sign_invoke`,
+    /// nothing is sent.
+    pub fn unsigned_invoke(
+        &self,
+        sender: Felt,
+        calls: &[Call],
+        nonce: Felt,
+        bounds: Bounds,
+        attachment: Option<&ProofAttachment<'_>>,
+    ) -> SignedInvoke {
+        self.invoke(sender, calls, nonce, bounds, attachment)
+    }
+
+    fn invoke(
+        &self,
+        sender: Felt,
+        calls: &[Call],
+        nonce: Felt,
+        bounds: Bounds,
+        attachment: Option<&ProofAttachment<'_>>,
+    ) -> SignedInvoke {
         let calldata = execute_calldata(calls);
         let proof_facts = attachment.map(|a| a.proof_facts).unwrap_or(&[]);
         let hash = InvokeV3 {
-            sender: signer.address,
+            sender,
             calldata: &calldata,
             chain_id: self.chain_id,
             nonce,
@@ -152,13 +192,12 @@ impl Gateway {
             proof_facts,
         }
         .hash();
-        let [r, s] = signer.sign(&hash)?;
         let mut body = json!({
             "type": "INVOKE_FUNCTION",
             "version": "0x3",
-            "sender_address": felt_hex(&signer.address),
+            "sender_address": felt_hex(&sender),
             "calldata": calldata.iter().map(felt_hex).collect::<Vec<_>>(),
-            "signature": [felt_hex(&r), felt_hex(&s)],
+            "signature": [],
             "nonce": felt_hex(&nonce),
             "resource_bounds": bounds.gateway_json(),
             "tip": "0x0",
@@ -171,8 +210,7 @@ impl Gateway {
             body["proof"] = json!(a.proof);
             body["proof_facts"] = json!(a.proof_facts.iter().map(felt_hex).collect::<Vec<_>>());
         }
-
-        Ok(SignedInvoke { hash, body })
+        SignedInvoke { hash, body }
     }
 
     /// Submits a signed invoke, checking the gateway echoes the hash we
@@ -319,6 +357,54 @@ mod tests {
     fn detects_too_recent() {
         assert!(rejected("StarknetErrorCode.INVALID_PROOF", "proof block is too recent").too_recent());
         assert!(!rejected("StarknetErrorCode.INVALID_PROOF", "bad proof").too_recent());
+    }
+
+    #[test]
+    fn detects_validate_refusals() {
+        let e = rejected(
+            "StarknetErrorCode.VALIDATE_FAILURE",
+            "Execution failed. Failure reason: 0x7469636b6574207370656e74 ('ticket spent').",
+        );
+        assert!(e.refused_with("ticket spent"));
+        assert!(!e.refused_with("nullifier spent"));
+        let hex_only = rejected("StarknetErrorCode.VALIDATE_FAILURE", "Failure reason: 0x7469636b6574207370656e74.");
+        assert!(hex_only.refused_with("ticket spent"));
+    }
+
+    /// The pool's publish: the v3 invoke hash with the pool as sender and an
+    /// EMPTY signature on the wire.
+    #[test]
+    fn unsigned_invoke_hashes_like_a_signed_one() {
+        let gateway = Gateway::sepolia();
+        let pool = Felt::from_hex("0x9001").unwrap();
+        let call = Call::new(pool, "send_message", vec![Felt::ONE, Felt::TWO]);
+        let facts = [Felt::THREE];
+        let attachment = ProofAttachment { proof: "AAAA", proof_facts: &facts };
+        let bounds = Bounds::default();
+        let tx = gateway.unsigned_invoke(pool, std::slice::from_ref(&call), Felt::from(4u64), bounds, Some(&attachment));
+        let calldata = execute_calldata(&[call.clone()]);
+        let want = InvokeV3 {
+            sender: pool,
+            calldata: &calldata,
+            chain_id: gateway.chain_id,
+            nonce: Felt::from(4u64),
+            tip: 0,
+            bounds,
+            proof_facts: &facts,
+        }
+        .hash();
+        assert_eq!(tx.hash, want);
+        assert_eq!(tx.body["signature"], json!([]));
+        assert_eq!(tx.body["sender_address"], felt_hex(&pool));
+        assert_eq!(tx.body["proof_facts"], json!(["0x3"]));
+
+        // A signed invoke is the same transaction plus its signature.
+        let signer = Signer::new(pool, Felt::from_hex("0x1234").unwrap());
+        let signed = gateway
+            .sign_invoke(&signer, &[call], Felt::from(4u64), bounds, Some(&attachment))
+            .unwrap();
+        assert_eq!(signed.hash, want);
+        assert_eq!(signed.body["signature"].as_array().unwrap().len(), 2);
     }
 
     #[test]

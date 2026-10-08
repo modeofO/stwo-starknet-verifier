@@ -12,5 +12,6 @@ pub mod registry;
 pub mod sequencer;
 pub mod setup;
 pub mod state;
+pub mod tickets;
 pub mod tree;
 pub mod virtual_send;

@@ -396,6 +396,67 @@ pub fn leaf_v3(scan_pub: &Felt, kem_digest: &Felt, m_commit: &Felt) -> Felt {
     starknet_crypto::poseidon_hash_many(&[leaf_v3_domain(), *scan_pub, *kem_digest, *m_commit])
 }
 
+// ---------------------------------------------------------------------------
+// v4: the pool's rate-limit nullifier and single-send tickets
+// (docs/superpowers/specs/2026-10-07-zkmsg-v4-pool-tickets-design.md;
+// contracts/zkmsg_pool_v4/src/prover.cairo)
+//
+//   nullifier        = poseidon_hash_many([NULLIFIER_V4, store, m, epoch, slot])
+//   ticket leaf      = poseidon_hash_many([TICKET_V4, t])
+//   ticket nullifier = poseidon_hash_many([TICKET_NULL_V4, store, t])
+//   envelope key     = poseidon_hash_many([commitment, content_hash])
+//
+// A ticket secret t has the member secret's form: 32 bytes BE, top 5 bits
+// clear, nonzero.
+// ---------------------------------------------------------------------------
+
+/// 'zkmsg-nullifier-v4' as a Cairo short string.
+pub fn nullifier_v4_domain() -> Felt {
+    Felt::from_bytes_be_slice(b"zkmsg-nullifier-v4")
+}
+
+/// 'zkmsg-ticket-v4' as a Cairo short string.
+pub fn ticket_v4_domain() -> Felt {
+    Felt::from_bytes_be_slice(b"zkmsg-ticket-v4")
+}
+
+/// 'zkmsg-ticket-null-v4' as a Cairo short string.
+pub fn ticket_null_v4_domain() -> Felt {
+    Felt::from_bytes_be_slice(b"zkmsg-ticket-null-v4")
+}
+
+/// The member's quota nullifier for `slot` of `epoch` on `store`. `m` and
+/// `slot` stay private, so it names neither the member nor the slot.
+pub fn nullifier_v4(store: &Felt, m: &Felt, epoch: u64, slot: u32) -> Felt {
+    starknet_crypto::poseidon_hash_many(&[
+        nullifier_v4_domain(),
+        *store,
+        *m,
+        Felt::from(epoch),
+        Felt::from(slot),
+    ])
+}
+
+/// Fresh ticket secret: the member secret's distribution (< 2^251, nonzero).
+pub fn ticket_secret_gen() -> [u8; MEMBER_SECRET_LEN] {
+    member_secret_gen()
+}
+
+/// What `buy_tickets` publishes for the ticket `t`.
+pub fn ticket_leaf(t: &Felt) -> Felt {
+    starknet_crypto::poseidon_hash_many(&[ticket_v4_domain(), *t])
+}
+
+/// What a send spending the ticket `t` on `store` reveals.
+pub fn ticket_nullifier(store: &Felt, t: &Felt) -> Felt {
+    starknet_crypto::poseidon_hash_many(&[ticket_null_v4_domain(), *store, *t])
+}
+
+/// The key the v4 store refuses to publish twice: commitment AND content.
+pub fn envelope_key(commitment: &Felt, content_hash: &Felt) -> Felt {
+    starknet_crypto::poseidon_hash_many(&[*commitment, *content_hash])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
