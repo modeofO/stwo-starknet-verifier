@@ -11,7 +11,7 @@ use std::thread;
 use eframe::egui;
 use starknet_types_core::felt::Felt;
 
-use zkmsg_core::app::{self, RegisterOutcome, StatusReport};
+use zkmsg_core::app::{self, RegisterOutcome, StatusReport, TicketPurchase};
 use zkmsg_core::chain::Chain;
 use zkmsg_core::config::{Config, Home};
 use zkmsg_core::inbox::{self, ReceivedMessage};
@@ -152,6 +152,7 @@ pub enum StatusWorkerMsg {
     Status(Result<StatusReport, String>),
     Init(Result<Felt, String>),
     Register(Result<RegisterOutcome, String>),
+    BuyTickets(Result<TicketPurchase, String>),
 }
 
 /// `home_dir` (not `Home`) so the caller can keep its own `Home` alive —
@@ -189,6 +190,19 @@ pub fn spawn_register(
         let home = Home::new(home_dir);
         let result = app::register(&home, &handle).map_err(|e| format!("{e:#}"));
         let _ = tx.send(StatusWorkerMsg::Register(result));
+        ctx.request_repaint();
+    });
+    rx
+}
+
+/// Buys `count` tickets from the profile's account (two transactions, each
+/// waited on) — same one-shot shape as `spawn_register`.
+pub fn spawn_buy_tickets(home_dir: PathBuf, count: usize, ctx: egui::Context) -> Receiver<StatusWorkerMsg> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let home = Home::new(home_dir);
+        let result = app::buy_tickets(&home, count).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(StatusWorkerMsg::BuyTickets(result));
         ctx.request_repaint();
     });
     rx

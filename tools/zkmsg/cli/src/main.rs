@@ -1,12 +1,14 @@
 //! zkmsg — private messages on Starknet, proven on your own machine. A send
 //! is one transaction: the zkmsg statement (sender membership in the
-//! registered-user tree, plus the hybrid ML-KEM + ECDH envelope) runs in
-//! StarkWare's virtual Starknet OS here, and the S-two proof of that run
-//! rides in the invoke for the sequencer to verify (SNIP-36,
+//! registered-user tree, a per-epoch quota nullifier, a spent fee ticket,
+//! plus the hybrid ML-KEM + ECDH envelope) runs in StarkWare's virtual
+//! Starknet OS here, and the S-two proof of that run rides in an invoke that
+//! the v4 POOL publishes and pays for — never your own account (SNIP-36,
 //! core/src/virtual_send.rs).
 //!
-//! Specs: docs/superpowers/specs/2026-10-01-zkmsg-desktop-snip36-pq-design.md
-//! and 2026-10-01-zkmsg-pq-hybrid-kem-design.md.
+//! Specs: docs/superpowers/specs/2026-10-07-zkmsg-v4-pool-tickets-design.md,
+//! 2026-10-01-zkmsg-desktop-snip36-pq-design.md and
+//! 2026-10-01-zkmsg-pq-hybrid-kem-design.md.
 
 use std::path::PathBuf;
 
@@ -57,37 +59,49 @@ enum Command {
         /// sncast account name to send transactions from.
         #[arg(long, default_value = "funded-deployer")]
         account: String,
-        /// MessageStore address (defaults to the v3 store).
+        /// Store address (defaults to the v4 pool).
         #[arg(long)]
         store: Option<String>,
     },
-    /// Register a handle on-chain (one tx).
+    /// Register a handle on-chain (one tx, from the profile's account).
     Register { handle: String },
-    /// Prove + publish a private message: one transaction, ~1.6 STRK (the
-    /// account must hold ~4 STRK of fee ceiling).
+    /// Prove + publish a private message: one transaction, published and
+    /// paid by the pool, spending one of your tickets. Your account is not
+    /// involved.
     Send { handle: String, text: String },
+    /// Buy single-send tickets (3 STRK each) from the profile's account.
+    /// The secrets are saved to tickets.json (0600) before anything is sent.
+    BuyTickets {
+        #[arg(default_value_t = 1)]
+        count: usize,
+    },
+    /// The ticket wallet: unspent / reserved / spent / pending tickets.
+    Tickets,
     /// Resume an interrupted send (its proof is saved; Publish is retried).
     Resume { id: String },
     /// Scan MessageSent events and decrypt the ones addressed to you.
     Inbox,
     /// Config, balance, deployed addresses.
     Status,
-    /// Point a profile at the v3 store (hash-based post-quantum membership).
+    /// Point a profile at the v4 pool (accountless, ticket-paid sends).
     /// Registration is per store: the handle is cleared and you register
-    /// again. The scan key is kept, a fresh membership secret is minted, and
-    /// an ML-KEM key is added if the profile predates v2.
+    /// again, with a FRESH scan key, ML-KEM seed and membership secret (the
+    /// old keys are overwritten — back the profile up first).
     MigrateStore {
         /// Profile name under the profile root (default: the current one).
         profile: Option<String>,
+        /// sncast account to register and buy tickets from (default: keep).
+        #[arg(long)]
+        account: Option<String>,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Command::MigrateStore { profile: Some(name) } = &cli.command {
+    if let Command::MigrateStore { profile: Some(name), account } = &cli.command {
         let dir = cli.home_dir().join(format!("{}{name}", zkmsg_core::profiles::PROFILE_PREFIX));
         ensure!(dir.join("config.json").exists(), "no profile '{name}' at {}", dir.display());
-        return cmd_migrate_store(&Home::new(dir));
+        return cmd_migrate_store(&Home::new(dir), account.as_deref());
     }
     let dir = zkmsg_core::profiles::resolve_cli_home(&cli.home_dir())?;
     let home = Home::new(dir);
@@ -97,9 +111,11 @@ fn main() -> Result<()> {
         Command::Register { handle } => cmd_register(&home, &handle),
         Command::Send { handle, text } => cmd_send(&home, &handle, &text),
         Command::Resume { id } => cmd_resume(&home, &id),
+        Command::BuyTickets { count } => cmd_buy_tickets(&home, count),
+        Command::Tickets => cmd_tickets(&home),
         Command::Inbox => cmd_inbox(&home),
         Command::Status => cmd_status(&home),
-        Command::MigrateStore { .. } => cmd_migrate_store(&home),
+        Command::MigrateStore { account, .. } => cmd_migrate_store(&home, account.as_deref()),
     }
 }
 
@@ -137,14 +153,43 @@ fn cmd_send(home: &Home, handle: &str, text: &str) -> Result<()> {
     ensure!(!config.store.is_empty(), "no store address in config.json");
     ensure!(
         app::on_current_store(&config),
-        "{} is not the v3 store — `zkmsg migrate-store` moves the profile",
+        "{} is not the v4 pool — `zkmsg migrate-store` moves the profile",
         config.store,
     );
     keys.leaf_index.context("not registered — run `zkmsg register`")?;
-    // The fee-ceiling check runs inside, against live prices, before proving.
+    // The ticket and the pool's fee policy are checked inside, before proving.
     let state = app::send_virtual(home, &config, &keys, handle, text, &mut sink())?;
-    println!("send '{}' -> {handle} published", state.id);
+    println!("send '{}' -> {handle} published by the pool", state.id);
     Ok(())
+}
+
+fn cmd_buy_tickets(home: &Home, count: usize) -> Result<()> {
+    println!("buying {count} ticket(s) — the secrets are saved before anything is sent");
+    let p = app::buy_tickets(home, count)?;
+    println!("approve tx {}", p.approve_tx);
+    println!("buy tx     {}", p.buy_tx);
+    println!(
+        "bought {} x {} STRK; wallet: {}",
+        p.bought,
+        p.price_fri as f64 / 1e18,
+        tickets_line(&p.counts)
+    );
+    Ok(())
+}
+
+fn cmd_tickets(home: &Home) -> Result<()> {
+    println!("tickets  : {}", tickets_line(&app::sync_tickets(home)?));
+    Ok(())
+}
+
+fn tickets_line(c: &zkmsg_core::tickets::TicketCounts) -> String {
+    let mut line = format!("{} unspent", c.unspent);
+    for (n, what) in [(c.reserved, "reserved by a pending send"), (c.pending, "purchase pending"), (c.spent, "spent")] {
+        if n > 0 {
+            line.push_str(&format!(", {n} {what}"));
+        }
+    }
+    line
 }
 
 fn cmd_resume(home: &Home, id: &str) -> Result<()> {
@@ -184,13 +229,13 @@ fn cmd_inbox(home: &Home) -> Result<()> {
     Ok(())
 }
 
-fn cmd_migrate_store(home: &Home) -> Result<()> {
-    let m = app::migrate_store(home)?;
+fn cmd_migrate_store(home: &Home, account: Option<&str>) -> Result<()> {
+    let m = app::migrate_store(home, account)?;
     println!(
-        "{}: store {} -> {}",
+        "{}: store {} -> {} (fresh scan key, ML-KEM seed and membership secret)",
         home.dir.display(),
         m.previous_store,
-        zkmsg_core::config::SEPOLIA_STORE_V3
+        zkmsg_core::config::SEPOLIA_POOL_V4
     );
     match m.previous_handle {
         Some(h) => println!("registration is per store — run `zkmsg register {h}` to register again"),
@@ -211,9 +256,9 @@ fn cmd_status(home: &Home) -> Result<()> {
     let route = if report.store.is_empty() {
         ""
     } else if is_current_store(&report.store) {
-        " (v3: hash-based PQ membership + hybrid ML-KEM/ECDH)"
+        " (v4 pool: accountless ticket-paid sends, PQ membership, hybrid ML-KEM/ECDH)"
     } else {
-        " (not read any more — `zkmsg migrate-store` moves to v3)"
+        " (not read any more — `zkmsg migrate-store` moves to v4)"
     };
     println!(
         "store    : {}{route}",
@@ -229,8 +274,11 @@ fn cmd_status(home: &Home) -> Result<()> {
     if let Some(n) = &report.n_messages {
         println!("messages : {n}");
     }
+    if let Some(c) = &report.tickets {
+        println!("tickets  : {} (a send spends one)", tickets_line(c));
+    }
     match report.balance_strk {
-        Some(strk) => println!("balance  : ~{strk} STRK (a send costs ~1.6; needs ~4 of fee ceiling)"),
+        Some(strk) => println!("balance  : ~{strk} STRK (pays registration and tickets, never a send)"),
         None => {
             let e = report.balance_error.as_deref().unwrap_or("?");
             println!("balance  : unavailable ({e})");

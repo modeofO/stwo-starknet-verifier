@@ -1,4 +1,4 @@
-//! Compose tab: recipient resolve, byte counter, the STRK-cost confirm
+//! Compose tab: recipient resolve, byte counter, the ticket-spend confirm
 //! dialog, and the live send-progress checklist. State lives on
 //! `ProfileSession`; this module renders it and drives the worker handoff —
 //! resolve runs in the background, and Confirm starts one worker that
@@ -20,11 +20,10 @@ use crate::session::ProfileSession;
 use crate::worker::{self, ResolveWorkerMsg, WorkerMsg};
 
 const BYTE_SOFT_CAP: usize = 1_000;
-/// Display-only estimates — NOT what gates the spend; the publish's own gas
-/// bounds are the real enforcement. The measured send, and the fee ceiling
-/// the account must hold for it (virtual_send::GAS_POLICY at 2026-09 prices).
-const VIRTUAL_COST_STRK: &str = "1.6";
-const VIRTUAL_CEILING_STRK: &str = "4";
+/// What a send spends: one ticket, bought earlier at the pool's price.
+fn ticket_strk() -> u128 {
+    zkmsg_core::config::SEPOLIA_V4_TICKET_PRICE_FRI / 1_000_000_000_000_000_000
+}
 
 impl ProfileSession {
     pub(crate) fn poll_compose_worker(&mut self) {
@@ -141,16 +140,21 @@ impl ProfileSession {
 
         ui.separator();
         let cost = self.cost_line();
-        let balance_line = match self.status.as_ref().and_then(|r| r.balance_strk) {
-            Some(strk) => format!("{cost} · balance ~{strk} STRK"),
-            None => format!("{cost} · balance unknown (see Status tab)"),
+        let tickets = self.status.as_ref().and_then(|r| r.tickets);
+        let ticket_line = match tickets {
+            Some(c) => format!("{cost} · {} unspent ticket(s)", c.unspent),
+            None => format!("{cost} · tickets unknown (see Status tab)"),
         };
-        ui.label(balance_line);
+        ui.label(ticket_line);
+        // Known-empty wallet: nothing to spend. Unknown: let the send's own
+        // check decide (it refuses before proving).
+        let out_of_tickets = tickets.is_some_and(|c| c.unspent == 0);
 
         let can_send = matches!(self.compose_resolved, Some(Ok(_)))
             && !self.compose_text.trim().is_empty()
             && !self.work_in_flight()
             && self.is_virtual_route()
+            && !out_of_tickets
             && !locked;
         ui.add_enabled_ui(can_send, |ui| {
             if ui.button("Send").clicked() {
@@ -158,7 +162,10 @@ impl ProfileSession {
             }
         });
         if !self.is_virtual_route() {
-            ui.label("this profile's store is retired — move it to the v3 store on the Status tab");
+            ui.label("this profile's store is retired — move it to the v4 pool on the Status tab");
+        }
+        if out_of_tickets {
+            ui.label("no unspent ticket — buy one on the Status tab");
         }
         if locked {
             ui.label("a profile setup is running — sending is paused until it finishes");
@@ -189,8 +196,10 @@ impl ProfileSession {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "Publish this message to {recipient}? This spends \
-                     ~{VIRTUAL_COST_STRK} STRK on Sepolia and cannot be undone."
+                    "Publish this message to {recipient}? This spends one ticket \
+                     ({} STRK, already paid) and cannot be undone. The pool publishes \
+                     it; your account is not involved.",
+                    ticket_strk()
                 ));
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
@@ -216,10 +225,7 @@ impl ProfileSession {
     }
 
     fn cost_line(&self) -> String {
-        format!(
-            "send costs ~{VIRTUAL_COST_STRK} STRK (one transaction; the account must hold \
-             ~{VIRTUAL_CEILING_STRK} STRK of fee ceiling)"
-        )
+        format!("a send spends one ticket ({} STRK); the pool publishes and pays for it", ticket_strk())
     }
 
     /// Prepare, prove and publish run as one worker (the witness never

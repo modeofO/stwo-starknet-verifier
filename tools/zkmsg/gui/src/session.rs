@@ -48,6 +48,8 @@ pub struct ProfileSession {
     pub(crate) status: Option<StatusReport>,
     init_pubkey: Option<String>,
     register_outcome: Option<RegisterOutcome>,
+    /// The last ticket purchase's outcome line.
+    ticket_note: Option<String>,
     /// Shared across tabs (status + inbox) — each poll routine clears it
     /// on success and sets it on failure, same as the Status tab always did.
     pub(crate) last_error: Option<String>,
@@ -111,6 +113,7 @@ impl ProfileSession {
             status: None,
             init_pubkey: None,
             register_outcome: None,
+            ticket_note: None,
             last_error: None,
             fetched_once: false,
             busy: false,
@@ -281,6 +284,13 @@ impl ProfileSession {
                 self.last_error = None;
             }
             StatusWorkerMsg::Register(Err(e)) => self.last_error = Some(e),
+            StatusWorkerMsg::BuyTickets(Ok(p)) => {
+                self.ticket_note = Some(format!("bought {} ticket(s) — buy tx {}", p.bought, p.buy_tx));
+                self.last_error = None;
+                // Re-read the status (ticket counts, balance) next frame.
+                self.fetched_once = false;
+            }
+            StatusWorkerMsg::BuyTickets(Err(e)) => self.last_error = Some(e),
         }
     }
 
@@ -305,10 +315,10 @@ impl ProfileSession {
             return;
         }
         self.migrate_offer(ui);
-        self.status_panel(ui, ctx);
+        self.status_panel(ui, ctx, locked);
     }
 
-    /// Offered on any profile not yet on the v3 store. Local-only (config +
+    /// Offered on any profile not yet on the v4 pool. Local-only (config +
     /// keys rewrite, no transaction); the register panel takes over after.
     fn migrate_offer(&mut self, ui: &mut egui::Ui) {
         let on_current = self.config.as_ref().is_some_and(zkmsg_core::app::on_current_store);
@@ -317,12 +327,12 @@ impl ProfileSession {
         }
         ui.horizontal(|ui| {
             ui.label(
-                "This profile points at a retired store, which is no longer read. The v3 store \
-                 has post-quantum key exchange and hash-based membership.",
+                "This profile points at a retired store, which is no longer read. On the v4 pool \
+                 sends are published and paid by the pool (with tickets), never by your account.",
             );
             ui.add_enabled_ui(!self.busy && !self.work_in_flight(), |ui| {
-                if ui.button("Move to v3 store…").clicked() {
-                    match zkmsg_core::app::migrate_store(&self.home) {
+                if ui.button("Move to v4 pool…").clicked() {
+                    match zkmsg_core::app::migrate_store(&self.home, None) {
                         Ok(m) => {
                             if let Some(h) = m.previous_handle {
                                 self.handle_input = h;
@@ -338,7 +348,11 @@ impl ProfileSession {
                 }
             });
         });
-        ui.label("Registration is per store: you'll register your handle again (one cheap transaction).");
+        ui.label(
+            "Registration is per store: you'll register your handle again (one cheap transaction), \
+             with fresh keys — this profile's current keys are replaced, so back the profile \
+             directory up first.",
+        );
         ui.separator();
     }
 
@@ -416,7 +430,7 @@ impl ProfileSession {
         }
     }
 
-    fn status_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn status_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, locked: bool) {
         // Kick the first live fetch automatically, exactly once; after
         // that (success OR error) only the Refresh button re-fires it —
         // otherwise a persistent RPC failure would re-spawn a fetch on
@@ -490,7 +504,7 @@ impl ProfileSession {
             ui.label("balance");
             match report.balance_strk {
                 Some(strk) => {
-                    ui.label(format!("~{strk} STRK"));
+                    ui.label(format!("~{strk} STRK (registration and tickets; never a send)"));
                 }
                 None => {
                     let e = report.balance_error.as_deref().unwrap_or("?");
@@ -498,6 +512,37 @@ impl ProfileSession {
                 }
             }
             ui.end_row();
+
+            ui.label("tickets");
+            ui.label(match &report.tickets {
+                Some(c) => format!(
+                    "{} unspent · {} reserved · {} pending · {} spent",
+                    c.unspent, c.reserved, c.pending, c.spent
+                ),
+                None => "-".into(),
+            });
+            ui.end_row();
         });
+
+        // A ticket purchase is a paid transaction from this profile's
+        // account: gated like Register (and blocked while a wizard spends).
+        let on_pool = self.config.as_ref().is_some_and(zkmsg_core::app::on_current_store);
+        ui.separator();
+        ui.add_enabled_ui(on_pool && !self.busy && !self.work_in_flight() && !locked, |ui| {
+            let price = zkmsg_core::config::SEPOLIA_V4_TICKET_PRICE_FRI / 1_000_000_000_000_000_000;
+            if ui.button(format!("Buy 1 ticket ({price} STRK)")).clicked() {
+                self.busy = true;
+                self.last_error = None;
+                self.ticket_note = None;
+                self.rx = Some(worker::spawn_buy_tickets(self.home.dir.clone(), 1, ctx.clone()));
+            }
+        });
+        ui.label(
+            "A send spends one ticket; the pool publishes and pays for it. Buying shows that this \
+             account bought tickets, not which sends used them.",
+        );
+        if let Some(note) = &self.ticket_note {
+            ui.label(note.as_str());
+        }
     }
 }
