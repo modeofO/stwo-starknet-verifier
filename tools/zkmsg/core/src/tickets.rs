@@ -26,14 +26,13 @@
 //! Event (contracts/zkmsg_pool_v4/src/pool.cairo `TicketBought`):
 //!   keys = [sn_keccak("TicketBought")], data = [leaf, index]
 
-use std::fs;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
 use crate::chain::{Chain, felt_hex, felt_to_u64, snkeccak};
-use crate::config::{Home, same_address, store_deploy_block, write_atomic};
+use crate::config::{Home, same_address, store_deploy_block};
 use crate::crypto::{member_secret_felt, ticket_leaf, ticket_nullifier, ticket_secret_gen};
 use crate::tree::MerkleTree;
 
@@ -107,7 +106,7 @@ impl Wallet {
         if !path.exists() {
             return Ok(Self { store: store.to_string(), tickets: vec![] });
         }
-        let wallet: Self = serde_json::from_str(&fs::read_to_string(&path)?)
+        let wallet: Self = serde_json::from_str(&crate::vault::read_to_string(home, &path)?)
             .with_context(|| format!("reading {}", path.display()))?;
         ensure!(
             same_address(&wallet.store, store),
@@ -120,8 +119,7 @@ impl Wallet {
 
     /// Atomic and owner-only: the secrets are bearer value.
     pub fn save(&self, home: &Home) -> Result<()> {
-        fs::create_dir_all(&home.dir)?;
-        write_atomic(&home.tickets_path(), serde_json::to_string_pretty(self)?.as_bytes(), 0o600)
+        crate::vault::write(home, &home.tickets_path(), serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     pub fn counts(&self) -> TicketCounts {
@@ -338,7 +336,7 @@ impl QuotaLog {
         if !path.exists() {
             return Ok(None);
         }
-        Ok(Some(serde_json::from_str(&fs::read_to_string(&path)?).context("reading quota.json")?))
+        Ok(Some(serde_json::from_str(&crate::vault::read_to_string(home, &path)?).context("reading quota.json")?))
     }
 
     /// Takes the next free slot of `epoch` (refusing past `quota`) and
@@ -357,7 +355,7 @@ impl QuotaLog {
         );
         let slot = log.used;
         log.used += 1;
-        write_atomic(&home.quota_path(), serde_json::to_string_pretty(&log)?.as_bytes(), 0o600)?;
+        crate::vault::write(home, &home.quota_path(), serde_json::to_string_pretty(&log)?.as_bytes())?;
         Ok(slot)
     }
 }
@@ -365,6 +363,7 @@ impl QuotaLog {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::fs;
 
     /// A `TicketBought` event as the RPC returns it.
     pub(crate) fn event(leaf: Felt, index: u32) -> (Vec<String>, Vec<String>) {

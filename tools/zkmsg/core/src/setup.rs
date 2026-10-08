@@ -397,7 +397,7 @@ fn fund_needed(balance_fri: u128, fund_strk: u64) -> bool {
 
 /// The account's STRK balance in fri (u256 low limb) — same read shape as
 /// `app::account_balance_strk`, but undivided for the exact pre-check.
-/// Also reused by the External-fund deposit poll and by Task 4's sweep.
+/// Also reused by the External-fund deposit poll and the delete dialog.
 pub fn read_balance_fri(chain: &Chain, address: &str) -> Result<u128> {
     let out = chain.call(STRK_TOKEN, "balance_of", &[address.to_string()])?;
     Ok(u128::from_str_radix(

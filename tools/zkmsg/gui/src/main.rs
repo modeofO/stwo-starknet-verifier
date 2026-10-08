@@ -1,5 +1,6 @@
 mod app;
 mod compose_view;
+mod delete_view;
 mod inbox_view;
 mod migrate_view;
 mod retire_view;

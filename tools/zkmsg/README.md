@@ -256,6 +256,35 @@ because moving it anywhere would draw the on-chain edge the burner
 exists to avoid. (Retired 2026-10-01, along with the optional
 `from:` line: messages carry no sender line.)
 
+## Deleting an identity, and secrets at rest (2026-10-08)
+
+A profile's secret files — `keys.json`, `tickets*.json`, `quota.json`,
+`inbox.json` and `sends/*.json` — are sealed (AES-256-GCM, the file's
+path as associated data) under a random per-profile key that lives in
+the macOS login Keychain (service `zkmsg.profile-key`, account = the id
+in the profile's `vault.json`), never on disk. Older profiles are sealed
+in place the first time the CLI or GUI opens them. `core/src/vault.rs`.
+
+Deleting a profile (`zkmsg delete-profile <name>`, or "delete…" in the
+GUI picker, live or archived) is a crypto-shred: the Keychain key goes
+first, so every sealed byte an SSD still holds stops decrypting; then the
+account's entry in sncast's accounts file (unless another profile uses it,
+or `--keep-account-key`), then the directory, then `current`. Before
+that, unspent tickets can move to another profile on the same pool
+(`--move-tickets-to`): a ticket is a bearer secret nothing on chain ties
+to an identity. The account's balance is read only on request
+(`--check-balance`, or "check" in the dialog: it asks the RPC about the
+address from your connection) and is **abandoned, never swept** — a transfer to another account would link the two on chain.
+Nothing happens on chain: the registration stays, and messages sent to
+the deleted handle become unreadable to everyone. You confirm by typing
+the handle. `core/src/wipe.rs`.
+
+Limits, honestly: the account's private key sits in sncast's plain
+accounts file, which delete rewrites (an ordinary file rewrite, not a
+shred); a deleted Keychain item can linger in the keychain database,
+encrypted under the login keychain; any plain copy you made of a profile
+(a backup directory) is untouched.
+
 First GUI-driven send shipped 2026-07-07 (fact `0x5b824d25…f6e25`,
 47.2 STRK); first wizard-born identity (carol) created, funded and
 registered in-app 2026-07-08, and her first send (fact

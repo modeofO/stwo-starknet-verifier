@@ -95,6 +95,31 @@ enum Command {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Delete a profile (live or archived) from this machine: shred its
+    /// Keychain key, remove its account key from sncast's file and its
+    /// directory. Nothing on chain changes; the account's balance is NOT
+    /// moved (a sweep would link the accounts) and is lost with the key.
+    DeleteProfile {
+        /// Profile name under the profile root.
+        name: String,
+        /// The profile is an archived one (under `archive/`).
+        #[arg(long)]
+        archived: bool,
+        /// Move unspent tickets to this profile first (same pool).
+        #[arg(long)]
+        move_tickets_to: Option<String>,
+        /// Keep the account's entry in sncast's accounts file.
+        #[arg(long)]
+        keep_account_key: bool,
+        /// Read the account's balance first (asks the RPC about its address,
+        /// from this machine's connection).
+        #[arg(long)]
+        check_balance: bool,
+        /// The handle (or, without one, the profile name), instead of typing
+        /// it at the prompt.
+        #[arg(long)]
+        confirm: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -104,8 +129,26 @@ fn main() -> Result<()> {
         ensure!(dir.join("config.json").exists(), "no profile '{name}' at {}", dir.display());
         return cmd_migrate_store(&Home::new(dir), account.as_deref());
     }
+    if let Command::DeleteProfile { name, archived, move_tickets_to, keep_account_key, check_balance, confirm } =
+        &cli.command
+    {
+        return cmd_delete_profile(
+            &cli.home_dir(),
+            name,
+            *archived,
+            move_tickets_to.as_deref(),
+            *keep_account_key,
+            *check_balance,
+            confirm.as_deref(),
+        );
+    }
     let dir = zkmsg_core::profiles::resolve_cli_home(&cli.home_dir())?;
     let home = Home::new(dir);
+    // Profiles written before the vault: seal their secret files now.
+    if home.config_path().exists() && zkmsg_core::vault::has_plaintext(&home)? {
+        let n = zkmsg_core::vault::seal_profile(&home)?;
+        eprintln!("sealed {n} file(s) of {} under its Keychain profile key", home.dir.display());
+    }
 
     match cli.command {
         Command::Init { account, store } => cmd_init(&home, account, store),
@@ -117,7 +160,106 @@ fn main() -> Result<()> {
         Command::Inbox => cmd_inbox(&home),
         Command::Status => cmd_status(&home),
         Command::MigrateStore { account, .. } => cmd_migrate_store(&home, account.as_deref()),
+        Command::DeleteProfile { .. } => unreachable!("handled before the home resolves"),
     }
+}
+
+fn cmd_delete_profile(
+    root: &std::path::Path,
+    name: &str,
+    archived: bool,
+    move_tickets_to: Option<&str>,
+    keep_account_key: bool,
+    check_balance: bool,
+    confirm: Option<&str>,
+) -> Result<()> {
+    use zkmsg_core::wipe;
+    let plan = wipe::plan_delete(root, name, archived)?;
+    let opts = wipe::WipeOptions { delete_account_key: !keep_account_key };
+    println!("delete profile '{name}'{}", if plan.archived { " (archived)" } else { "" });
+    println!("  directory : {}", plan.dir.display());
+    println!("  handle    : {}", plan.handle.as_deref().unwrap_or("(none)"));
+    if let Some(account) = &plan.account {
+        let address = plan.account_address.as_deref().unwrap_or("address unknown");
+        println!("  account   : {account} ({address})");
+        let balance = if !check_balance {
+            "not checked (--check-balance asks the RPC)".to_string()
+        } else {
+            match wipe::account_balance_fri(&plan) {
+                Ok(fri) => wipe::strk_label(fri),
+                Err(e) => format!("unknown ({e:#})"),
+            }
+        };
+        println!("  balance   : {balance} — NOT moved: a sweep would link the accounts on chain");
+        if plan.removes_account_key(&opts) {
+            println!("  its private key is removed from sncast's accounts file: the balance is lost");
+        } else if plan.account_address.is_none() {
+            println!("  its key is not in sncast's accounts file");
+        } else if !plan.account_shared_with.is_empty() {
+            println!("  its key stays: also used by {}", plan.account_shared_with.join(", "));
+        } else {
+            println!("  its key stays in sncast's accounts file (--keep-account-key)");
+        }
+    }
+    let tickets = plan.movable_tickets;
+    match move_tickets_to {
+        Some(target) => println!("  tickets   : {tickets} move to '{target}'"),
+        None if tickets > 0 => println!(
+            "  tickets   : {tickets} unspent ABANDONED (--move-tickets-to <profile> keeps them{})",
+            if plan.ticket_targets.is_empty() {
+                String::new()
+            } else {
+                format!("; candidates: {}", plan.ticket_targets.join(", "))
+            }
+        ),
+        None => {}
+    }
+    if plan.tickets_in_flight > 0 {
+        println!("  {} ticket(s) reserved by a submitted send are not moved", plan.tickets_in_flight);
+    }
+    if plan.incomplete_sends > 0 {
+        println!("  {} incomplete send(s) are abandoned", plan.incomplete_sends);
+    }
+    if !plan.key_shared_with.is_empty() {
+        println!(
+            "  its Keychain key is NOT shredded: copies of this directory share it ({})",
+            plan.key_shared_with.join(", ")
+        );
+    }
+    println!("  on chain  : nothing changes; messages to this handle become unreadable to everyone");
+
+    let typed = match confirm {
+        Some(c) => c.to_string(),
+        None => {
+            print!("type '{}' to delete: ", plan.confirm_text());
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line.trim_end_matches(['\n', '\r']).to_string()
+        }
+    };
+    let (moved, report) = wipe::delete_profile(root, &plan, &typed, move_tickets_to, opts)?;
+    if let Some(m) = moved {
+        println!(
+            "moved {} ticket(s){}",
+            m.moved,
+            if m.already_there > 0 { format!(" ({} already there)", m.already_there) } else { String::new() }
+        );
+    }
+    println!(
+        "deleted '{name}': {}",
+        if report.shredded { "profile key shredded, directory removed" } else { "directory removed (no key shredded)" }
+    );
+    if let Some(account) = report.account_key_removed {
+        println!("removed account '{account}' from sncast's accounts file");
+    }
+    match report.new_current {
+        Some(Some(next)) => println!("current profile is now '{next}'"),
+        Some(None) => println!("no profiles left"),
+        None => {}
+    }
+    Ok(())
 }
 
 fn cmd_init(home: &Home, account: String, store: Option<String>) -> Result<()> {
@@ -229,7 +371,7 @@ fn cmd_inbox(home: &Home) -> Result<()> {
     for m in &messages {
         println!("#{:<4} {}  {}", m.nonce, &m.commitment[..18], m.text);
     }
-    std::fs::write(home.inbox_cache_path(), serde_json::to_string_pretty(&messages)?)?;
+    zkmsg_core::vault::write(home, &home.inbox_cache_path(), serde_json::to_string_pretty(&messages)?.as_bytes())?;
     Ok(())
 }
 

@@ -16,4 +16,6 @@ pub mod state;
 pub mod tickets;
 pub mod tree;
 pub mod txpolicy;
+pub mod vault;
 pub mod virtual_send;
+pub mod wipe;

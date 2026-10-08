@@ -7,7 +7,6 @@
 //! State files from the removed lane-1 pipeline (2026-10-01) no longer
 //! parse; `app::pending_sends` skips them.
 
-use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -134,13 +133,13 @@ impl SendState {
     /// Atomic (temp file + fsync + rename): a crash mid-write must never
     /// leave a truncated state that loses a recorded transaction hash.
     pub fn save(&self, home: &Home) -> Result<()> {
-        fs::create_dir_all(home.sends_dir())?;
-        crate::config::write_atomic(&Self::path(home, &self.id), serde_json::to_string_pretty(self)?.as_bytes(), 0o600)
+        crate::vault::write(home, &Self::path(home, &self.id), serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     pub fn load(home: &Home, id: &str) -> Result<Self> {
-        let raw = fs::read_to_string(Self::path(home, id))
-            .with_context(|| format!("no send state '{id}'"))?;
+        let path = Self::path(home, id);
+        anyhow::ensure!(path.exists(), "no send state '{id}'");
+        let raw = crate::vault::read_to_string(home, &path)?;
         serde_json::from_str(&raw)
             .with_context(|| format!("send state '{id}' is not a SNIP-36 send (lane-1 sends are retired)"))
     }
@@ -149,6 +148,7 @@ impl SendState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn plan() -> SendState {
         SendState::new_virtual_plan(
