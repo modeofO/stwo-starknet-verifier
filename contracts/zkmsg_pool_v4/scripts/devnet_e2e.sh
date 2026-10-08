@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Local-only end to end of the pool spike on starknet-devnet (>= 0.9).
+# CONTENT_LEN=1372|2140|5212 picks the padded size; POOL_ONLY=1 skips the virtual phase.
 # For each phase: start a throwaway devnet on 127.0.0.1, declare the three
 # classes with a predeployed account, run scripts/devnet_e2e.py, stop it.
 #   virtual: --proof-mode devnet (starknet_proveTransaction, virtual sender)
@@ -44,5 +45,5 @@ run_phase() {
   return $status
 }
 
-run_phase virtual devnet
+[ -n "${POOL_ONLY:-}" ] || run_phase virtual devnet
 run_phase pool none

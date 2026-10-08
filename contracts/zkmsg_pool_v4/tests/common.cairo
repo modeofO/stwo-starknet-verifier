@@ -23,7 +23,6 @@ use zkmsg_pool_v4::prover::{
 use crate::vector::{
     ALICE_KEM_DIGEST, ALICE_MEMBER_SECRET, ALICE_M_COMMIT, ALICE_SCAN_PUB, BOB_M_COMMIT,
     BOB_SCAN_PUB, COMMITMENT, EPHEMERAL_PUBKEY, ROOT, alice_kem_pubkey, alice_path, bob_kem_pubkey,
-    content,
 };
 
 pub const ALICE: felt252 = 0xa11ce;
@@ -242,6 +241,17 @@ pub fn tx_env(facts: Span<felt252>) {
 /// The protocol calls account entry points with caller 0.
 pub fn as_protocol(account: ContractAddress) {
     cheat_caller_address(account, addr(0), CheatSpan::TargetCalls(1));
+}
+
+/// The fixtures' send content: the v3 vector's ciphertext (1136 bytes)
+/// zero-filled to the smallest padded size, 1372 bytes. (The contracts never
+/// decrypt; only its length and hash matter here.)
+pub fn content() -> ByteArray {
+    let mut b = crate::vector::content();
+    while b.len() < zkmsg_pool_v4::pool::CONTENT_LEN_SMALL {
+        b.append_byte(0);
+    }
+    b
 }
 
 pub fn bytes(n: u32) -> ByteArray {

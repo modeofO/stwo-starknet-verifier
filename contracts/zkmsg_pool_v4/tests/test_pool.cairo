@@ -24,13 +24,11 @@ use zkmsg_pool_v4::pool::{
 use zkmsg_pool_v4::prover::{IZkmsgSendProverV4Dispatcher, ticket_leaf};
 use crate::common::{
     ALICE, BASE_BLOCK, BUYER, C1, C2, C3, C4, EPOCH, EPOCH_BLOCKS, MIN_L2_GAS, N_TICKETS, Proven,
-    QUOTA, Send, TICKET_PRICE, addr, alice_send, as_protocol, buy, bytes, deploy_pool_with,
+    QUOTA, Send, TICKET_PRICE, addr, alice_send, as_protocol, buy, bytes, content, deploy_pool_with,
     deploy_prover, deploy_strk, facts, pool_args, prove, register_as, send_calls, ticket_secret,
     tx_env,
 };
-use crate::vector::{
-    ALICE_M_COMMIT, ALICE_SCAN_PUB, EPHEMERAL_PUBKEY, ROOT, alice_kem_pubkey, content,
-};
+use crate::vector::{ALICE_M_COMMIT, ALICE_SCAN_PUB, EPHEMERAL_PUBKEY, ROOT, alice_kem_pubkey};
 
 #[derive(Drop, Copy)]
 struct Fixture {
@@ -241,12 +239,12 @@ fn a_replayed_envelope_is_rejected_in_validate() {
 fn a_front_run_commitment_does_not_block_the_real_send() {
     let f = setup();
     let mut forged = alice_send(C1, 0);
-    forged.content = bytes(1200);
+    forged.content = bytes(1372);
     publish(f, @forged);
     publish(f, @alice_send(C1, 1));
     assert_eq!(f.pool.n_messages(), 2);
     assert!(f.pool.is_envelope_consumed(C1, content_hash(@content())));
-    assert!(f.pool.is_envelope_consumed(C1, content_hash(@bytes(1200))));
+    assert!(f.pool.is_envelope_consumed(C1, content_hash(@bytes(1372))));
 }
 
 #[test]
@@ -284,7 +282,7 @@ fn other_content_is_rejected_in_validate() {
     let send = alice_send(C1, 0);
     let (_, p) = prepare(f, @send);
     let mut other = send.clone();
-    other.content.append_byte(0);
+    other.content = bytes(1372); // same padded size, other bytes
     validate(f, send_calls(f.pool.contract_address, @other, p));
 }
 
@@ -300,24 +298,67 @@ fn a_forged_nullifier_is_rejected() {
     validate(f, send_calls(f.pool.contract_address, @send, p));
 }
 
+/// Every padded size publishes; the largest still fits the event cap.
 #[test]
-#[should_panic(expected: ('content too long',))]
-fn content_past_the_event_limit_is_rejected_in_validate() {
+fn each_padded_size_publishes() {
+    let f = setup();
+    let mut slot = 0;
+    for len in array![1372_u32, 2140, 5212] {
+        let mut send = alice_send(C1 + slot.into(), slot);
+        send.content = bytes(len);
+        publish(f, @send);
+        slot += 1;
+    }
+    assert_eq!(f.pool.n_messages(), 3);
+}
+
+fn validate_len(len: u32) {
     let f = setup();
     let mut send = alice_send(C1, 0);
-    send.content = bytes(8193);
+    send.content = bytes(len);
     let (calls, _) = prepare(f, @send);
     validate(f, calls);
 }
 
 #[test]
-#[should_panic(expected: ('content too short',))]
-fn short_content_is_rejected_in_validate() {
+#[should_panic(expected: ('content not a padded size',))]
+fn one_byte_under_a_bucket_is_rejected_in_validate() {
+    validate_len(1371);
+}
+
+#[test]
+#[should_panic(expected: ('content not a padded size',))]
+fn one_byte_over_a_bucket_is_rejected_in_validate() {
+    validate_len(2141);
+}
+
+#[test]
+#[should_panic(expected: ('content not a padded size',))]
+fn the_old_unpadded_size_is_rejected_in_validate() {
+    validate_len(1136);
+}
+
+#[test]
+#[should_panic(expected: ('content not a padded size',))]
+fn past_the_top_bucket_is_rejected_in_validate() {
+    validate_len(5213);
+}
+
+/// execute applies the same rule (a direct send_message from the pool).
+#[test]
+#[should_panic(expected: ('content not a padded size',))]
+fn send_message_rejects_other_sizes_too() {
     let f = setup();
-    let mut send = alice_send(C1, 0);
-    send.content = bytes(1088 + 12 + 15);
-    let (calls, _) = prepare(f, @send);
-    validate(f, calls);
+    let send = alice_send(C1, 0);
+    let (_, p) = prepare(f, @send);
+    cheat_caller_address(
+        f.pool.contract_address, f.pool.contract_address, CheatSpan::TargetCalls(1),
+    );
+    f
+        .pool
+        .send_message(
+            C1, EPHEMERAL_PUBKEY, ROOT, p.nullifier, p.ticket_root, p.ticket_nullifier, bytes(2000),
+        );
 }
 
 // --- validate refuses calls the pool would pay for -----------------------------
@@ -635,3 +676,4 @@ fn pool_args_are_well_formed() {
     let class = declare("ZkmsgPoolV4").unwrap().contract_class();
     class.deploy(@pool_args(addr(0x9407e2), strk.contract_address, QUOTA)).unwrap();
 }
+

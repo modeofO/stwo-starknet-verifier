@@ -8,11 +8,10 @@ use zkmsg_pool_v4::prover::{
     IZkmsgSendProverV4DispatcherTrait, LEAF_V3, MEMBER_V3, NULLIFIER_V4, TICKET_NULL_V4, TICKET_V4,
     leaf_v3, member_commit, nullifier_v4, send_payload_v4, ticket_leaf, ticket_nullifier,
 };
-use crate::common::{EPOCH, QUOTA, deploy_prover};
+use crate::common::{EPOCH, QUOTA, content, deploy_prover};
 use crate::vector::{
     ALICE_KEM_DIGEST, ALICE_LEAF, ALICE_MEMBER_SECRET, ALICE_M_COMMIT, ALICE_SCAN_PUB,
     BOB_MEMBER_SECRET, COMMITMENT, EPHEMERAL_PUBKEY, LEAF_DOMAIN, MEMBER_DOMAIN, ROOT, alice_path,
-    content,
 };
 
 const STORE: felt252 = 0x5702e;

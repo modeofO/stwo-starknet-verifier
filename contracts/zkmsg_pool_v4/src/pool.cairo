@@ -41,8 +41,9 @@
 //!     was built with;
 //!   * member root known, envelope (commitment, content) unused, member
 //!     nullifier unspent, epoch fresh, ticket root known, ticket unspent;
-//!   * content length within [MIN, MAX] (MAX keeps the MessageSent event
-//!     under the 300-felt event data limit, another execute-revert source);
+//!   * content length exactly one of the padded sizes 1372 / 2140 / 5212
+//!     (all under the 300-felt event data limit, another execute-revert
+//!     source);
 //!   * fee fields within policy (src/policy.cairo).
 //!
 //! Registration is v3's, called by members from their own accounts.
@@ -162,14 +163,22 @@ pub fn envelope_key(commitment: felt252, content_hash: felt252) -> felt252 {
 }
 
 pub const KEM_PUBKEY_LEN: u32 = 1184;
-/// Shortest content: kem_ct (1088) ‖ nonce (12) ‖ GCM tag (16).
-pub const MIN_CONTENT_LEN: u32 = 1088 + 12 + 16;
-/// Longest content. MessageSent's data is [E, nonce, ...ByteArray], and a
-/// ByteArray of n bytes serializes to n/31 + 3 felts; the protocol caps event
-/// data at 300 felts (versioned constants `tx_event_limits.max_data_length`),
-/// so anything past 9175 bytes would revert in execute. 8 KiB leaves margin
-/// and fits the gateway's 5000-felt calldata cap.
-pub const MAX_CONTENT_LEN: u32 = 8192;
+/// Content = kem_ct (1088) ‖ nonce (12) ‖ AEAD(padded) ‖ GCM tag (16), and
+/// clients pad the plaintext inside the AEAD to 256, 1024 or 4096 bytes, so
+/// a send's length says only which bucket. The store accepts exactly these
+/// three lengths. The largest: MessageSent's data is [E, nonce,
+/// ...ByteArray], 5212 bytes serialize to 168 + 3 felts, 173 in all — under
+/// the protocol's 300-felt event data cap (versioned constants
+/// `tx_event_limits.max_data_length`) and the gateway's calldata cap.
+pub const CONTENT_OVERHEAD: u32 = 1088 + 12 + 16;
+pub const CONTENT_LEN_SMALL: u32 = CONTENT_OVERHEAD + 256;
+pub const CONTENT_LEN_MEDIUM: u32 = CONTENT_OVERHEAD + 1024;
+pub const CONTENT_LEN_LARGE: u32 = CONTENT_OVERHEAD + 4096;
+
+/// Whether `len` is one of the three padded sizes (1372, 2140, 5212).
+pub fn is_bucket_len(len: u32) -> bool {
+    len == CONTENT_LEN_SMALL || len == CONTENT_LEN_MEDIUM || len == CONTENT_LEN_LARGE
+}
 /// Tickets per `buy_tickets` call (bounds the call's gas).
 pub const MAX_TICKETS_PER_BUY: u32 = 32;
 
@@ -240,9 +249,8 @@ pub mod ZkmsgPoolV4 {
     use crate::policy::{FeePolicy, check_fee_fields};
     use crate::prover::{leaf_v3, send_payload_v4};
     use super::{
-        IERC20Dispatcher, IERC20DispatcherTrait, KEM_PUBKEY_LEN, MAX_CONTENT_LEN,
-        MAX_TICKETS_PER_BUY, MIN_CONTENT_LEN, SendCall, content_hash, decode_pool_calls, envelope_key,
-        kem_digest,
+        IERC20Dispatcher, IERC20DispatcherTrait, KEM_PUBKEY_LEN, MAX_TICKETS_PER_BUY, SendCall,
+        content_hash, decode_pool_calls, envelope_key, is_bucket_len, kem_digest,
     };
 
     const ROOT_HISTORY_SIZE: u8 = 64;
@@ -424,8 +432,7 @@ pub mod ZkmsgPoolV4 {
     }
 
     fn check_content_len(content: @ByteArray) {
-        assert(content.len() >= MIN_CONTENT_LEN, 'content too short');
-        assert(content.len() <= MAX_CONTENT_LEN, 'content too long');
+        assert(is_bucket_len(content.len()), 'content not a padded size');
     }
 
     /// The admission rule set, shared by validate, `check_send` and execute.

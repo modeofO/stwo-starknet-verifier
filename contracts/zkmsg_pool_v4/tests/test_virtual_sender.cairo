@@ -10,10 +10,10 @@ use zkmsg_pool_v4::merkle::{TREE_DEPTH, hash_pair, zero_hash};
 use zkmsg_pool_v4::policy::{L1_DATA_GAS, L1_GAS, L2_GAS};
 use zkmsg_pool_v4::pool::content_hash;
 use zkmsg_pool_v4::prover::ticket_leaf;
-use crate::common::{EPOCH, QUOTA, addr, deploy_prover, good_bounds};
+use crate::common::{EPOCH, QUOTA, addr, content, deploy_prover, good_bounds};
 use crate::vector::{
     ALICE_KEM_DIGEST, ALICE_MEMBER_SECRET, ALICE_SCAN_PUB, COMMITMENT, EPHEMERAL_PUBKEY, ROOT,
-    alice_path, content,
+    alice_path,
 };
 
 fn deploy_sender() -> AccountContractDispatcher {

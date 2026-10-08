@@ -3,8 +3,7 @@
 //! own functions — the Rust client and this file must agree on every value.
 //! The prove_send calldata is replayed verbatim through the real prover.
 
-use snforge_std::MessageToL1SpyTrait;
-use snforge_std::spy_messages_to_l1;
+use snforge_std::{MessageToL1SpyTrait, spy_messages_to_l1};
 use starknet::SyscallResultTrait;
 use starknet::syscalls::call_contract_syscall;
 use zkmsg_pool_v4::facts::message_hash;
@@ -106,20 +105,12 @@ fn prove_send_calldata_replays() {
     let prover = deploy_prover();
     let calldata = array![
         0x50f98ee98a0c1a583529c115f394ad79d18686ff66dc1ee25ba0f7bc53669b9,
-        0x1b6038df051fc98a724400633f4776c41f09ae7e9e8a2f03fc25e654874ef06,
-        0x8bd512dc0383b1b8,
-        0xe0e0,
-        0x7a938f628321a57d574fb07c044c64795a9d1954fee29736bfc81b0459dafa6,
-        0xcb3,
-        0xa,
+        0x1b6038df051fc98a724400633f4776c41f09ae7e9e8a2f03fc25e654874ef06, 0x8bd512dc0383b1b8,
+        0xe0e0, 0x7a938f628321a57d574fb07c044c64795a9d1954fee29736bfc81b0459dafa6, 0xcb3, 0xa,
         0x642fdbf0f58b3405e7ee922139b205c611a8d8512cea14290298e85e840ec4b,
         0x3948102149cf2d831e1a91e9014fd63216b6b83cdbbbba17fe82ccddf2df054,
         0x3d9aebb2f9823b47e55d0a962f225afa89da234c4ec60e3e8a366f079775f2e,
-        0x4d3b2a1f00112233445566778899aabbccddeeff00112233445566778899aab,
-        0x2,
-        0x1,
-        0x14,
-        0xaaa,
+        0x4d3b2a1f00112233445566778899aabbccddeeff00112233445566778899aab, 0x2, 0x1, 0x14, 0xaaa,
         0x1fb7169b936dd880cb7ebc50e932a495a60e0084cdab94a681040cb4006e1a0,
         0x17b96a8cee53f9566e4a318ccfe4bd54669d13d4e0ad518ce2905ac58ab6fcd,
         0x4268c203f18d361afc33a2d15356a4e64f2ca1f507bcefaf6e0daa5a2c4c4b8,
@@ -138,11 +129,8 @@ fn prove_send_calldata_replays() {
         0x3378095e3b6b35069a13555a585e41a8497cacf482520ed422d8a6addf0115a,
         0x1b31d8bdb4b4ca31bbf3902884c8be863315e8433a22e4aa2090c55f236b9a1,
         0x20a0570911d8a00c74573184ac517730de6f8cc0ca547f3449865eeb62b5b45,
-        0x57ae865f1792ab222addcd9174fa8ef11d8d4e70149324ec901f7674a18d575,
-        0x7111c3700001,
-        0x1,
-        0x14,
-        0x251386f00dd769bd9a0132431343bc3bee14393c5c467276b9f06b2908b0bc5,
+        0x57ae865f1792ab222addcd9174fa8ef11d8d4e70149324ec901f7674a18d575, 0x7111c3700001, 0x1,
+        0x14, 0x251386f00dd769bd9a0132431343bc3bee14393c5c467276b9f06b2908b0bc5,
         0x6cbe0b9beaf9fdab1c0c009a7e575d3ca3056ed0202e5ae6dd3c0c5407e66d2,
         0x52b8c9b2cf16ec833149721744bbd34dff1d8d0d1eb0c9ed0d447f635e73921,
         0x4268c203f18d361afc33a2d15356a4e64f2ca1f507bcefaf6e0daa5a2c4c4b8,

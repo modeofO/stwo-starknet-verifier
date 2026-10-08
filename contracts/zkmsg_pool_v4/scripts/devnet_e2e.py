@@ -138,8 +138,10 @@ def alice_path():
     return [int(x, 16) for x in re.findall(r"0x[0-9a-f]+", body)]
 
 
-CONTENT = bytearray_fn("content")
-CONTENT_HASH = const("CONTENT_HASH")
+# The v3 vector's ciphertext zero-filled to the smallest padded size: the
+# pool accepts only 1372 / 2140 / 5212-byte content.
+CONTENT = bytearray_fn("content").ljust(int(__import__("os").environ.get("CONTENT_LEN", "1372")), b"\0")
+CONTENT_HASH = H(ser_bytearray(CONTENT))
 E, ROOT, M = const("EPHEMERAL_PUBKEY"), const("ROOT"), const("ALICE_MEMBER_SECRET")
 
 
