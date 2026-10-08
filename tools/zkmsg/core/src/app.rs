@@ -11,6 +11,7 @@ use crate::chain::{Chain, account_address, bytearray_calldata, felt_hex, felt_to
 use crate::config::{Config, Home, Keys, STRK_TOKEN, is_current_store};
 use crate::crypto::{kem_digest, member_commit, scan_keygen};
 use crate::state::{SendState, StepKind};
+use crate::tickets::{TicketCounts, TicketTree, Wallet};
 
 pub struct StatusReport {
     pub rpc: String,
@@ -28,6 +29,8 @@ pub struct StatusReport {
     /// Set (and `balance_strk` left `None`) when the balance read fails,
     /// so callers can reproduce the CLI's "unavailable ({e})" message.
     pub balance_error: Option<String>,
+    /// The local ticket wallet on the current store (no network read).
+    pub tickets: Option<TicketCounts>,
 }
 
 /// Snapshots config, keys and live chain reads (message count, balance)
@@ -61,6 +64,9 @@ pub fn status(home: &Home) -> Result<StatusReport> {
         n_messages,
         balance_strk,
         balance_error,
+        tickets: is_current_store(&config.store)
+            .then(|| Wallet::load(home, &config.store).ok().map(|w| w.counts()))
+            .flatten(),
     })
 }
 
@@ -118,7 +124,7 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let config = home.load_config()?;
     ensure!(
         is_current_store(&config.store),
-        "{} is not the v3 store — `zkmsg migrate-store` first",
+        "{} is not the v4 pool — `zkmsg migrate-store` first",
         config.store
     );
     if let Some(existing) = &home.load_keys()?.handle {
@@ -148,12 +154,14 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
         Err(e) => return Err(e.context("checking whether the handle is registered")),
     };
     let tx_hash = if already.is_none() {
-        let mut calldata = vec![felt_hex(&handle_felt), keys.scan_pub.clone()];
-        calldata.extend(bytearray_calldata(&ek));
-        calldata.push(felt_hex(&m_commit));
-        let tx = chain.invoke(&config.store, "register", &calldata, &Default::default())?;
-        chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
-        Some(tx)
+        let mut calldata = vec![handle_felt, keys.scan_pub_felt()?];
+        for word in bytearray_calldata(&ek) {
+            calldata.push(Felt::from_hex(&word)?);
+        }
+        calldata.push(m_commit);
+        let call = crate::invoke_v3::Call::new(Felt::from_hex(&config.store)?, "register", calldata);
+        // Signed natively under the shared policy, like every client's.
+        Some(crate::account_tx::send(&chain, &config.account, &[call], crate::txpolicy::TxKind::Register)?)
     } else {
         None
     };
@@ -227,15 +235,17 @@ pub struct StoreMigration {
     pub previous_handle: Option<String>,
 }
 
-/// Points a profile at the v3 store. Registration is per store, so the
-/// handle and leaf index are cleared and the user registers again; the
-/// profile gets its ML-KEM seed now if it predates v2, and a FRESH
-/// membership secret (one per identity per store, never reused). The scan
-/// key is kept.
+/// Points a profile at the v4 pool. Registration is per store, so the
+/// handle and leaf index are cleared and the user registers again, with a
+/// FRESH identity: a new scan key, ML-KEM seed and membership secret. Keys
+/// reused across stores would link the identities (red team 2026-10); the
+/// old ones stay in whatever backup was taken first — this overwrites them.
+/// `account` replaces the profile's account (the one that registers and buys
+/// tickets); an empty RPC URL is reset to the Sepolia default.
 /// Refused while a send is incomplete: its proof is bound to the old store.
-pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
+pub fn migrate_store(home: &Home, account: Option<&str>) -> Result<StoreMigration> {
     let mut config = home.load_config()?;
-    ensure!(!is_current_store(&config.store), "this profile already uses the v3 store");
+    ensure!(!is_current_store(&config.store), "this profile already uses the v4 pool");
     let pending = pending_sends(home)?;
     ensure!(
         pending.is_empty(),
@@ -243,27 +253,43 @@ pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
         pending.len(),
         pending.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", "),
     );
+    if let Some(account) = account {
+        account_address(account).with_context(|| format!("account '{account}'"))?;
+    }
 
-    // One write: the old store's handle out, a seed in if there isn't one.
+    // One write: the old store's registration out, a fresh identity in.
     let mut keys = home.load_keys()?;
     let migration = StoreMigration {
         previous_store: config.store.clone(),
         previous_handle: keys.handle.take(),
     };
+    let (scan_priv, scan_pub) = scan_keygen();
+    keys.scan_priv = felt_hex(&scan_priv);
+    keys.scan_pub = felt_hex(&scan_pub);
     keys.leaf_index = None;
-    if keys.kem_seed.is_none() {
-        keys.kem_seed = Some(crate::config::kem_seed_hex(&crate::crypto::kem_seed_gen()));
-    }
+    keys.kem_seed = Some(crate::config::kem_seed_hex(&crate::crypto::kem_seed_gen()));
     keys.member_secret = Some(crate::config::member_secret_hex(&crate::crypto::member_secret_gen()));
     home.update_keys(&keys)?;
-    config.store = crate::config::SEPOLIA_STORE_V3.to_string();
+    config.store = crate::config::SEPOLIA_POOL_V4.to_string();
+    if let Some(account) = account {
+        config.account = account.to_string();
+    }
+    if config.rpc_url.is_empty() {
+        config.rpc_url = crate::config::SEPOLIA_RPC_DEFAULT.into();
+    }
     home.save_config(&config)?;
-    // The cached inbox belongs to the old store.
+    // The cached inbox and the quota log belong to the old store; its
+    // ticket wallet is set aside (kept: ticket secrets are bearer value).
     let _ = std::fs::remove_file(home.inbox_cache_path());
+    let _ = std::fs::remove_file(home.quota_path());
+    if home.tickets_path().exists() {
+        let old = home.dir.join(format!("tickets-{}.json", migration.previous_store.trim_start_matches("0x")));
+        std::fs::rename(home.tickets_path(), &old).with_context(|| format!("setting aside {}", old.display()))?;
+    }
     Ok(migration)
 }
 
-/// Whether `config` points at the store this client reads and writes (v3).
+/// Whether `config` points at the store this client reads and writes (v4).
 /// Anything else needs `migrate_store` first.
 pub fn on_current_store(config: &Config) -> bool {
     is_current_store(&config.store)
@@ -290,6 +316,73 @@ pub fn resume_send(
     sink: &mut dyn FnMut(crate::pipeline::PipelineEvent),
 ) -> Result<()> {
     crate::virtual_send::VirtualSender::new(home, config)?.resume(state, sink)
+}
+
+/// What `buy_tickets` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketPurchase {
+    /// The one `[approve, buy_tickets]` transaction.
+    pub buy_tx: String,
+    pub bought: usize,
+    pub price_fri: u128,
+    /// Wallet counts after settling against the chain (a purchase the RPC
+    /// has not indexed yet still reads as pending).
+    pub counts: TicketCounts,
+}
+
+/// Buys `n` single-send tickets from the pool with the profile's account:
+/// fresh secrets are written to `tickets.json` (0600) first, then ONE
+/// natively signed `[approve, buy_tickets(leaves)]` transaction under the
+/// shared policy. The purchase shows the account bought tickets; nothing
+/// on chain ties a later send to them.
+pub fn buy_tickets(home: &Home, n: usize) -> Result<TicketPurchase> {
+    let config = home.load_config()?;
+    ensure!(is_current_store(&config.store), "{} is not the v4 pool — `zkmsg migrate-store` first", config.store);
+    let max = crate::txpolicy::MAX_TICKETS_PER_PURCHASE;
+    ensure!((1..=max).contains(&n), "buy 1..={max} tickets at a time");
+    let chain = Chain::new(&config.rpc_url, &config.account);
+    let price_fri = {
+        let out = chain.call(&config.store, "ticket_price", &[])?;
+        u128::from_str_radix(out.first().context("ticket_price shape")?.trim_start_matches("0x"), 16)?
+    };
+    let total = price_fri.checked_mul(n as u128).context("ticket total overflows")?;
+
+    let mut wallet = Wallet::load(home, &config.store)?;
+    let first = wallet.tickets.len();
+    let leaves = wallet.mint(n)?;
+    // Bearer value: on disk before any transaction can make it real.
+    wallet.save(home)?;
+
+    let pool = Felt::from_hex(&config.store)?;
+    let approve = crate::invoke_v3::Call::new(Felt::from_hex(STRK_TOKEN)?, "approve", vec![pool, Felt::from(total), Felt::ZERO]);
+    let mut leaves_calldata = vec![Felt::from(n as u64)];
+    leaves_calldata.extend_from_slice(&leaves);
+    let buy = crate::invoke_v3::Call::new(pool, "buy_tickets", leaves_calldata);
+    let buy_tx = crate::account_tx::send(&chain, &config.account, &[approve, buy], crate::txpolicy::TxKind::BuyTickets)?;
+    for t in &mut wallet.tickets[first..] {
+        t.buy_tx = Some(buy_tx.clone());
+    }
+    wallet.save(home)?;
+
+    let tree = TicketTree::fetch(&chain, &config.store, None)?;
+    wallet.settle(&tree)?;
+    wallet.save(home)?;
+    Ok(TicketPurchase { buy_tx, bought: n, price_fri, counts: wallet.counts() })
+}
+
+/// Settles pending purchases against ALL of the pool's ticket purchases
+/// (the request names no ticket) and returns the wallet's counts.
+pub fn sync_tickets(home: &Home) -> Result<TicketCounts> {
+    let config = home.load_config()?;
+    ensure!(is_current_store(&config.store), "{} is not the v4 pool — `zkmsg migrate-store` first", config.store);
+    let mut wallet = Wallet::load(home, &config.store)?;
+    if wallet.counts().pending > 0 {
+        let chain = Chain::new(&config.rpc_url, &config.account);
+        if wallet.settle(&TicketTree::fetch(&chain, &config.store, None)?)? > 0 {
+            wallet.save(home)?;
+        }
+    }
+    Ok(wallet.counts())
 }
 
 /// Incomplete sends under `home` — id + the kind of their next pending
@@ -357,7 +450,7 @@ mod tests {
     const OLD_STORE: &str = "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f";
 
     #[test]
-    fn migrate_store_moves_to_v2_and_clears_registration() {
+    fn migrate_store_moves_to_v4_with_a_fresh_identity() {
         let dir = std::env::temp_dir().join(format!("zkmsg-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = Home::new(dir.clone());
@@ -374,17 +467,23 @@ mod tests {
         })
         .unwrap();
 
-        let m = migrate_store(&home).unwrap();
+        std::fs::write(home.quota_path(), "{}").unwrap();
+        std::fs::write(home.tickets_path(), "{}").unwrap();
+        let m = migrate_store(&home, None).unwrap();
         assert_eq!(m.previous_handle.as_deref(), Some("carol"));
         assert_eq!(m.previous_store, OLD_STORE);
         let keys = home.load_keys().unwrap();
         assert_eq!((keys.handle.as_deref(), keys.leaf_index), (None, None));
-        assert_eq!(keys.scan_priv, "0x5", "the scan key survives");
-        assert!(keys.kem_seed.is_some());
+        assert_ne!(keys.scan_priv, "0x5", "a fresh scan key: none is reused across stores");
+        assert_eq!(keys.scan_pub_felt().unwrap(), crate::crypto::ec_mul_gen_x(&keys.scan_priv_felt().unwrap()));
+        assert!(keys.kem_seed_bytes().is_ok());
         assert!(keys.member_secret_felt().is_ok(), "a fresh membership secret for the new store");
         assert!(is_current_store(&home.load_config().unwrap().store));
+        assert!(!home.quota_path().exists(), "the old store's quota log is dropped");
+        assert!(!home.tickets_path().exists());
+        assert!(dir.join(format!("tickets-{}.json", OLD_STORE.trim_start_matches("0x"))).exists(), "old tickets kept aside");
         // Twice is refused.
-        assert!(migrate_store(&home).is_err());
+        assert!(migrate_store(&home, None).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -400,7 +499,7 @@ mod tests {
             "p1".into(), "mode2".into(), "00".into(), ("0xa".into(), "0xb".into(), "0xc".into()), 1,
         );
         s.save(&home).unwrap();
-        assert!(migrate_store(&home).unwrap_err().to_string().contains("p1"));
+        assert!(migrate_store(&home, None).unwrap_err().to_string().contains("p1"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

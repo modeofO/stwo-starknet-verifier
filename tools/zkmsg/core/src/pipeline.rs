@@ -16,4 +16,7 @@ pub enum PipelineEvent {
     /// The send's state was first written to disk under `id`; from here on it
     /// can be resumed (it is saved once its proof exists).
     Checkpointed { id: String },
+    /// The proof is ready; the publish waits for the shared schedule
+    /// (`txpolicy`) until the chain head reaches `until_block`.
+    Waiting { until_block: u64, blocks_left: u64 },
 }

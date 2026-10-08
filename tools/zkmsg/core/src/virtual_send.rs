@@ -1,40 +1,53 @@
-//! The SNIP-36 send route: Prepare → Prove → Publish, one transaction.
+//! The SNIP-36 send route on the v4 pool: Prepare → Prove → Publish, one
+//! transaction, and none of it from the member's own account.
 //!
 //! Since Starknet 0.14.2 the sequencer verifies S-two proofs natively, but
 //! only proofs of the *virtual* Starknet OS running one invoke on top of a
 //! past block. So the zkmsg statement lives in a contract
-//! (`ZkmsgSendProverV3`) that only ever runs inside that virtual OS, here: its
+//! (`ZkmsgSendProverV4`) that only ever runs inside that virtual OS, here: its
 //! calldata is the witness (the sender's scan pubkey R, kem_digest,
-//! membership secret m, leaf index and Merkle path) and the chain never sees
-//! it. What leaves is the proof and its facts, whose one L2→L1 message hash
-//! binds (store, commitment, ephemeral pubkey, root, content hash).
-//! `MessageStoreV3.send_message` recomputes that hash from public data in the
-//! same transaction that publishes the ciphertext.
+//! membership secret m, quota slot, leaf index and Merkle path, and a fee
+//! ticket's secret, index and path) and the chain never sees it. What leaves
+//! is the proof and its facts, whose one L2→L1 message hash binds
+//! (store, commitment, ephemeral pubkey, root, content hash, quota nullifier,
+//! epoch, quota, ticket root, ticket nullifier).
 //!
-//! A port of zkmsg-ios `VirtualSendExecutor`; its rules, exactly:
+//! v4 removes the member's account from the send entirely:
+//!
+//!   * the virtual invoke comes from the SHARED `ZkmsgVirtualSenderV4`
+//!     (zero fee, nonce 0 forever, any signature), so the proof request
+//!     names no member's account;
+//!   * the publish is an UNSIGNED invoke whose sender is the pool itself
+//!     (`ZkmsgPoolV4` is the store and an account): its `__validate__`
+//!     admits exactly the proven send, burns the ticket and pays the fee
+//!     from the STRK tickets brought in.
+//!
+//! The rules (a port of zkmsg-ios `VirtualSendExecutor`, extended):
 //!
 //!   * Prepare reads everything at ONE block N — the block the virtual OS
-//!     then runs on — so the witness can't disagree with the state the proof
-//!     is about: every registration up to N, the root at N, the nonce.
-//!   * No read names a handle or a leaf. Both members and the sender's path
-//!     come from the tree rebuilt locally from all registrations
-//!     (`registry`), which must reproduce the store's root at N; the RPC
-//!     sees the same requests from every sender.
+//!     then runs on: every registration and every ticket purchase up to N,
+//!     both roots at N, the rate limit, the virtual sender's nonce.
+//!   * No read names a handle, a leaf, a ticket or the user's account. Both
+//!     trees are rebuilt locally from all events (`registry`, `tickets`) and
+//!     must reproduce the store's roots at N; the RPC sees the same requests
+//!     from every sender.
 //!   * The witness is never written down. The proof and its facts are public
-//!     and are, so a killed process resumes at Publish. A proof doesn't expire:
-//!     the sequencer only needs its base block to trail the head by 10.
+//!     and are, so a killed process resumes at Publish. A proof doesn't
+//!     expire at the protocol level; the pool accepts its epoch for
+//!     `max_epoch_lag` epochs.
 //!   * Verify before spending: the facts must attest exactly the message hash
 //!     this send should produce, on block N.
-//!   * Never sign against a forgotten root. The store keeps the current root
-//!     and a short history; a proof against an evicted root would revert and
-//!     keep the fee. `is_known_root` is checked first, and a stale proof is
-//!     retired so the next attempt proves afresh.
-//!   * Never submit twice. The publish hash is saved the moment the gateway
-//!     takes it; a resume polls that hash before it would ever resubmit.
+//!   * Never publish against a forgotten root. The store keeps the current
+//!     member root and a short history; a stale proof is retired (and its
+//!     ticket released) so the next attempt proves afresh.
+//!   * Never submit twice. The publish hash is saved the moment before the
+//!     gateway takes it; a resume polls that hash before it would ever
+//!     resubmit. A lost nonce race resubmits the SAME proof at the next pool
+//!     nonce (no re-proving).
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -44,94 +57,183 @@ use serde_json::{Value, json};
 use starknet_crypto::poseidon_hash_many;
 use starknet_types_core::felt::Felt;
 
-use crate::chain::{Chain, bytearray_calldata, felt_hex, snkeccak};
-use crate::config::{Config, Home, Keys, STRK_TOKEN, is_current_store};
-use crate::crypto::{SealedV2, kem_digest, leaf_v3, member_commit, send_v2};
-use crate::tree::fold_path;
-use crate::invoke_v3::{Bounds, Call, InvokeV3, ResourceBounds, Signer, execute_calldata};
+use crate::chain::{Chain, bytearray_calldata, felt_hex, felt_to_u64, snkeccak};
+use crate::config::{Config, Home, Keys, is_current_store};
+use crate::crypto::{
+    kem_digest, leaf_v3, member_commit, nullifier_v4, send_v4, ticket_leaf, ticket_nullifier,
+};
+use crate::invoke_v3::{Bounds, Call, ResourceBounds, execute_calldata};
 use crate::pipeline::PipelineEvent;
 use crate::registry::Registry;
 use crate::sequencer::{Gateway, GatewayError, ProofAttachment};
-use crate::state::{SendState, StepKind};
+use crate::state::{SendState, StepKind, V4Binding};
+use crate::tickets::{QuotaLog, TicketNotInTreeYet, TicketState, TicketTree, Wallet};
+use crate::txpolicy::{self, TIP};
+use crate::tree::fold_path;
 
-/// The contracts a virtual send is bound to. The store pins the prover, so
-/// they travel together.
+/// The contracts a v4 send is bound to. The pool pins the prover; the
+/// virtual sender is the shared account the proof runs from.
 #[derive(Debug, Clone)]
 pub struct VirtualRoute {
+    /// The pool: store and publishing account in one.
     pub store: Felt,
     /// The contract whose virtual execution is proven.
     pub prover: Felt,
+    pub virtual_sender: Felt,
     pub chain_id: Felt,
 }
 
 impl VirtualRoute {
-    /// The route for `store`: the v3 store and its pinned prover. The v3
-    /// statement proves only the sender's membership, by knowledge of the
-    /// membership secret under the root (hash-only); the store publishes
-    /// `kem_ct ‖ blob`.
+    /// The route for `store`: only the current (v4 pool) store has one.
     pub fn for_store(store: &str) -> Option<Self> {
-        use crate::config::{SEPOLIA_STORE_V3, SEPOLIA_V3_SEND_PROVER};
+        use crate::config::{SEPOLIA_POOL_V4, SEPOLIA_V4_SEND_PROVER, SEPOLIA_V4_VIRTUAL_SENDER};
         is_current_store(store).then(|| Self {
-            store: Felt::from_hex(SEPOLIA_STORE_V3).expect("constant"),
-            prover: Felt::from_hex(SEPOLIA_V3_SEND_PROVER).expect("constant"),
+            store: Felt::from_hex(SEPOLIA_POOL_V4).expect("constant"),
+            prover: Felt::from_hex(SEPOLIA_V4_SEND_PROVER).expect("constant"),
+            virtual_sender: Felt::from_hex(SEPOLIA_V4_VIRTUAL_SENDER).expect("constant"),
             chain_id: crate::invoke_v3::short_string("SN_SEPOLIA"),
         })
     }
 }
 
-/// What Prepare hands Prove: the public tuple, the bytes to publish, and the
-/// `prove_send` calldata — which IS the witness, so this never touches disk.
-struct Prepared {
-    id: String,
-    block: u64,
-    nonce: Felt,
-    commitment: Felt,
-    ephemeral: Felt,
-    root: Felt,
-    /// The ByteArray `send_message` publishes: `kem_ct ‖ blob`.
-    content: Vec<u8>,
-    content_hash: Felt,
-    prove_calldata: Vec<Felt>,
+// --- pure encodings the contracts must agree with ---------------------------
+
+/// Everything a v4 proof makes public: the L2→L1 payload, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicV4 {
+    pub store: Felt,
+    pub commitment: Felt,
+    pub ephemeral: Felt,
+    pub root: Felt,
+    pub content_hash: Felt,
+    pub nullifier: Felt,
+    pub epoch: u64,
+    pub quota: u32,
+    pub ticket_root: Felt,
+    pub ticket_nullifier: Felt,
 }
 
-/// A send's id: the commitment's first 10 hex digits.
-fn send_id(commitment: &Felt) -> String {
-    format!("{:.10}", felt_hex(commitment).trim_start_matches("0x"))
+impl PublicV4 {
+    /// `[store, commitment, ephemeral_pubkey, merkle_root, content_hash,
+    /// nullifier, epoch, quota, ticket_root, ticket_nullifier]`
+    /// (`prover::send_payload_v4`).
+    pub fn payload(&self) -> [Felt; 10] {
+        [
+            self.store,
+            self.commitment,
+            self.ephemeral,
+            self.root,
+            self.content_hash,
+            self.nullifier,
+            Felt::from(self.epoch),
+            Felt::from(self.quota),
+            self.ticket_root,
+            self.ticket_nullifier,
+        ]
+    }
+
+    /// The L2→L1 message hash the virtual OS writes into the facts:
+    /// `poseidon([from = prover, to = 0, 10, ...payload])` (`facts::message_hash`).
+    pub fn message_hash(&self, prover: Felt) -> Felt {
+        let payload = self.payload();
+        let mut fields = vec![prover, Felt::ZERO, Felt::from(payload.len() as u64)];
+        fields.extend_from_slice(&payload);
+        poseidon_hash_many(&fields)
+    }
+
+    fn binding(&self) -> V4Binding {
+        V4Binding {
+            nullifier: felt_hex(&self.nullifier),
+            epoch: self.epoch,
+            quota: self.quota,
+            ticket_root: felt_hex(&self.ticket_root),
+            ticket_nullifier: felt_hex(&self.ticket_nullifier),
+        }
+    }
+
+    /// The tuple a saved send state recorded.
+    fn from_state(store: Felt, state: &SendState, content: &[u8]) -> Result<Self> {
+        let b = state.binding.as_ref().context("send state predates v4 (no binding)")?;
+        Ok(Self {
+            store,
+            commitment: Felt::from_hex(&state.expected_commitment)?,
+            ephemeral: Felt::from_hex(&state.expected_ephemeral_pubkey)?,
+            root: Felt::from_hex(&state.expected_merkle_root)?,
+            content_hash: content_hash(content),
+            nullifier: Felt::from_hex(&b.nullifier)?,
+            epoch: b.epoch,
+            quota: b.quota,
+            ticket_root: Felt::from_hex(&b.ticket_root)?,
+            ticket_nullifier: Felt::from_hex(&b.ticket_nullifier)?,
+        })
+    }
 }
 
-/// v3 `prove_send` calldata: `(store, content_hash, commitment, E, root,
-/// sender_scan_pub, sender_kem_digest, member_secret, sender_leaf_index,
-/// sender_path)`. The witness is the membership secret m; the scan key is a
-/// public input here (no elliptic-curve step in the statement).
-pub fn prove_send_calldata_v3(
-    store: Felt,
-    sealed: &SealedV2,
-    root: Felt,
-    sender_scan_pub: Felt,
-    sender_kem_digest: Felt,
-    member_secret: Felt,
-    sender_leaf_index: u32,
-    sender_path: &[Felt],
-) -> Result<Vec<Felt>> {
-    ensure!(sender_path.len() == 20, "sender path has {} siblings, not 20", sender_path.len());
+/// The private half of `prove_send`.
+pub struct WitnessV4<'a> {
+    pub scan_pub: Felt,
+    pub kem_digest: Felt,
+    pub member_secret: Felt,
+    pub slot: u32,
+    pub leaf_index: u32,
+    pub path: &'a [Felt],
+    pub ticket_secret: Felt,
+    pub ticket_index: u32,
+    pub ticket_path: &'a [Felt],
+}
+
+/// v4 `prove_send` calldata: `(store, content_hash, commitment, E, root,
+/// epoch, quota, ticket_root, sender_scan_pub, sender_kem_digest,
+/// member_secret, slot, sender_leaf_index, sender_path, ticket_secret,
+/// ticket_index, ticket_path)`. The nullifiers are not inputs: the prover
+/// computes them from the secrets.
+pub fn prove_send_calldata_v4(public: &PublicV4, w: &WitnessV4<'_>) -> Result<Vec<Felt>> {
+    ensure!(w.path.len() == 20, "sender path has {} siblings, not 20", w.path.len());
+    ensure!(w.ticket_path.len() == 20, "ticket path has {} siblings, not 20", w.ticket_path.len());
+    ensure!(w.slot < public.quota, "slot {} is over the quota {}", w.slot, public.quota);
     let mut out = vec![
-        store,
-        sealed.content_hash,
-        sealed.commitment,
-        sealed.ephemeral_pub,
-        root,
-        sender_scan_pub,
-        sender_kem_digest,
-        member_secret,
-        Felt::from(sender_leaf_index),
+        public.store,
+        public.content_hash,
+        public.commitment,
+        public.ephemeral,
+        public.root,
+        Felt::from(public.epoch),
+        Felt::from(public.quota),
+        public.ticket_root,
+        w.scan_pub,
+        w.kem_digest,
+        w.member_secret,
+        Felt::from(w.slot),
+        Felt::from(w.leaf_index),
         Felt::from(20u64),
     ];
-    out.extend_from_slice(sender_path);
+    out.extend_from_slice(w.path);
+    out.push(w.ticket_secret);
+    out.push(Felt::from(w.ticket_index));
+    out.push(Felt::from(20u64));
+    out.extend_from_slice(w.ticket_path);
+    Ok(out)
+}
+
+/// The pool's `send_message(commitment, ephemeral_pubkey, merkle_root,
+/// nullifier, ticket_root, ticket_nullifier, content: ByteArray)` arguments.
+pub fn send_message_calldata_v4(public: &PublicV4, content: &[u8]) -> Result<Vec<Felt>> {
+    let mut out = vec![
+        public.commitment,
+        public.ephemeral,
+        public.root,
+        public.nullifier,
+        public.ticket_root,
+        public.ticket_nullifier,
+    ];
+    for word in bytearray_calldata(content) {
+        out.push(Felt::from_hex(&word)?);
+    }
     Ok(out)
 }
 
 /// What the prover hands back: the proof as the gateway takes it (base64)
-/// and the facts the transaction signs over. Saved in the send's workdir.
+/// and the facts the transaction carries. Saved in the send's workdir.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VirtualProof {
     pub proof: String,
@@ -144,8 +246,6 @@ impl VirtualProof {
     }
 }
 
-// --- pure encodings the contracts must agree with ---------------------------
-
 /// `[PROOF1, VIRTUAL_SNOS, program_hash, VIRTUAL_SNOS0, block_number,
 /// block_hash, os_config_hash, n_messages, message_hash]`.
 const FACTS_LEN: usize = 9;
@@ -154,25 +254,13 @@ const FACT_N_MESSAGES: usize = 7;
 const FACT_MESSAGE_HASH: usize = 8;
 
 /// Poseidon over the Cairo serialization of the ciphertext `ByteArray` —
-/// what the proof carries in the ciphertext's place
-/// (`messagezk_store_v3::store::content_hash`).
+/// what the proof carries in the ciphertext's place (`pool::content_hash`).
 pub fn content_hash(ciphertext: &[u8]) -> Felt {
     let felts: Vec<Felt> = bytearray_calldata(ciphertext)
         .iter()
         .map(|h| Felt::from_hex(h).expect("bytearray_calldata emits hex"))
         .collect();
     poseidon_hash_many(&felts)
-}
-
-/// The L2→L1 message hash the virtual OS writes into the facts:
-/// `poseidon([from, to, payload_len, ...payload])`, `to` = 0 (an L1 address
-/// must fit 160 bits, so the store rides in the payload), payload
-/// `[store, commitment, ephemeral_pubkey, root, content_hash]`.
-pub fn message_hash(route: &VirtualRoute, commitment: Felt, ephemeral: Felt, root: Felt, content: Felt) -> Felt {
-    let payload = [route.store, commitment, ephemeral, root, content];
-    let mut fields = vec![route.prover, Felt::ZERO, Felt::from(payload.len() as u64)];
-    fields.extend_from_slice(&payload);
-    poseidon_hash_many(&fields)
 }
 
 /// The facts must attest exactly `expected`, proven on `block`.
@@ -192,35 +280,24 @@ pub fn check_facts(facts: &[Felt], expected: Felt, block: u64) -> Result<()> {
     Ok(())
 }
 
-/// Resource bounds of the virtual transaction. It is never charged; the
-/// virtual OS only needs amounts large enough to run it (the reference
-/// prover's defaults).
+/// Resource bounds of the virtual transaction. It is never charged (the
+/// virtual sender refuses any nonzero price); the virtual OS only needs
+/// amounts large enough to run it.
 pub const VIRTUAL_BOUNDS: Bounds = Bounds {
     l1_gas: ResourceBounds { max_amount: 0, max_price_per_unit: 0 },
     l2_gas: ResourceBounds { max_amount: 0x700_0000, max_price_per_unit: 0 },
     l1_data_gas: ResourceBounds { max_amount: 0x1b0, max_price_per_unit: 0 },
 };
 
-/// The signed virtual invoke in RPC shape, as `starknet_proveTransaction`
-/// takes it. The account's `__validate__` runs inside the virtual OS, so it
-/// carries a real signature over the ordinary (fact-less) hash.
-pub fn virtual_invoke(signer: &Signer, calls: &[Call], nonce: Felt, chain_id: Felt) -> Result<Value> {
+/// The virtual invoke in RPC shape, as `starknet_proveTransaction` takes
+/// it: from the shared virtual sender, at its base-block nonce, unsigned
+/// (its `__validate__` accepts any signature and only zero fees).
+pub fn virtual_invoke(virtual_sender: Felt, calls: &[Call], nonce: Felt) -> Value {
     let calldata = execute_calldata(calls);
-    let hash = InvokeV3 {
-        sender: signer.address,
-        calldata: &calldata,
-        chain_id,
-        nonce,
-        tip: 0,
-        bounds: VIRTUAL_BOUNDS,
-        proof_facts: &[],
-    }
-    .hash();
-    let [r, s] = signer.sign(&hash)?;
-    Ok(json!({
+    json!({
         "type": "INVOKE",
         "version": "0x3",
-        "sender_address": felt_hex(&signer.address),
+        "sender_address": felt_hex(&virtual_sender),
         "calldata": calldata.iter().map(felt_hex).collect::<Vec<_>>(),
         "nonce": felt_hex(&nonce),
         "resource_bounds": VIRTUAL_BOUNDS.rpc_json(),
@@ -229,76 +306,168 @@ pub fn virtual_invoke(signer: &Signer, calls: &[Call], nonce: Felt, chain_id: Fe
         "account_deployment_data": [],
         "nonce_data_availability_mode": "L1",
         "fee_data_availability_mode": "L1",
-        "signature": [felt_hex(&r), felt_hex(&s)],
-    }))
+        "signature": [],
+    })
 }
 
-/// Fee bounds for the one real transaction. Measured on the phone: ~77M L2
-/// gas and 384 data gas for a send whose ~300 KB proof is priced as calldata.
-pub struct GasPolicy {
-    pub l2_gas: u64,
-    pub l1_data_gas: u64,
-    pub l1_gas: u64,
-    /// Applied to the latest block's prices, in percent.
-    pub price_percent: u128,
+/// The pool's fee policy (`fee_policy()`): its `__validate__` refuses a
+/// publish whose worst-case fee exceeds `max_fee` (= at most the ticket
+/// price), whose tip exceeds `max_tip`, or whose L2 gas bound is under
+/// `min_l2_gas` (so execute can never run out of gas after the ticket burnt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolFeePolicy {
+    pub max_fee: u128,
+    pub max_tip: u128,
+    pub min_l2_gas: u64,
 }
 
-pub const GAS_POLICY: GasPolicy =
-    GasPolicy { l2_gas: 120_000_000, l1_data_gas: 4_096, l1_gas: 0, price_percent: 150 };
+impl PoolFeePolicy {
+    /// `fee_policy()` returns `(max_fee: u128, max_tip: u128, min_l2_gas: u64)`.
+    pub fn from_felts(felts: &[Felt]) -> Result<Self> {
+        ensure!(felts.len() == 3, "fee_policy returned {} felts, expected 3", felts.len());
+        let u128_of = |f: &Felt| -> Result<u128> {
+            let bytes = f.to_bytes_be();
+            ensure!(bytes[..16].iter().all(|b| *b == 0), "fee policy value does not fit u128");
+            Ok(u128::from_be_bytes(bytes[16..].try_into().expect("16 bytes")))
+        };
+        Ok(Self { max_fee: u128_of(&felts[0])?, max_tip: u128_of(&felts[1])?, min_l2_gas: felt_to_u64(&felts[2])? })
+    }
 
-impl GasPolicy {
-    pub fn bounds(&self, (l1, l2, l1_data): (u128, u128, u128)) -> Bounds {
-        let scale = |p: u128| p.saturating_mul(self.price_percent) / 100;
-        Bounds {
-            l1_gas: ResourceBounds { max_amount: self.l1_gas, max_price_per_unit: scale(l1) },
-            l2_gas: ResourceBounds { max_amount: self.l2_gas, max_price_per_unit: scale(l2) },
-            l1_data_gas: ResourceBounds { max_amount: self.l1_data_gas, max_price_per_unit: scale(l1_data) },
-        }
+    /// Publish bounds per the shared policy (`txpolicy::publish_bounds`).
+    pub fn bounds(&self, prices: (u128, u128, u128)) -> Result<Bounds> {
+        crate::txpolicy::publish_bounds(prices, self.max_fee, self.max_tip, self.min_l2_gas)
     }
 }
 
-/// The fee ceiling an account must hold for `bounds` to pass validation:
-/// the sequencer checks the balance against the full ceiling, not what the
-/// send ends up costing.
-pub fn fee_ceiling_fri(bounds: &Bounds) -> u128 {
-    [bounds.l1_gas, bounds.l2_gas, bounds.l1_data_gas]
-        .iter()
-        .map(|b| (b.max_amount as u128).saturating_mul(b.max_price_per_unit))
-        .fold(0u128, u128::saturating_add)
+/// Runs `snip36-prove` on one virtual transaction at `block`. The request
+/// (the witness included) goes to the prover on stdin and nowhere else; the
+/// prover's spill files are removed whatever happens.
+pub fn run_prover(
+    prover_bin: &Path,
+    spill: &Path,
+    out_path: &Path,
+    rpc_url: &str,
+    chain_id: &str,
+    block: u64,
+    transaction: Value,
+) -> Result<VirtualProof> {
+    fs::create_dir_all(spill)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(spill, fs::Permissions::from_mode(0o700))?;
+    }
+    let request = json!({
+        "rpc_url": rpc_url,
+        "chain_id": chain_id,
+        "block_id": {"block_number": block},
+        "transaction": transaction,
+    });
+    ensure!(
+        prover_bin.exists(),
+        "prover binary {} not found — build it (tools/snip36-phone-ffi/README.md) or set \
+         \"virtual_prover_bin\" in config.json",
+        prover_bin.display()
+    );
+    let mut child = Command::new(prover_bin)
+        .arg(out_path)
+        .env("ZKMSG_SPILL_DIR", spill)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting {}", prover_bin.display()))?;
+    {
+        let mut stdin = child.stdin.take().context("prover stdin")?;
+        stdin.write_all(request.to_string().as_bytes())?;
+    }
+    drop(request);
+    let output = child.wait_with_output();
+    // The spill files hold the prover's memory, witness included: gone
+    // whatever happened.
+    let _ = fs::remove_dir_all(spill);
+    let output = output?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: Vec<String> = stderr.lines().rev().take(8).map(redact_felts).collect();
+        bail!(
+            "snip36-prove failed ({}):\n{}",
+            output.status,
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        );
+    }
+    let out: Value = serde_json::from_str(&fs::read_to_string(out_path)?)?;
+    let _ = fs::remove_file(out_path);
+    Ok(VirtualProof {
+        proof: out["proof"].as_str().context("prover output has no proof")?.to_string(),
+        proof_facts: out["proof_facts"]
+            .as_array()
+            .context("prover output has no proof_facts")?
+            .iter()
+            .map(|f| f.as_str().map(String::from).context("proof fact is not a string"))
+            .collect::<Result<_>>()?,
+    })
 }
 
 // --- the executor -----------------------------------------------------------
 
 const PUBLISH_POLL: Duration = Duration::from_secs(5);
+/// How often the scheduled publish re-reads the head while it waits.
+const SCHEDULE_POLL: Duration = Duration::from_secs(6);
+/// Prepare retries (× SCHEDULE_POLL) for a ticket younger than the base.
+const TICKET_WAIT_TRIES: usize = 20;
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(1800);
 const TOO_RECENT_WAIT: Duration = Duration::from_secs(10);
 const PUBLISH_ATTEMPTS: usize = 12;
 
+/// The pool's `__validate__` reasons after which this proof can never land.
+/// `ticket spent` is handled apart: the ticket is gone, not just the proof.
+const FINAL_REFUSALS: [&str; 4] = ["nullifier spent", "envelope consumed", "stale epoch", "unknown merkle root"];
+
+/// What Prepare hands Prove: the public tuple, the bytes to publish, and the
+/// `prove_send` calldata — which IS the witness, so this never touches disk.
+struct Prepared {
+    id: String,
+    block: u64,
+    /// The virtual sender's nonce at `block`.
+    nonce: Felt,
+    public: PublicV4,
+    /// The ByteArray `send_message` publishes: `kem_ct ‖ blob`.
+    content: Vec<u8>,
+    prove_calldata: Vec<Felt>,
+}
+
+/// A send's id: the commitment's first 10 hex digits.
+fn send_id(commitment: &Felt) -> String {
+    format!("{:.10}", felt_hex(commitment).trim_start_matches("0x"))
+}
+
 pub struct VirtualSender<'a> {
     pub home: &'a Home,
     pub route: VirtualRoute,
-    /// Every read goes through the prover's RPC, so the block the tree is
+    /// Every read goes through the prover's RPC, so the block the trees are
     /// read at is a block the prover can fetch storage proofs for.
     pub chain: Chain,
     pub gateway: Gateway,
-    pub signer: Signer,
     pub prover_bin: PathBuf,
 }
 
 impl<'a> VirtualSender<'a> {
     pub fn new(home: &'a Home, config: &Config) -> Result<Self> {
-        let route = VirtualRoute::for_store(&config.store)
-            .with_context(|| {
-                format!("{} is not the v3 store — `zkmsg migrate-store` moves this profile", config.store)
-            })?;
+        let route = VirtualRoute::for_store(&config.store).with_context(|| {
+            format!("{} is not the v4 pool — `zkmsg migrate-store` moves this profile", config.store)
+        })?;
         Ok(Self {
             home,
             route,
             chain: Chain::new(config.prover_rpc_url(), &config.account),
             gateway: Gateway::sepolia(),
-            signer: Signer::from_sncast_account(&config.account)?,
             prover_bin: config.virtual_prover_bin(),
         })
+    }
+
+    fn store_hex(&self) -> String {
+        felt_hex(&self.route.store)
     }
 
     /// A fresh send: prepare, prove, publish. Returns the finished state.
@@ -311,70 +480,89 @@ impl<'a> VirtualSender<'a> {
     ) -> Result<SendState> {
         let total = 3;
 
-        // 1. Prepare, all at one block.
+        // 1. Prepare, all at one block. Takes a quota slot and reserves a ticket.
         sink(PipelineEvent::StepStarted { index: 0, total, kind: StepKind::Prepare });
-        let p = self.prepare(keys, handle, text)?;
+        // A ticket bought moments ago enters the tree after the base block:
+        // wait for the base to catch up (≈1 min) rather than fail.
+        let mut tries = 0;
+        let p = loop {
+            match self.prepare(keys, handle, text) {
+                Err(e) if tries < TICKET_WAIT_TRIES && e.downcast_ref::<TicketNotInTreeYet>().is_some() => {
+                    tries += 1;
+                    std::thread::sleep(SCHEDULE_POLL);
+                }
+                other => break other?,
+            }
+        };
         let block = p.block;
         let mut state = SendState::new_virtual_plan(
             p.id.clone(),
             handle.to_string(),
             hex::encode(&p.content),
-            (felt_hex(&p.commitment), felt_hex(&p.ephemeral), felt_hex(&p.root)),
+            (felt_hex(&p.public.commitment), felt_hex(&p.public.ephemeral), felt_hex(&p.public.root)),
             block,
         );
-        state.mark_done(0, None, Some(format!("block {block}")));
+        state.binding = Some(p.public.binding());
+        state.publish_after_block = Some(txpolicy::publish_after(block, txpolicy::jitter()));
+        state.mark_done(0, None, Some(format!("block {block}, epoch {}", p.public.epoch)));
         sink(PipelineEvent::StepCompleted { kind: StepKind::Prepare, tx_hash: None, note: None });
 
-        // Spend check before minutes of proving: the account must hold the
-        // whole fee ceiling, or the publish is refused at validation.
-        let ceiling = fee_ceiling_fri(&GAS_POLICY.bounds(self.chain.gas_prices()?));
-        let balance = self.balance_fri()?;
-        ensure!(
-            balance >= ceiling,
-            "account holds {} STRK; a send needs a fee ceiling of {} STRK",
-            strk(balance),
-            strk(ceiling),
-        );
-
         // 2. Prove. The witness rides in the virtual transaction's calldata,
-        //    handed to the prover on stdin and dropped after.
+        //    handed to the prover on stdin and dropped after. A failure here
+        //    hands the ticket back: no proof of it exists.
         sink(PipelineEvent::StepStarted { index: 1, total, kind: StepKind::Prove });
-        let Prepared { nonce, commitment, ephemeral, root, content_hash: content, prove_calldata, .. } = p;
+        let public = p.public;
+        if let Err(e) = self.prove_and_save(&mut state, p) {
+            self.release_ticket(&public);
+            return Err(e);
+        }
+        sink(PipelineEvent::Checkpointed { id: state.id.clone() });
+        sink(PipelineEvent::StepCompleted { kind: StepKind::Prove, tx_hash: None, note: None });
+
+        // 3. Publish, from the pool.
+        self.publish(&mut state, sink)?;
+        Ok(state)
+    }
+
+    fn prove_and_save(&self, state: &mut SendState, p: Prepared) -> Result<()> {
+        let Prepared { nonce, public, prove_calldata, block, .. } = p;
         let call = Call::new(self.route.prover, "prove_send", prove_calldata);
-        let transaction = virtual_invoke(&self.signer, &[call], nonce, self.route.chain_id)?;
+        let transaction = virtual_invoke(self.route.virtual_sender, &[call], nonce);
         let started = Instant::now();
-        let proof = self.prove(&state, transaction, block)?;
-        let expected = message_hash(&self.route, commitment, ephemeral, root, content);
-        check_facts(&proof.facts()?, expected, block)?;
-        fs::write(self.proof_path(&state), serde_json::to_string(&proof)?)?;
+        let workdir = SendState::workdir(self.home, &state.id);
+        fs::create_dir_all(&workdir)?;
+        let proof = run_prover(
+            &self.prover_bin,
+            &self.home.dir.join("spill"),
+            &workdir.join("prover_out.json"),
+            &self.chain.rpc_url,
+            &crate::invoke_v3::short_string_text(&self.route.chain_id)?,
+            block,
+            transaction,
+        )?;
+        check_facts(&proof.facts()?, public.message_hash(self.route.prover), block)?;
+        fs::write(self.proof_path(state), serde_json::to_string(&proof)?)?;
         state.mark_done(
             1,
             None,
             Some(format!("{:.0} s, {} b64 bytes, facts verified", started.elapsed().as_secs_f64(), proof.proof.len())),
         );
-        state.save(self.home)?;
-        sink(PipelineEvent::Checkpointed { id: state.id.clone() });
-        sink(PipelineEvent::StepCompleted { kind: StepKind::Prove, tx_hash: None, note: None });
-
-        // 3. Publish.
-        self.publish(&mut state, sink)?;
-        Ok(state)
+        state.save(self.home)
     }
 
-    /// Only the sender's membership is proven. Both members, the tree and
-    /// the sender's path come from the store's registration events, rebuilt
-    /// locally (`Registry`): no read names a handle or a leaf, so the RPC
-    /// can't tell who is sending to whom. The rebuilt root must equal the
-    /// store's root at block N, which also binds every registered ML-KEM key
-    /// to the `kem_digest` its leaf holds.
+    /// Both members, the sender's path and the ticket's path come from
+    /// events, rebuilt locally: no read names a handle, a leaf or a ticket,
+    /// so the RPC can't tell who is sending to whom, or with which ticket.
     fn prepare(&self, keys: &Keys, handle: &str, text: &str) -> Result<Prepared> {
         let sender_handle = keys.handle.as_deref().context("not registered — run `zkmsg register`")?;
+        // Refuse an over-long message before any slot or ticket is taken.
+        crate::crypto::pad_v4(text.as_bytes())?;
         let scan_pub = keys.scan_pub_felt()?;
         let own_digest = kem_digest(&keys.kem_keypair()?.1);
         let member_secret = keys.member_secret_felt()?;
         let own_m_commit = member_commit(&member_secret);
 
-        let (block, registry, root) = self.pinned_registry()?;
+        let (block, registry, root, tickets) = self.pinned_state()?;
         let recipient = registry.get(handle)?;
         let sender = registry.get(sender_handle)?;
         ensure!(
@@ -384,61 +572,95 @@ impl<'a> VirtualSender<'a> {
             "'{sender_handle}' is registered to different keys in this store",
         );
         let sender_path = registry.path(sender.leaf_index)?;
-        let nonce = self.nonce(Some(block))?;
         ensure!(
             fold_path(&leaf_v3(&scan_pub, &own_digest, &own_m_commit), sender.leaf_index, &sender_path)
                 == root,
             "sender path does not fold to the root at block {block}",
         );
 
-        let sealed = send_v2(&recipient.scan_pub, &recipient.kem_pubkey, text.as_bytes())?;
-        let prove_calldata = prove_send_calldata_v3(
-            self.route.store,
-            &sealed,
-            root,
-            scan_pub,
-            own_digest,
-            member_secret,
-            sender.leaf_index,
-            &sender_path,
-        )?;
-        Ok(Prepared {
-            id: send_id(&sealed.commitment),
-            block,
-            nonce,
+        let store = self.store_hex();
+        let mut wallet = Wallet::load(self.home, &store)?;
+        if wallet.settle(&tickets)? > 0 {
+            wallet.save(self.home)?;
+        }
+        let ti = wallet.pick(&tickets)?;
+        let ticket_secret = wallet.tickets[ti].secret_felt()?;
+        let ticket_index = wallet.tickets[ti].index.context("picked ticket has no index")?;
+        let ticket_path = tickets.path(ticket_index)?;
+        ensure!(
+            fold_path(&ticket_leaf(&ticket_secret), ticket_index, &ticket_path) == tickets.root(),
+            "ticket path does not fold to the ticket root at block {block}",
+        );
+
+        let (epoch_blocks, _, quota) = self.rate_limit(block)?;
+        let epoch = block / epoch_blocks;
+        let nonce = self.virtual_nonce(block)?;
+        let slot = QuotaLog::take_slot(self.home, &store, epoch, quota)?;
+
+        let sealed = send_v4(&recipient.scan_pub, &recipient.kem_pubkey, text.as_bytes())?;
+        let public = PublicV4 {
+            store: self.route.store,
             commitment: sealed.commitment,
             ephemeral: sealed.ephemeral_pub,
             root,
             content_hash: sealed.content_hash,
-            content: sealed.content,
-            prove_calldata,
-        })
+            nullifier: nullifier_v4(&self.route.store, &member_secret, epoch, slot),
+            epoch,
+            quota,
+            ticket_root: tickets.root(),
+            ticket_nullifier: ticket_nullifier(&self.route.store, &ticket_secret),
+        };
+        let prove_calldata = prove_send_calldata_v4(
+            &public,
+            &WitnessV4 {
+                scan_pub,
+                kem_digest: own_digest,
+                member_secret,
+                slot,
+                leaf_index: sender.leaf_index,
+                path: &sender_path,
+                ticket_secret,
+                ticket_index,
+                ticket_path: &ticket_path,
+            },
+        )?;
+        let id = send_id(&sealed.commitment);
+        wallet.tickets[ti].state = TicketState::Reserved { send_id: id.clone() };
+        wallet.save(self.home)?;
+        Ok(Prepared { id, block, nonce, public, content: sealed.content, prove_calldata })
     }
 
-    /// Pins block N, rebuilds the registry from every registration up to N
-    /// and checks it against `get_merkle_root` at N — requests every client
-    /// makes alike. A mismatch (an RPC whose event index trails its state)
-    /// is retried once at a fresh block, then refused: a witness against the
-    /// wrong tree would only fail after minutes of proving.
-    fn pinned_registry(&self) -> Result<(u64, Registry, Felt)> {
-        let store = felt_hex(&self.route.store);
+    /// Pins block N, rebuilds both trees from every registration and every
+    /// ticket purchase up to N, and checks them against the store's roots
+    /// at N — requests every client makes alike. A mismatch (an RPC whose
+    /// event index trails its state) is retried once at a fresh block, then
+    /// refused: a witness against the wrong tree would only fail after
+    /// minutes of proving.
+    fn pinned_state(&self) -> Result<(u64, Registry, Felt, TicketTree)> {
+        let store = self.store_hex();
         let mut mismatch = String::new();
         for _ in 0..2 {
-            let block = self.block_number()?;
+            // The shared schedule's base: a multiple of 32, ≥ 10 behind the head.
+            let block = txpolicy::base_block(self.block_number()?);
             let registry = Registry::fetch(&self.chain, &store, Some(block))?;
-            let root = self.root(block)?;
-            if registry.root() == root {
-                return Ok((block, registry, root));
+            let root = self.store_felt("get_merkle_root", &[], Some(block))?;
+            let tickets = TicketTree::fetch(&self.chain, &store, Some(block))?;
+            let ticket_root = self.store_felt("get_ticket_root", &[], Some(block))?;
+            if registry.root() == root && tickets.root() == ticket_root {
+                return Ok((block, registry, root, tickets));
             }
             mismatch = format!(
-                "{} registrations up to block {block} rebuild root {}, but the store's root there \
-                 is {}",
+                "up to block {block}: {} registrations rebuild root {} (store: {}), {} tickets \
+                 rebuild {} (store: {})",
                 registry.len(),
                 felt_hex(&registry.root()),
                 felt_hex(&root),
+                tickets.len(),
+                felt_hex(&tickets.root()),
+                felt_hex(&ticket_root),
             );
         }
-        bail!("the local membership tree disagrees with the store ({mismatch}); the RPC's event index may be behind — try again shortly")
+        bail!("the local trees disagree with the store ({mismatch}); the RPC's event index may be behind — try again shortly")
     }
 
     /// Resumes a saved virtual send. Only Publish can be pending: the state
@@ -465,36 +687,43 @@ impl<'a> VirtualSender<'a> {
             .context("virtual plan has no Publish step")?;
         let total = state.steps.len();
         sink(PipelineEvent::StepStarted { index, total, kind: StepKind::Publish });
+        let content = hex::decode(&state.ciphertext_hex)?;
+        let public = PublicV4::from_state(self.route.store, state, &content)?;
 
         // A hash saved by an earlier attempt is settled before anything is
-        // signed. Landed or still in flight: wait for it. Reverted: the fee
-        // is spent and the send is over. Only an explicit drop (never
-        // received, or rejected before execution) falls through, and then to
-        // the IDENTICAL transaction (saved nonce + bounds), which can land at
-        // most once however often it is resubmitted.
+        // built. Landed or still in flight: wait for it. Reverted: the
+        // ticket burnt in validate and the send is over. Only an explicit
+        // drop (never received, or rejected before execution) falls through,
+        // and then to the IDENTICAL transaction (saved nonce + bounds).
         if let Some(saved) = state.steps[index].tx_hash.clone() {
             let hash = Felt::from_hex(&saved)?;
             let status = self.gateway.status(&hash)?;
             if status.is_reverted() {
+                self.spend_ticket(&public, Some(saved.clone()));
                 self.retire(state)?;
                 bail!(
-                    "publish {saved} reverted ({}); its fee is spent — send again",
+                    "publish {saved} reverted ({}); its ticket is spent — send again",
                     status.revert_reason.as_deref().unwrap_or("no reason")
                 );
             }
             if !status.is_dropped() || !self.rpc_agrees_dropped(&hash) {
-                self.gateway.await_acceptance(&hash, PUBLISH_POLL, PUBLISH_TIMEOUT)?;
-                return self.finish(state, index, saved, sink);
+                return self.await_and_finish(state, index, &public, hash, sink);
             }
         }
 
-        let root = Felt::from_hex(&state.expected_merkle_root)?;
-        let known = self.store_call("is_known_root", &[root], None)?;
-        if known.first() != Some(&Felt::ONE) {
+        // The shared schedule: never before base + 90..110 blocks, however
+        // fast this device proved.
+        if let Some(target) = state.publish_after_block {
+            wait_for_head(target, || self.block_number(), std::thread::sleep, SCHEDULE_POLL, sink)?;
+        }
+
+        let known = self.store_felt("is_known_root", &[public.root], None)?;
+        if known != Felt::ONE {
+            self.release_ticket(&public);
             self.retire(state)?;
             bail!(
-                "the tree moved on since this send was proven (root {} is no longer known to the \
-                 store); send again to re-prove",
+                "the member tree moved on since this send was proven (root {} is no longer known \
+                 to the store); send again to re-prove",
                 state.expected_merkle_root
             );
         }
@@ -503,38 +732,31 @@ impl<'a> VirtualSender<'a> {
             &fs::read_to_string(self.proof_path(state)).context("reading the saved proof")?,
         )?;
         let facts = proof.facts()?;
-        let content = hex::decode(&state.ciphertext_hex)?;
         // The saved proof must still attest exactly this send (a swapped or
-        // corrupted file would be signed over and burn the fee).
-        let expected = message_hash(
-            &self.route,
-            Felt::from_hex(&state.expected_commitment)?,
-            Felt::from_hex(&state.expected_ephemeral_pubkey)?,
-            root,
-            content_hash(&content),
-        );
-        check_facts(&facts, expected, state.base_block.context("state has no base block")?)?;
+        // corrupted file would burn the ticket for nothing).
+        check_facts(
+            &facts,
+            public.message_hash(self.route.prover),
+            state.base_block.context("state has no base block")?,
+        )?;
 
-        let mut calldata = vec![
-            Felt::from_hex(&state.expected_commitment)?,
-            Felt::from_hex(&state.expected_ephemeral_pubkey)?,
-            root,
-        ];
-        for word in bytearray_calldata(&content) {
-            calldata.push(Felt::from_hex(&word)?);
-        }
-        let call = Call::new(self.route.store, "send_message", calldata);
+        let call = Call::new(self.route.store, "send_message", send_message_calldata_v4(&public, &content)?);
         let attachment = ProofAttachment { proof: &proof.proof, proof_facts: &facts };
-
         let (mut nonce, bounds) = match (&state.publish_nonce, state.publish_bounds) {
             (Some(nonce), Some(bounds)) => (Felt::from_hex(nonce)?, bounds),
-            _ => (self.nonce(None)?, GAS_POLICY.bounds(self.chain.gas_prices()?)),
+            _ => self.publish_inputs()?,
         };
         for attempt in 0..PUBLISH_ATTEMPTS {
             let last = attempt + 1 == PUBLISH_ATTEMPTS;
-            let signed =
-                self.gateway.sign_invoke(&self.signer, std::slice::from_ref(&call), nonce, bounds, Some(&attachment))?;
-            let hex = felt_hex(&signed.hash);
+            let tx = self.gateway.unsigned_invoke(
+                self.route.store,
+                std::slice::from_ref(&call),
+                nonce,
+                bounds,
+                TIP,
+                Some(&attachment),
+            );
+            let hex = felt_hex(&tx.hash);
             // Recorded BEFORE the POST: whatever happens to the request, a
             // resume knows the one hash this send may have produced.
             state.record_submission(index, hex.clone());
@@ -542,40 +764,45 @@ impl<'a> VirtualSender<'a> {
             state.publish_bounds = Some(bounds);
             state.save(self.home)?;
 
-            let rejected = match self.gateway.submit(&signed) {
+            let err = match self.gateway.submit(&tx) {
                 Ok(()) => {
                     sink(PipelineEvent::TxSubmitted { kind: StepKind::Publish, tx_hash: hex.clone() });
-                    self.gateway.await_acceptance(&signed.hash, PUBLISH_POLL, PUBLISH_TIMEOUT)?;
-                    return self.finish(state, index, hex, sink);
+                    return self.await_and_finish(state, index, &public, tx.hash, sink);
                 }
-                Err(e) => match e.downcast_ref::<GatewayError>() {
-                    Some(g @ GatewayError::Rejected { .. }) => (g.clone(), e),
-                    // Timeout, 5xx, a hash mismatch: the gateway may hold the
-                    // transaction. Stop; the saved hash is polled on resume.
-                    _ => return Err(e),
-                },
+                Err(e) => e,
             };
-            let (gateway, err) = rejected;
+            let Some(gateway) = err.downcast_ref::<GatewayError>().cloned() else {
+                // Timeout, 5xx, a hash mismatch: the gateway may hold the
+                // transaction. Stop; the saved hash is polled on resume.
+                return Err(err);
+            };
+            if !matches!(gateway, GatewayError::Rejected { .. }) {
+                return Err(err);
+            }
             if !last && gateway.too_recent() {
                 // Same transaction again once the base block is old enough.
                 std::thread::sleep(TOO_RECENT_WAIT);
                 continue;
             }
-            if let (false, Some(expected)) = (last, gateway.expected_nonce()) {
-                // The nonce moved. If it moved because THIS send landed (an
-                // earlier attempt the gateway did take), finish instead of
-                // paying again under the next nonce.
-                let status = self.gateway.status(&signed.hash)?;
-                if !status.is_dropped() || !self.rpc_agrees_dropped(&signed.hash) {
-                    self.gateway.await_acceptance(&signed.hash, PUBLISH_POLL, PUBLISH_TIMEOUT)?;
-                    return self.finish(state, index, hex, sink);
+            if gateway.refused_with("ticket spent") {
+                self.spend_ticket(&public, None);
+                self.retire(state)?;
+                return Err(err.context("the pool says this send's ticket is already spent — send again"));
+            }
+            if let Some(reason) = FINAL_REFUSALS.iter().find(|r| gateway.refused_with(r)) {
+                self.release_ticket(&public);
+                self.retire(state)?;
+                return Err(err.context(format!("the pool refused this proof ({reason}) — send again")));
+            }
+            if !last && is_nonce_rejection(&gateway) {
+                // Another send took this pool nonce. If it was THIS send (an
+                // earlier attempt the gateway did take), finish instead.
+                let status = self.gateway.status(&tx.hash)?;
+                if !status.is_dropped() || !self.rpc_agrees_dropped(&tx.hash) {
+                    return self.await_and_finish(state, index, &public, tx.hash, sink);
                 }
-                ensure!(
-                    Felt::from(expected) != nonce,
-                    "gateway rejected nonce {} but expects the same one",
-                    felt_hex(&nonce)
-                );
-                nonce = Felt::from(expected);
+                // Same proof, next nonce: no re-proving.
+                nonce = next_nonce(nonce, gateway.expected_nonce(), self.pool_nonce()?);
                 continue;
             }
             return Err(err);
@@ -583,30 +810,65 @@ impl<'a> VirtualSender<'a> {
         bail!("publish retries exhausted")
     }
 
+    /// The pool's nonce and policy bounds for a first publish attempt.
+    fn publish_inputs(&self) -> Result<(Felt, Bounds)> {
+        let policy = PoolFeePolicy::from_felts(&self.store_call("fee_policy", &[], None)?)?;
+        Ok((self.pool_nonce()?, policy.bounds(self.chain.gas_prices()?)?))
+    }
+
+    fn await_and_finish(
+        &self,
+        state: &mut SendState,
+        index: usize,
+        public: &PublicV4,
+        hash: Felt,
+        sink: &mut dyn FnMut(PipelineEvent),
+    ) -> Result<()> {
+        let tx_hash = felt_hex(&hash);
+        if let Err(e) = self.gateway.await_acceptance(&hash, PUBLISH_POLL, PUBLISH_TIMEOUT) {
+            if matches!(e.downcast_ref::<GatewayError>(), Some(GatewayError::Reverted { .. })) {
+                // Validate burnt the ticket before execute reverted.
+                self.spend_ticket(public, Some(tx_hash));
+                self.retire(state)?;
+            }
+            return Err(e);
+        }
+        self.spend_ticket(public, Some(tx_hash.clone()));
+        state.mark_done(index, Some(tx_hash.clone()), Some("message published by the pool".into()));
+        state.save(self.home)?;
+        sink(PipelineEvent::StepCompleted { kind: StepKind::Publish, tx_hash: Some(tx_hash), note: None });
+        sink(PipelineEvent::Completed);
+        Ok(())
+    }
+
+    /// Wallet bookkeeping is best effort: a failure here must not hide the
+    /// send's own outcome (the wallet re-settles against the chain later).
+    fn spend_ticket(&self, public: &PublicV4, tx: Option<String>) {
+        if let Ok(mut wallet) = Wallet::load(self.home, &self.store_hex()) {
+            if wallet.mark_spent(&public.store, &public.ticket_nullifier, tx) {
+                let _ = wallet.save(self.home);
+            }
+        }
+    }
+
+    fn release_ticket(&self, public: &PublicV4) {
+        if let Ok(mut wallet) = Wallet::load(self.home, &self.store_hex()) {
+            if wallet.release(&public.store, &public.ticket_nullifier) {
+                let _ = wallet.save(self.home);
+            }
+        }
+    }
+
     /// Second opinion before anything is resubmitted under a new nonce: the
     /// feeder can lag, so a transaction counts as dropped only if the RPC
     /// doesn't know it either. Any doubt (an RPC error included) says "not
-    /// dropped", which waits instead of paying twice.
+    /// dropped", which waits instead of resubmitting.
     fn rpc_agrees_dropped(&self, hash: &Felt) -> bool {
         match self.chain.rpc("starknet_getTransactionStatus", json!([felt_hex(hash)])) {
             Ok(v) => matches!(v["finality_status"].as_str(), Some("REJECTED")),
             // TXN_HASH_NOT_FOUND (code 29) is the RPC's "never seen it".
             Err(e) => format!("{e:#}").contains("\"code\":29"),
         }
-    }
-
-    fn finish(
-        &self,
-        state: &mut SendState,
-        index: usize,
-        tx_hash: String,
-        sink: &mut dyn FnMut(PipelineEvent),
-    ) -> Result<()> {
-        state.mark_done(index, Some(tx_hash.clone()), Some("message published".into()));
-        state.save(self.home)?;
-        sink(PipelineEvent::StepCompleted { kind: StepKind::Publish, tx_hash: Some(tx_hash), note: None });
-        sink(PipelineEvent::Completed);
-        Ok(())
     }
 
     /// Takes a stale send out of the pending list: its proof can never be
@@ -617,75 +879,11 @@ impl<'a> VirtualSender<'a> {
             .with_context(|| format!("retiring {}", path.display()))
     }
 
-    fn prove(&self, state: &SendState, transaction: Value, block: u64) -> Result<VirtualProof> {
-        let workdir = SendState::workdir(self.home, &state.id);
-        fs::create_dir_all(&workdir)?;
-        let spill = self.home.dir.join("spill");
-        fs::create_dir_all(&spill)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&spill, fs::Permissions::from_mode(0o700))?;
-        }
-        let out_path = workdir.join("prover_out.json");
-        let request = json!({
-            "rpc_url": self.chain.rpc_url,
-            "chain_id": crate::invoke_v3::short_string_text(&self.route.chain_id)?,
-            "block_id": {"block_number": block},
-            "transaction": transaction,
-        });
-
-        ensure!(
-            self.prover_bin.exists(),
-            "prover binary {} not found — build it (tools/snip36-phone-ffi/README.md) or set \
-             \"virtual_prover_bin\" in config.json",
-            self.prover_bin.display()
-        );
-        let mut child = Command::new(&self.prover_bin)
-            .arg(&out_path)
-            .env("ZKMSG_SPILL_DIR", &spill)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("starting {}", self.prover_bin.display()))?;
-        {
-            let mut stdin = child.stdin.take().context("prover stdin")?;
-            stdin.write_all(request.to_string().as_bytes())?;
-        }
-        drop(request);
-        let output = child.wait_with_output();
-        // The spill files hold the prover's memory, witness included: gone
-        // whatever happened.
-        let _ = fs::remove_dir_all(&spill);
-        let output = output?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail: Vec<String> = stderr.lines().rev().take(8).map(redact_felts).collect();
-            bail!(
-                "snip36-prove failed ({}):\n{}",
-                output.status,
-                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-            );
-        }
-        let out: Value = serde_json::from_str(&fs::read_to_string(&out_path)?)?;
-        let _ = fs::remove_file(&out_path);
-        Ok(VirtualProof {
-            proof: out["proof"].as_str().context("prover output has no proof")?.to_string(),
-            proof_facts: out["proof_facts"]
-                .as_array()
-                .context("prover output has no proof_facts")?
-                .iter()
-                .map(|f| f.as_str().map(String::from).context("proof fact is not a string"))
-                .collect::<Result<_>>()?,
-        })
-    }
-
     fn proof_path(&self, state: &SendState) -> PathBuf {
         SendState::workdir(self.home, &state.id).join("virtual_proof.json")
     }
 
-    // --- reads (all through the prover's RPC) -------------------------------
+    // --- reads (all through the prover's RPC; none names a member) --------
 
     fn block_id(block: Option<u64>) -> Value {
         match block {
@@ -699,12 +897,12 @@ impl<'a> VirtualSender<'a> {
         v.as_u64().with_context(|| format!("starknet_blockNumber: {v}"))
     }
 
-    fn call_at(&self, contract: Felt, entrypoint: &str, calldata: &[Felt], block: Option<u64>) -> Result<Vec<Felt>> {
+    fn store_call(&self, entrypoint: &str, calldata: &[Felt], block: Option<u64>) -> Result<Vec<Felt>> {
         let v = self.chain.rpc(
             "starknet_call",
             json!([
                 {
-                    "contract_address": felt_hex(&contract),
+                    "contract_address": felt_hex(&self.route.store),
                     "entry_point_selector": felt_hex(&snkeccak(entrypoint)),
                     "calldata": calldata.iter().map(felt_hex).collect::<Vec<_>>(),
                 },
@@ -718,32 +916,76 @@ impl<'a> VirtualSender<'a> {
             .collect()
     }
 
-    fn store_call(&self, entrypoint: &str, calldata: &[Felt], block: Option<u64>) -> Result<Vec<Felt>> {
-        self.call_at(self.route.store, entrypoint, calldata, block)
+    fn store_felt(&self, entrypoint: &str, calldata: &[Felt], block: Option<u64>) -> Result<Felt> {
+        self.store_call(entrypoint, calldata, block)?
+            .first()
+            .copied()
+            .with_context(|| format!("{entrypoint} returned nothing"))
     }
 
-    fn root(&self, block: u64) -> Result<Felt> {
-        let root = self.store_call("get_merkle_root", &[], Some(block))?;
-        root.first().copied().context("get_merkle_root returned nothing")
+    /// `rate_limit()` at `block`: (epoch_blocks, max_epoch_lag, quota).
+    fn rate_limit(&self, block: u64) -> Result<(u64, u64, u32)> {
+        let v = self.store_call("rate_limit", &[], Some(block))?;
+        ensure!(v.len() == 3, "rate_limit returned {} felts", v.len());
+        let epoch_blocks = felt_to_u64(&v[0])?;
+        ensure!(epoch_blocks != 0, "rate_limit: zero epoch");
+        Ok((epoch_blocks, felt_to_u64(&v[1])?, u32::try_from(felt_to_u64(&v[2])?)?))
     }
 
-    fn nonce(&self, block: Option<u64>) -> Result<Felt> {
-        let v = self.chain.rpc(
-            "starknet_getNonce",
-            json!([Self::block_id(block), felt_hex(&self.signer.address)]),
-        )?;
+    fn nonce_of(&self, address: Felt, block: Option<u64>) -> Result<Felt> {
+        let v = self.chain.rpc("starknet_getNonce", json!([Self::block_id(block), felt_hex(&address)]))?;
         Felt::from_hex(v.as_str().with_context(|| format!("starknet_getNonce: {v}"))?).context("nonce")
     }
 
-    fn balance_fri(&self) -> Result<u128> {
-        let out = self.call_at(Felt::from_hex(STRK_TOKEN)?, "balance_of", &[self.signer.address], None)?;
-        let low = out.first().context("balance_of shape")?;
-        Ok(u128::from_str_radix(felt_hex(low).trim_start_matches("0x"), 16)?)
+    /// The shared virtual sender's nonce at the base block (0: it can never
+    /// transact for real).
+    fn virtual_nonce(&self, block: u64) -> Result<Felt> {
+        self.nonce_of(self.route.virtual_sender, Some(block))
+    }
+
+    fn pool_nonce(&self) -> Result<Felt> {
+        self.nonce_of(self.route.store, None)
     }
 }
 
+/// Waits until `head()` reaches `target`, reporting the wait once.
+fn wait_for_head(
+    target: u64,
+    mut head: impl FnMut() -> Result<u64>,
+    mut sleep: impl FnMut(Duration),
+    poll: Duration,
+    sink: &mut dyn FnMut(PipelineEvent),
+) -> Result<()> {
+    let mut reported = false;
+    loop {
+        let now = head()?;
+        if now >= target {
+            return Ok(());
+        }
+        if !reported {
+            sink(PipelineEvent::Waiting { until_block: target, blocks_left: target - now });
+            reported = true;
+        }
+        sleep(poll);
+    }
+}
+
+/// A rejection over the pool's nonce: stale (`INVALID_TRANSACTION_NONCE`) or
+/// already taken by a pending send (a duplicate in the mempool).
+fn is_nonce_rejection(e: &GatewayError) -> bool {
+    matches!(e, GatewayError::Rejected { code, message }
+        if code.contains("NONCE") || message.to_ascii_lowercase().contains("nonce"))
+}
+
+/// The nonce to retry at: the one the gateway names, else the chain's,
+/// and always past the one just refused.
+fn next_nonce(refused: Felt, expected: Option<u64>, chain: Felt) -> Felt {
+    let candidate = expected.map(Felt::from).unwrap_or(chain);
+    if candidate > refused { candidate } else { refused + Felt::ONE }
+}
+
 /// Masks long hex runs in a prover log line: if the prover ever echoed its
-/// request, the witness (membership secret) must not reach the UI.
+/// request, the witness (membership and ticket secrets) must not reach the UI.
 fn redact_felts(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
@@ -762,10 +1004,6 @@ fn redact_felts(line: &str) -> String {
     out
 }
 
-fn strk(fri: u128) -> String {
-    format!("{:.2}", fri as f64 / 1e18)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,21 +1012,18 @@ mod tests {
         v.as_array().unwrap().iter().map(|x| Felt::from_hex(x.as_str().unwrap()).unwrap()).collect()
     }
 
-    /// The real phone send in testdata: its facts attest the message hash we
-    /// recompute from its own public send_message calldata.
+    /// The real phone send in testdata (SNIP-36 v1 store): its facts attest
+    /// the message hash recomputed from its own public calldata. Pins the
+    /// facts layout and the message-hash rule, which v4 keeps (only the
+    /// payload grew).
     #[test]
     fn live_send_facts_check_out() {
         let tx: Value = serde_json::from_str(include_str!("../testdata/snip36_send_tx.json")).unwrap();
         let calldata = felts(&tx["calldata"]);
         let facts = felts(&tx["proof_facts"]);
-        // The phone's send on the SNIP-36 v1 deployment: same facts layout and
-        // message-hash rule as v2, which is what this pins.
-        let route = VirtualRoute {
-            store: Felt::from_hex("0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f").unwrap(),
-            prover: Felt::from_hex("0x012b85a4b5e6918eb6f18a07fddc1667d67beaac0ab647928105b8ccf7ee5346").unwrap(),
-            chain_id: crate::invoke_v3::short_string("SN_SEPOLIA"),
-        };
-        assert_eq!(calldata[1], route.store);
+        let store = Felt::from_hex("0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f").unwrap();
+        let prover = Felt::from_hex("0x012b85a4b5e6918eb6f18a07fddc1667d67beaac0ab647928105b8ccf7ee5346").unwrap();
+        assert_eq!(calldata[1], store);
         // send_message args: commitment, ephemeral, root, then the ciphertext
         // ByteArray, whose serialization is exactly what content_hash hashes.
         let args = &calldata[4..];
@@ -797,7 +1032,7 @@ mod tests {
         assert_eq!(consumed, args.len() - 3);
         assert_eq!(content_hash(&bytes), content);
 
-        let expected = message_hash(&route, args[0], args[1], args[2], content);
+        let expected = poseidon_hash_many(&[prover, Felt::ZERO, Felt::from(5u64), store, args[0], args[1], args[2], content]);
         let block = crate::chain::felt_to_u64(&facts[FACT_BLOCK]).unwrap();
         check_facts(&facts, expected, block).unwrap();
         // Any other block, or any other message, is refused.
@@ -807,70 +1042,113 @@ mod tests {
     }
 
     #[test]
-    fn virtual_invoke_signs_the_factless_hash() {
-        let key = Felt::from_hex("0xabc123").unwrap();
-        let signer = Signer::new(Felt::from_hex("0x5617").unwrap(), key);
-        let call = Call::new(Felt::from(7u64), "prove_send", vec![Felt::ONE]);
-        let tx = virtual_invoke(&signer, &[call.clone()], Felt::from(3u64), crate::invoke_v3::short_string("SN_SEPOLIA")).unwrap();
-        let calldata = execute_calldata(&[call]);
-        let hash = InvokeV3 {
-            sender: signer.address,
-            calldata: &calldata,
-            chain_id: crate::invoke_v3::short_string("SN_SEPOLIA"),
-            nonce: Felt::from(3u64),
-            tip: 0,
-            bounds: VIRTUAL_BOUNDS,
-            proof_facts: &[],
+    fn virtual_invoke_is_unsigned_zero_fee_from_the_shared_sender() {
+        let route = VirtualRoute::for_store(crate::config::SEPOLIA_POOL_V4).unwrap();
+        let call = Call::new(route.prover, "prove_send", vec![Felt::ONE]);
+        let tx = virtual_invoke(route.virtual_sender, &[call.clone()], Felt::ZERO);
+        assert_eq!(tx["sender_address"], felt_hex(&route.virtual_sender));
+        assert_eq!(tx["signature"], json!([]));
+        assert_eq!(tx["nonce"], "0x0");
+        assert_eq!(felts(&tx["calldata"]), execute_calldata(&[call]));
+        for r in ["l1_gas", "l2_gas", "l1_data_gas"] {
+            assert_eq!(tx["resource_bounds"][r]["max_price_per_unit"], "0x0", "{r} must be free");
         }
-        .hash();
-        let sig = felts(&tx["signature"]);
-        let public = starknet_crypto::get_public_key(&key);
-        assert!(starknet_crypto::verify(&public, &hash, &sig[0], &sig[1]).unwrap());
-        assert_eq!(tx["resource_bounds"]["l2_gas"]["max_amount"], "0x7000000");
-        assert_eq!(tx["nonce_data_availability_mode"], "L1");
+        assert_eq!(tx["tip"], "0x0");
+    }
+
+    fn sample_public() -> PublicV4 {
+        PublicV4 {
+            store: Felt::from(1u64),
+            commitment: Felt::from(2u64),
+            ephemeral: Felt::from(3u64),
+            root: Felt::from(4u64),
+            content_hash: Felt::from(5u64),
+            nullifier: Felt::from(6u64),
+            epoch: 7,
+            quota: 8,
+            ticket_root: Felt::from(9u64),
+            ticket_nullifier: Felt::from(10u64),
+        }
     }
 
     #[test]
-    fn v3_calldata_layout_and_content_hash() {
-        let (_, ek) = crate::crypto::kem_keygen_from_seed(&[7u8; 64]);
-        let recipient_pub = crate::crypto::ec_mul_gen_x(&Felt::from(11u64));
-        let sealed = send_v2(&recipient_pub, &ek, b"hello v3").unwrap();
-        // The store hashes the published ByteArray the same way we do.
-        assert_eq!(content_hash(&sealed.content), sealed.content_hash);
-        assert!(sealed.content.len() >= crate::crypto::MIN_CONTENT_V2_LEN);
-
+    fn v4_calldata_layouts() {
+        let public = sample_public();
         let path: Vec<Felt> = (100..120u64).map(Felt::from).collect();
-        let out = prove_send_calldata_v3(
-            Felt::from(1u64), &sealed, Felt::from(2u64), Felt::from(3u64), Felt::from(4u64),
-            Felt::from(9u64), 5, &path,
+        let tpath: Vec<Felt> = (200..220u64).map(Felt::from).collect();
+        let w = WitnessV4 {
+            scan_pub: Felt::from(11u64),
+            kem_digest: Felt::from(12u64),
+            member_secret: Felt::from(13u64),
+            slot: 3,
+            leaf_index: 5,
+            path: &path,
+            ticket_secret: Felt::from(14u64),
+            ticket_index: 6,
+            ticket_path: &tpath,
+        };
+        let out = prove_send_calldata_v4(&public, &w).unwrap();
+        let head: Vec<Felt> = [1u64, 5, 2, 3, 4, 7, 8, 9, 11, 12, 13, 3, 5, 20].into_iter().map(Felt::from).collect();
+        assert_eq!(&out[..14], &head[..]);
+        assert_eq!(&out[14..34], &path[..]);
+        assert_eq!(&out[34..37], &[Felt::from(14u64), Felt::from(6u64), Felt::from(20u64)]);
+        assert_eq!(&out[37..], &tpath[..]);
+        assert!(prove_send_calldata_v4(&public, &WitnessV4 { slot: 8, ..w }).is_err(), "slot must be < quota");
+        assert!(prove_send_calldata_v4(&public, &WitnessV4 { slot: 0, path: &path[..19], ..w }).is_err());
+
+        let send = send_message_calldata_v4(&public, b"hi").unwrap();
+        let want: Vec<Felt> = [2u64, 3, 4, 6, 9, 10, 0, 0x6869, 2].into_iter().map(Felt::from).collect();
+        assert_eq!(send, want);
+        assert_eq!(public.payload()[6], Felt::from(7u64));
+    }
+
+    #[test]
+    fn pool_fee_policy_reads_and_bounds() {
+        let policy = PoolFeePolicy { max_fee: 3_000_000_000_000_000_000, max_tip: 1_000_000_000, min_l2_gas: 100_000_000 };
+        assert_eq!(
+            PoolFeePolicy::from_felts(&[Felt::from(policy.max_fee), Felt::from(policy.max_tip), Felt::from(policy.min_l2_gas)]).unwrap(),
+            policy
+        );
+        let b = policy.bounds((52_616_363_968_810, 18_090_898_182, 52_616)).unwrap();
+        assert_eq!(b, txpolicy::bounds(txpolicy::TxKind::Publish, (52_616_363_968_810, 18_090_898_182, 52_616)));
+    }
+
+    #[test]
+    fn the_publish_waits_for_its_block() {
+        let heads = std::cell::RefCell::new(vec![100u64, 104, 109, 110, 111]);
+        let mut slept = 0;
+        let mut events = vec![];
+        wait_for_head(
+            110,
+            || Ok(heads.borrow_mut().remove(0)),
+            |_| slept += 1,
+            Duration::ZERO,
+            &mut |e| events.push(e),
         )
         .unwrap();
-        assert_eq!(
-            &out[..10],
-            &[
-                Felt::from(1u64),
-                sealed.content_hash,
-                sealed.commitment,
-                sealed.ephemeral_pub,
-                Felt::from(2u64),
-                Felt::from(3u64), // scan PUBKEY
-                Felt::from(4u64), // kem_digest
-                Felt::from(9u64), // member secret
-                Felt::from(5u64),
-                Felt::from(20u64),
-            ]
-        );
-        assert_eq!(&out[10..], &path[..]);
-        assert!(prove_send_calldata_v3(Felt::ONE, &sealed, Felt::ONE, Felt::ONE, Felt::ONE, Felt::ONE, 0, &path[..19]).is_err());
+        assert_eq!(slept, 3);
+        assert_eq!(events.len(), 1, "reported once");
+        assert!(matches!(events[0], PipelineEvent::Waiting { until_block: 110, blocks_left: 10 }));
+        // Already past: no wait, no event.
+        let mut events = vec![];
+        wait_for_head(110, || Ok(200), |_| panic!("no sleep"), Duration::ZERO, &mut |e| events.push(e)).unwrap();
+        assert!(events.is_empty());
     }
 
     #[test]
-    fn fee_ceiling_prices_the_whole_bound() {
-        // 120M L2 gas at 1 gfri ×1.5 + 4096 data gas at 1000 ×1.5.
-        let bounds = GAS_POLICY.bounds((0, 1_000_000_000, 1_000));
-        assert_eq!(bounds.l2_gas.max_price_per_unit, 1_500_000_000);
-        assert_eq!(fee_ceiling_fri(&bounds), 120_000_000 * 1_500_000_000 + 4_096 * 1_500);
+    fn nonce_retry_always_moves_forward() {
+        let n = |x: u64| Felt::from(x);
+        assert_eq!(next_nonce(n(5), Some(7), n(6)), n(7));
+        assert_eq!(next_nonce(n(5), None, n(6)), n(6));
+        assert_eq!(next_nonce(n(5), Some(5), n(5)), n(6), "pending duplicate: queue behind it");
+        assert_eq!(next_nonce(n(5), None, n(3)), n(6));
+        let dup = GatewayError::Rejected { code: "StarknetErrorCode.DUPLICATED_TRANSACTION".into(), message: "nonce already used".into() };
+        assert!(is_nonce_rejection(&dup));
+        let other = GatewayError::Rejected { code: "StarknetErrorCode.VALIDATE_FAILURE".into(), message: "stale epoch".into() };
+        assert!(!is_nonce_rejection(&other));
     }
+
+    // --- prepare against a fake pool ----------------------------------------
 
     /// One profile of the fake store: keys.json plus its registration event.
     fn profile(handle: &str, seed: u8, leaf_index: u32) -> (Keys, (Vec<String>, Vec<String>)) {
@@ -896,139 +1174,243 @@ mod tests {
 
     type Log = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
 
-    /// A sender whose RPC is a fake v3 store at block `BLOCK` holding
-    /// `events`; `get_merkle_root` answers from `roots` (one per call, the
-    /// last repeating). Every request is recorded.
-    fn fake_sender<'a>(
-        home: &'a Home,
-        events: Vec<(Vec<String>, Vec<String>)>,
+    const BLOCK: u64 = 16_000_123;
+    /// `txpolicy::base_block(BLOCK)`.
+    const BASE: u64 = 16_000_096;
+    const EPOCH_BLOCKS: u64 = 5_000;
+    const QUOTA: u32 = 2;
+
+    struct Fake {
+        members: Vec<(Vec<String>, Vec<String>)>,
+        tickets: Vec<(Vec<String>, Vec<String>)>,
+        /// `get_merkle_root` answers, one per call, the last repeating.
         roots: Vec<Felt>,
-    ) -> (VirtualSender<'a>, Log) {
-        const BLOCK: u64 = 16_000_000;
+        ticket_root: Felt,
+    }
+
+    /// A sender whose RPC is a fake v4 pool at block `BLOCK`. Every request
+    /// is recorded.
+    fn fake_sender<'a>(home: &'a Home, fake: Fake) -> (VirtualSender<'a>, Log) {
         let log: Log = Default::default();
-        let roots = std::sync::Mutex::new(roots);
+        let roots = std::sync::Mutex::new(fake.roots);
         let record = log.clone();
+        let route = VirtualRoute::for_store(crate::config::SEPOLIA_POOL_V4).unwrap();
+        let vsender = felt_hex(&route.virtual_sender);
         let transport: crate::chain::Transport = std::sync::Arc::new(move |method: &str, params: &Value| {
             record.lock().unwrap().push((method.to_string(), params.clone()));
+            let as_events = |evs: &Vec<(Vec<String>, Vec<String>)>| {
+                let events: Vec<Value> = evs.iter().map(|(k, d)| json!({"keys": k, "data": d})).collect();
+                json!({"events": events})
+            };
             Ok(match method {
                 "starknet_blockNumber" => json!(BLOCK),
                 "starknet_getEvents" => {
-                    assert_eq!(params[0]["to_block"], json!({"block_number": BLOCK}), "events must stop at N");
-                    let events: Vec<Value> =
-                        events.iter().map(|(k, d)| json!({"keys": k, "data": d})).collect();
-                    json!({"events": events})
+                    assert_eq!(params[0]["to_block"], json!({"block_number": BASE}), "events must stop at N");
+                    let key = params[0]["keys"][0][0].as_str().unwrap().to_string();
+                    if key == felt_hex(&snkeccak("UserRegistered")) {
+                        as_events(&fake.members)
+                    } else if key == felt_hex(&snkeccak("TicketBought")) {
+                        as_events(&fake.tickets)
+                    } else {
+                        anyhow::bail!("unexpected event filter {key}")
+                    }
                 }
                 "starknet_call" => {
-                    assert_eq!(params[0]["entry_point_selector"], felt_hex(&snkeccak("get_merkle_root")));
-                    let mut roots = roots.lock().unwrap();
-                    let root = if roots.len() > 1 { roots.remove(0) } else { roots[0] };
-                    json!([felt_hex(&root)])
+                    let selector = params[0]["entry_point_selector"].as_str().unwrap().to_string();
+                    if selector == felt_hex(&snkeccak("get_merkle_root")) {
+                        let mut roots = roots.lock().unwrap();
+                        let root = if roots.len() > 1 { roots.remove(0) } else { roots[0] };
+                        json!([felt_hex(&root)])
+                    } else if selector == felt_hex(&snkeccak("get_ticket_root")) {
+                        json!([felt_hex(&fake.ticket_root)])
+                    } else if selector == felt_hex(&snkeccak("rate_limit")) {
+                        json!([felt_hex(&Felt::from(EPOCH_BLOCKS)), "0x1", felt_hex(&Felt::from(QUOTA))])
+                    } else {
+                        anyhow::bail!("unexpected call {selector}")
+                    }
                 }
-                "starknet_getNonce" => json!("0x3"),
+                "starknet_getNonce" => {
+                    assert_eq!(params[1], json!(vsender), "only the virtual sender's nonce is read");
+                    json!("0x0")
+                }
                 other => anyhow::bail!("unexpected rpc {other}"),
             })
         });
         let sender = VirtualSender {
             home,
-            route: VirtualRoute::for_store(crate::config::SEPOLIA_STORE_V3).unwrap(),
+            route,
             chain: Chain::with_transport("fake://rpc", "unused", transport),
             gateway: Gateway::sepolia(),
-            signer: Signer::new(Felt::from_hex("0x5617").unwrap(), Felt::from_hex("0xabc123").unwrap()),
             prover_bin: PathBuf::from("/nonexistent"),
         };
         (sender, log)
     }
 
-    fn three_members() -> (Keys, Vec<(Vec<String>, Vec<String>)>, Felt) {
+    struct World {
+        alice: Keys,
+        home: Home,
+        fake: Fake,
+        /// alice's ticket leaves in the tree (at indices 1 and 2).
+        ticket_leaves: Vec<Felt>,
+    }
+
+    /// alice, bob, carol registered; alice holds two bought tickets (one
+    /// stranger's ticket sits before them) and one whose purchase never landed.
+    fn world(tag: &str) -> World {
+        let home = Home::new(std::env::temp_dir().join(format!("zkmsg-v4-{tag}-{}", std::process::id())));
+        let _ = fs::remove_dir_all(&home.dir);
+        fs::create_dir_all(&home.dir).unwrap();
         let (alice, a) = profile("alice", 0x11, 0);
         let (_, b) = profile("bob", 0x22, 1);
         let (_, c) = profile("carol", 0x33, 2);
-        let events = vec![a, b, c];
-        let root = crate::registry::Registry::from_events(&events).unwrap().root();
-        (alice, events, root)
+        let members = vec![a, b, c];
+        let root = Registry::from_events(&members).unwrap().root();
+
+        let mut wallet = Wallet::load(&home, crate::config::SEPOLIA_POOL_V4).unwrap();
+        let leaves = wallet.mint(3).unwrap();
+        wallet.save(&home).unwrap();
+        let tickets = vec![
+            crate::tickets::tests::event(Felt::from(0x5157u64), 0),
+            crate::tickets::tests::event(leaves[0], 1),
+            crate::tickets::tests::event(leaves[1], 2),
+        ];
+        let ticket_root = TicketTree::from_events(&tickets).unwrap().root();
+        World {
+            alice,
+            home,
+            fake: Fake { members, tickets, roots: vec![root], ticket_root },
+            ticket_leaves: leaves[..2].to_vec(),
+        }
     }
 
-    /// The send-prep path names no handle and no leaf to the RPC: its only
-    /// requests are the head block, ALL registrations (filtered by event
-    /// selector alone), the root (no calldata) and the account's own nonce.
+    /// The send path names no handle, no leaf, no ticket and no account of
+    /// the user's to the RPC: its only requests are the head block, ALL
+    /// registrations and ALL ticket purchases (filtered by event selector
+    /// alone), the two roots and the rate limit (no calldata), and the
+    /// SHARED virtual sender's nonce.
     #[test]
-    fn prepare_reads_name_no_handle_or_leaf() {
-        let home = Home::new(std::env::temp_dir().join(format!("zkmsg-prep-{}", std::process::id())));
-        let (alice, events, root) = three_members();
-        let (sender, log) = fake_sender(&home, events, vec![root]);
+    fn prepare_reads_name_no_handle_leaf_ticket_or_account() {
+        let w = world("egress");
+        let (sender, log) = fake_sender(&w.home, w.fake);
+        let p = sender.prepare(&w.alice, "carol", "hi carol").unwrap();
+        assert_eq!(p.block, BASE, "proved on the schedule's base block");
+        assert_eq!(p.public.epoch, BASE / EPOCH_BLOCKS);
+        assert_eq!(p.public.quota, QUOTA);
+        // The witness: alice's leaf 0, slot 0, ticket at index 1.
+        assert_eq!(p.prove_calldata[11], Felt::ZERO, "slot");
+        assert_eq!(p.prove_calldata[12], Felt::ZERO, "leaf index");
+        assert_eq!(p.prove_calldata[35], Felt::ONE, "ticket index");
+        let member_secret = w.alice.member_secret_felt().unwrap();
+        assert_eq!(p.public.nullifier, nullifier_v4(&sender.route.store, &member_secret, p.public.epoch, 0));
 
-        let p = sender.prepare(&alice, "carol", "hi carol").unwrap();
-        assert_eq!(p.root, root);
-        assert_eq!(p.block, 16_000_000);
-        // The witness carries alice's locally computed path at leaf 0.
-        assert_eq!(p.prove_calldata[8], Felt::ZERO);
+        // The ticket is reserved for this send; the next one is the other.
+        let wallet = Wallet::load(&w.home, crate::config::SEPOLIA_POOL_V4).unwrap();
+        assert_eq!(wallet.tickets[0].state, TicketState::Reserved { send_id: p.id.clone() });
+        assert_eq!(wallet.counts().unspent, 1);
+        assert_eq!(wallet.counts().pending, 1, "an unlanded purchase stays pending");
+        let ticket_secret = wallet.tickets[0].secret_felt().unwrap();
 
         let log = log.lock().unwrap();
         let methods: Vec<&str> = log.iter().map(|(m, _)| m.as_str()).collect();
         assert_eq!(
             methods,
-            ["starknet_blockNumber", "starknet_getEvents", "starknet_call", "starknet_getNonce"]
+            [
+                "starknet_blockNumber",
+                "starknet_getEvents",
+                "starknet_call",
+                "starknet_getEvents",
+                "starknet_call",
+                "starknet_call",
+                "starknet_getNonce",
+            ]
         );
-        let handles: Vec<String> = ["alice", "bob", "carol"]
+        let mut secrets: Vec<String> = ["alice", "bob", "carol"]
             .iter()
             .map(|h| felt_hex(&crate::app::short_string_felt(h).unwrap()))
             .collect();
+        secrets.push(w.alice.scan_pub.clone());
+        secrets.push(felt_hex(&member_secret));
+        secrets.push(felt_hex(&p.public.nullifier));
+        secrets.push(felt_hex(&ticket_secret));
+        secrets.push(felt_hex(&p.public.ticket_nullifier));
+        secrets.extend(w.ticket_leaves.iter().map(felt_hex));
+        secrets.push(felt_hex(&Felt::from(0x5011u64))); // alice's account (event owner)
         for (method, params) in log.iter() {
             let text = params.to_string();
-            for h in &handles {
-                assert!(!text.contains(h.as_str()), "{method} names a handle: {text}");
+            for s in &secrets {
+                assert!(!text.contains(s.as_str()), "{method} names {s}: {text}");
             }
-            assert!(!text.contains(alice.scan_pub.as_str()), "{method} names the sender's scan key");
             match method.as_str() {
-                "starknet_getEvents" => assert_eq!(
-                    params[0]["keys"],
-                    json!([[felt_hex(&snkeccak("UserRegistered"))]]),
-                    "the event filter must not select a user"
-                ),
+                "starknet_getEvents" => assert_eq!(params[0]["keys"].as_array().unwrap()[0].as_array().unwrap().len(), 1, "the event filter selects no user or ticket"),
                 "starknet_call" => assert_eq!(params[0]["calldata"], json!([]), "no call takes an argument"),
-                "starknet_getNonce" => assert_eq!(params[1], json!(felt_hex(&sender.signer.address))),
                 _ => {}
             }
         }
+        fs::remove_dir_all(&w.home.dir).unwrap();
+    }
+
+    /// Quota slots advance per send within an epoch, and the quota is
+    /// enforced before anything is sealed or proven.
+    #[test]
+    fn prepare_takes_quota_slots_and_tickets_in_turn() {
+        let w = world("quota");
+        let (sender, _) = fake_sender(&w.home, w.fake);
+        let first = sender.prepare(&w.alice, "bob", "one").unwrap();
+        let second = sender.prepare(&w.alice, "bob", "two").unwrap();
+        assert_eq!(second.prove_calldata[11], Felt::ONE, "the second send takes slot 1");
+        assert_eq!(second.prove_calldata[35], Felt::TWO, "and the other ticket");
+        assert_ne!(first.public.nullifier, second.public.nullifier);
+        // No ticket left: refused before the quota is touched.
+        let err = sender.prepare(&w.alice, "bob", "three").err().unwrap();
+        assert!(format!("{err:#}").contains("no unspent ticket"), "{err:#}");
+        let log = QuotaLog::load(&w.home).unwrap().unwrap();
+        assert_eq!(log.used, 2);
+        fs::remove_dir_all(&w.home.dir).unwrap();
     }
 
     #[test]
-    fn prepare_refuses_a_tree_that_disagrees_with_the_store() {
-        let home = Home::new(std::env::temp_dir().join(format!("zkmsg-prep2-{}", std::process::id())));
-        let (alice, events, root) = three_members();
-
+    fn prepare_refuses_trees_that_disagree_with_the_store() {
+        let w = world("mismatch");
+        let good = w.fake.roots[0];
         // Wrong once: refreshed and retried at a fresh block, then fine.
-        let (sender, log) = fake_sender(&home, events.clone(), vec![Felt::from(7u64), root]);
-        sender.prepare(&alice, "bob", "hi").unwrap();
-        let n_events = log.lock().unwrap().iter().filter(|(m, _)| m == "starknet_getEvents").count();
-        assert_eq!(n_events, 2);
+        let fake = Fake { roots: vec![Felt::from(7u64), good], ..w.fake };
+        let (sender, log) = fake_sender(&w.home, fake);
+        sender.prepare(&w.alice, "bob", "hi").unwrap();
+        let n = log.lock().unwrap().iter().filter(|(m, _)| m == "starknet_getEvents").count();
+        assert_eq!(n, 4, "both trees fetched twice");
+        fs::remove_dir_all(&w.home.dir).unwrap();
 
-        // Wrong twice: a clear error, before anything is sealed or proven.
-        let (sender, log) = fake_sender(&home, events, vec![Felt::from(7u64)]);
-        let err = sender.prepare(&alice, "bob", "hi").err().expect("mismatch must fail");
-        assert!(format!("{err:#}").contains("disagrees with the store"), "{err:#}");
-        assert!(!log.lock().unwrap().iter().any(|(m, _)| m == "starknet_getNonce"));
+        // A ticket tree that never matches: a clear error, nothing reserved.
+        let w = world("mismatch2");
+        let fake = Fake { ticket_root: Felt::from(9u64), ..w.fake };
+        let (sender, _) = fake_sender(&w.home, fake);
+        let err = sender.prepare(&w.alice, "bob", "hi").err().unwrap();
+        assert!(format!("{err:#}").contains("disagree with the store"), "{err:#}");
+        let wallet = Wallet::load(&w.home, crate::config::SEPOLIA_POOL_V4).unwrap();
+        assert_eq!(wallet.counts().reserved, 0);
+        assert!(QuotaLog::load(&w.home).unwrap().is_none(), "no slot taken");
+        fs::remove_dir_all(&w.home.dir).unwrap();
     }
 
     #[test]
     fn prepare_checks_the_sender_registration_and_recipient() {
-        let home = Home::new(std::env::temp_dir().join(format!("zkmsg-prep3-{}", std::process::id())));
-        let (alice, events, root) = three_members();
-        let (sender, _) = fake_sender(&home, events, vec![root]);
-        let err = sender.prepare(&alice, "dave", "hi").err().unwrap();
+        let w = world("checks");
+        let (sender, _) = fake_sender(&w.home, w.fake);
+        let err = sender.prepare(&w.alice, "dave", "hi").err().unwrap();
         assert!(format!("{err:#}").contains("'dave' is not registered"), "{err:#}");
-        // Local keys that differ from alice's registered record are refused.
         let (mut other, _) = profile("alice", 0x11, 0);
         other.member_secret = Some(crate::config::member_secret_hex(&[0x01; 32]));
         let err = sender.prepare(&other, "bob", "hi").err().unwrap();
         assert!(format!("{err:#}").contains("registered to different keys"), "{err:#}");
+        fs::remove_dir_all(&w.home.dir).unwrap();
     }
 
     #[test]
     fn only_the_current_store_routes() {
-        let v3 = VirtualRoute::for_store(crate::config::SEPOLIA_STORE_V3).unwrap();
-        assert_eq!(v3.prover, Felt::from_hex(crate::config::SEPOLIA_V3_SEND_PROVER).unwrap());
-        assert!(VirtualRoute::for_store("0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f").is_none());
+        let v4 = VirtualRoute::for_store(crate::config::SEPOLIA_POOL_V4).unwrap();
+        assert_eq!(v4.prover, Felt::from_hex(crate::config::SEPOLIA_V4_SEND_PROVER).unwrap());
+        assert_eq!(v4.virtual_sender, Felt::from_hex(crate::config::SEPOLIA_V4_VIRTUAL_SENDER).unwrap());
+        assert!(VirtualRoute::for_store(crate::config::SEPOLIA_STORE_V3).is_none());
         assert!(VirtualRoute::for_store("0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8").is_none());
     }
 }

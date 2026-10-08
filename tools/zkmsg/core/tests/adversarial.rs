@@ -296,20 +296,29 @@ fn shared_secret_is_nondegenerate() {
 fn live_current_store_is_pinned_to_our_prover() {
     use serde_json::json;
     use zkmsg_core::chain::{snkeccak, Chain};
-    use zkmsg_core::config::{SEPOLIA_PROVER_RPC, SEPOLIA_STORE_V3, SEPOLIA_V3_SEND_PROVER};
+    use zkmsg_core::config::{
+        SEPOLIA_POOL_V4, SEPOLIA_PROVER_RPC, SEPOLIA_V4_SEND_PROVER, SEPOLIA_V4_TICKET_PRICE_FRI,
+        SEPOLIA_V4_VIRTUAL_SENDER,
+    };
 
     let chain = Chain::new(SEPOLIA_PROVER_RPC, "unused-for-read-only");
-    let result = chain
-        .rpc(
-            "starknet_call",
-            json!([
-                { "contract_address": SEPOLIA_STORE_V3,
-                  "entry_point_selector": format!("{:#x}", snkeccak("prover")),
-                  "calldata": [] },
-                "latest"
-            ]),
-        )
-        .unwrap_or_else(|e| panic!("live call prover() failed: {e}"));
-    let prover = Felt::from_hex(result[0].as_str().unwrap()).unwrap();
-    assert_eq!(prover, Felt::from_hex(SEPOLIA_V3_SEND_PROVER).unwrap(), "store re-pinned");
+    let call = |name: &str| -> Vec<Felt> {
+        let result = chain
+            .rpc(
+                "starknet_call",
+                json!([
+                    { "contract_address": SEPOLIA_POOL_V4,
+                      "entry_point_selector": format!("{:#x}", snkeccak(name)),
+                      "calldata": [] },
+                    "latest"
+                ]),
+            )
+            .unwrap_or_else(|e| panic!("live call {name}() failed: {e}"));
+        result.as_array().unwrap().iter().map(|x| Felt::from_hex(x.as_str().unwrap()).unwrap()).collect()
+    };
+    assert_eq!(call("prover"), [Felt::from_hex(SEPOLIA_V4_SEND_PROVER).unwrap()], "pool re-pinned");
+    assert_eq!(call("ticket_price"), [Felt::from(SEPOLIA_V4_TICKET_PRICE_FRI)]);
+    // The shared virtual sender exists and has never transacted.
+    let nonce = chain.rpc("starknet_getNonce", json!(["latest", SEPOLIA_V4_VIRTUAL_SENDER])).unwrap();
+    assert_eq!(Felt::from_hex(nonce.as_str().unwrap()).unwrap(), Felt::ZERO);
 }

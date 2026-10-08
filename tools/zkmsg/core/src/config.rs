@@ -1,6 +1,9 @@
 //! `~/.zkmsg` home layout: `config.json` (network + addresses + tool
 //! paths), `keys.json` (mode 0600: the scan keypair, the ML-KEM `kem_seed`
-//! and the v3 `member_secret` — the app's long-lived secrets), `sends/<id>.json` (pipeline checkpoints).
+//! and the `member_secret` — the app's long-lived secrets),
+//! `tickets.json` (mode 0600: the v4 fee tickets, bearer value),
+//! `quota.json` (the epoch's used quota slots), `sends/<id>.json` (send
+//! checkpoints).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,28 +12,50 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
-/// MessageStoreV3 (contracts/messagezk_store_v3), deployed 2026-10-01
-/// (docs/zkmsg-deployment.md): hash-based (post-quantum) membership. Each
-/// identity holds a membership secret m; the leaf is
-/// poseidon(LEAF_V3, scan_pub, kem_digest, poseidon(MEMBER_V3, m)), and a send
-/// proves knowledge of m under the root — no elliptic-curve step. Content and
-/// recipient detection are v2's hybrid ML-KEM-768 + ECDH, unchanged.
+/// MessageStoreV3 (contracts/messagezk_store_v3), deployed 2026-10-01 —
+/// RETIRED 2026-10-07 by the v4 pool: every v3 send was published (and paid)
+/// by the sender's own account, the same account that registered the handle.
 pub const SEPOLIA_STORE_V3: &str =
     "0x0103de677e966a8a72669551093f0f5342621e635531fec146c4b04c5f5d3d9d";
-pub const SEPOLIA_STORE_V3_DEPLOY_BLOCK: u64 = 15_952_418;
-/// ZkmsgSendProverV3 — the v3 store's pinned virtual-OS prover contract.
-pub const SEPOLIA_V3_SEND_PROVER: &str =
-    "0x03d4da714c3bb315fe54017d2556face941836c2d5dfa9cc0b6852b94c0b4f30";
+
+/// The first ZkmsgPoolV4 (2026-10-07, block 16,257,012) — RETIRED the same
+/// day for the padded pool below: it accepted any content of 1116..8192
+/// bytes. Its 6.27 STRK surplus stays locked (no owner).
+pub const SEPOLIA_POOL_V4_UNPADDED: &str =
+    "0x050f98ee98a0c1a583529c115f394ad79d18686ff66dc1ee25ba0f7bc53669b9";
+
+/// ZkmsgPoolV4 (contracts/zkmsg_pool_v4), deployed 2026-10-07
+/// (docs/zkmsg-deployment.md): the message store AND the account that
+/// publishes every send. A send carries no signature and names no member's
+/// account: the SNIP-36 proof (v3 membership + a per-epoch quota nullifier +
+/// a spent single-send ticket) authorizes it, and the ticket, bought earlier
+/// at `ticket_price`, pays for it. Content must be one of the padded sizes
+/// 1372 / 2140 / 5212 bytes. Registration (leaf, events, ABI) is v3's.
+pub const SEPOLIA_POOL_V4: &str =
+    "0x07ba165780beacf1e4dd8fae2cbeb3873afdd0e3b806fb60fb1563fc2860e9eb";
+pub const SEPOLIA_POOL_V4_DEPLOY_BLOCK: u64 = 16_258_239;
+/// The pool's `ticket_price()`: 3 STRK per single-send ticket. Its fee
+/// policy caps a publish's worst case at the same 3 STRK (~2x a send's
+/// measured cost); what a send does not use stays in the pool.
+pub const SEPOLIA_V4_TICKET_PRICE_FRI: u128 = 3_000_000_000_000_000_000;
+/// ZkmsgSendProverV4 — the pool's pinned virtual-OS prover contract.
+pub const SEPOLIA_V4_SEND_PROVER: &str =
+    "0x0496b7e39ea515c48e8f37dd588ed1ff16c86b3ff7619c6a30ae7b473f902973";
+/// ZkmsgVirtualSenderV4 — the shared, zero-fee account every member's
+/// VIRTUAL `prove_send` runs from (its nonce stays 0 forever), so a member's
+/// own account never enters a proof request.
+pub const SEPOLIA_V4_VIRTUAL_SENDER: &str =
+    "0x01e9fefc5d5848690330af81644736e90cc1e7192357d06fe40080da2ddd94a4";
 
 /// The store a fresh profile is configured with — and the only one this
 /// client reads or writes (owner decision 2026-10-01: only the current store
 /// is read; `zkmsg migrate-store` moves a profile still pointing at an older
-/// one — v2 PQ, SNIP-36 v1 or the lane-1 store).
-pub const SEPOLIA_STORE_DEFAULT: &str = SEPOLIA_STORE_V3;
+/// one).
+pub const SEPOLIA_STORE_DEFAULT: &str = SEPOLIA_POOL_V4;
 
-/// Whether `store` is the current (v3) store.
+/// Whether `store` is the current (v4 pool) store.
 pub fn is_current_store(store: &str) -> bool {
-    same_address(store, SEPOLIA_STORE_V3)
+    same_address(store, SEPOLIA_POOL_V4)
 }
 
 /// Address equality as felts (tolerates leading zeros / case).
@@ -44,7 +69,7 @@ pub fn same_address(a: &str, b: &str) -> bool {
 /// First block worth scanning for `store`'s events: the current store's deploy
 /// block, else 0. From-genesis getEvents 500s on publicnode.
 pub fn store_deploy_block(store: &str) -> u64 {
-    if is_current_store(store) { SEPOLIA_STORE_V3_DEPLOY_BLOCK } else { 0 }
+    if is_current_store(store) { SEPOLIA_POOL_V4_DEPLOY_BLOCK } else { 0 }
 }
 
 pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.com";
@@ -53,7 +78,8 @@ pub const SEPOLIA_RPC_DEFAULT: &str = "https://starknet-sepolia-rpc.publicnode.c
 pub const SEPOLIA_PROVER_RPC: &str = "https://api.zan.top/public/starknet-sepolia/rpc/v0_10";
 
 /// STRK token (same address on Sepolia and mainnet) — the fee/transfer
-/// token used by the setup wizard's fund step and the status balance read.
+/// token used by the setup wizard's fund step, the status balance read and
+/// ticket purchases.
 pub const STRK_TOKEN: &str =
     "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 
@@ -223,6 +249,16 @@ impl Home {
 
     pub fn inbox_cache_path(&self) -> PathBuf {
         self.dir.join("inbox.json")
+    }
+
+    /// The ticket wallet (mode 0600): ticket secrets are bearer value.
+    pub fn tickets_path(&self) -> PathBuf {
+        self.dir.join("tickets.json")
+    }
+
+    /// The quota slots this profile used in the current epoch.
+    pub fn quota_path(&self) -> PathBuf {
+        self.dir.join("quota.json")
     }
 
     pub fn load_config(&self) -> Result<Config> {
@@ -411,12 +447,16 @@ mod tests {
 
     #[test]
     fn store_routing() {
-        assert_eq!(Config::default_sepolia(Path::new("/r")).store, SEPOLIA_STORE_V3);
+        assert_eq!(Config::default_sepolia(Path::new("/r")).store, SEPOLIA_POOL_V4);
+        assert!(is_current_store(SEPOLIA_POOL_V4));
         // Leading-zero / case differences still match.
-        assert!(is_current_store("0x103DE677E966A8A72669551093F0F5342621E635531FEC146C4B04C5F5D3D9D"));
-        assert_eq!(store_deploy_block(SEPOLIA_STORE_V3), SEPOLIA_STORE_V3_DEPLOY_BLOCK);
+        let upper = format!("0x{}", SEPOLIA_POOL_V4.trim_start_matches("0x").trim_start_matches('0').to_uppercase());
+        assert!(is_current_store(&upper));
+        assert_eq!(store_deploy_block(SEPOLIA_POOL_V4), SEPOLIA_POOL_V4_DEPLOY_BLOCK);
         // The retired stores are just unknown addresses now.
         for retired in [
+            SEPOLIA_STORE_V3,
+            SEPOLIA_POOL_V4_UNPADDED,
             "0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8", // v2 PQ
             "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f", // SNIP-36 v1
         ] {

@@ -17,12 +17,14 @@ use crate::config::Home;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepKind {
-    /// Read the tree, the members and the nonce at one block. Never
-    /// checkpointed on its own: nothing is resumable before the proof exists.
+    /// Read both trees, the rate limit and the virtual sender's nonce at
+    /// one block; take a quota slot and reserve a ticket. Never checkpointed
+    /// on its own: nothing is resumable before the proof exists.
     Prepare,
     /// Virtual-OS proof of `prove_send`, facts checked against the send.
     Prove,
-    /// The one paid transaction: `send_message` carrying proof + facts.
+    /// The one transaction: the pool's own `send_message` carrying proof +
+    /// facts, sent unsigned from the pool and paid by the burnt ticket.
     Publish,
 }
 
@@ -55,6 +57,25 @@ pub struct SendState {
     pub publish_nonce: Option<String>,
     #[serde(default)]
     pub publish_bounds: Option<crate::invoke_v3::Bounds>,
+    /// What a v4 proof binds besides the envelope (absent in older states,
+    /// which the v4 client no longer publishes).
+    #[serde(default)]
+    pub binding: Option<V4Binding>,
+    /// The publish goes out once the head reaches this block
+    /// (`txpolicy::publish_after`), fixed when the send is prepared.
+    #[serde(default)]
+    pub publish_after_block: Option<u64>,
+}
+
+/// The rest of a v4 send's public tuple (hex felts): the quota nullifier,
+/// the store-derived epoch and quota, and the ticket spend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V4Binding {
+    pub nullifier: String,
+    pub epoch: u64,
+    pub quota: u32,
+    pub ticket_root: String,
+    pub ticket_nullifier: String,
 }
 
 impl SendState {
@@ -80,6 +101,8 @@ impl SendState {
             base_block: Some(base_block),
             publish_nonce: None,
             publish_bounds: None,
+            binding: None,
+            publish_after_block: None,
         }
     }
 

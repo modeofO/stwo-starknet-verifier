@@ -1,0 +1,27 @@
+[package]
+license = "Apache-2.0"
+name = "zkmsg_pool_v4"
+version = "0.1.0"
+edition = "2024_07"
+
+# zkmsg v4: accountless sends. A shared pool account (the store itself)
+# publishes every send, paid by single-send tickets, so no member's account
+# signs or pays for one. Deployed on Sepolia (docs/zkmsg-deployment.md).
+# See src/lib.cairo.
+
+[dependencies]
+starknet = "2.18.0"
+
+[[target.starknet-contract]]
+sierra = true
+allowed-libfuncs-list.name = "audited"
+
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
