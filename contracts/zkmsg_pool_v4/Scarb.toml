@@ -1,0 +1,26 @@
+[package]
+license = "Apache-2.0"
+name = "zkmsg_pool_v4"
+version = "0.1.0"
+edition = "2024_07"
+
+# SPIKE (pool-spike branch): accountless zkmsg sends. A shared pool account
+# publishes every send, so no member's account signs or pays for one. Local
+# prototype only; nothing here is deployed. See src/lib.cairo.
+
+[dependencies]
+starknet = "2.18.0"
+
+[[target.starknet-contract]]
+sierra = true
+allowed-libfuncs-list.name = "audited"
+
+[dev-dependencies]
+snforge_std = "0.61.0"
+assert_macros = "2.18.0"
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
