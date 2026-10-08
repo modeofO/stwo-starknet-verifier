@@ -20,3 +20,9 @@ sha3 = "0.10"
 # deterministic encapsulation, which the golden vectors pin.
 ml-kem = { version = "0.3.2", features = ["hazmat"] }
 clap = { version = "4", features = ["derive"] }
+
+# Argon2id runs at 256 MiB for the app PIN: unoptimized it takes ~20x longer.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

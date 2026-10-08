@@ -15,6 +15,8 @@ use zkmsg_core::profiles::{
     execute_migration, list_profiles, plan_migration, write_current,
 };
 
+use crate::delete_view::{DeleteOutcome, DeleteUi};
+use crate::lock_view::{LockOutcome, LockUi, PanicOutcome, PanicUi};
 use crate::migrate_view::{self, MigrateAction, MigrationUi};
 use crate::retire_view::{RetireOutcome, RetireUi};
 use crate::session::{ProfileSession, Tab};
@@ -36,6 +38,8 @@ enum PickerAction {
     Archive(String),
     /// Move an archived profile back into the picker.
     Unarchive(String),
+    /// Delete a profile (open the delete dialog); `true`: the archived one.
+    Delete(String, bool),
 }
 
 pub struct ZkmsgApp {
@@ -70,11 +74,27 @@ pub struct ZkmsgApp {
     /// the app-level in-flight guard.
     wizard: Option<WizardUi>,
 
-    /// The burner-retirement dialog, when open. Owned here (not on the
-    /// session) because a successful archive drops the very session it may
-    /// have been opened from; its sweep folds into `work_in_flight`.
+    /// The archive dialog, when open. Owned here (not on the session)
+    /// because a successful archive drops the very session it may have been
+    /// opened from.
     retire: Option<RetireUi>,
+
+    /// The delete dialog, when open; owned here for the same reason.
+    delete: Option<DeleteUi>,
+
+    /// The profile root the app lock and the panic wipe act on.
+    lock_root: PathBuf,
+    /// `Some` while locked (app PIN): the lock screen owns the window.
+    lock: Option<LockUi>,
+    /// The panic-wipe dialog, when open (from the lock screen or the top bar).
+    panic: Option<PanicUi>,
+    /// The session to reopen on unlock after a lock.
+    reopen: Option<(String, PathBuf)>,
+    last_input: std::time::Instant,
 }
+
+/// Unlocked and untouched this long (and nothing running): lock.
+const IDLE_LOCK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 impl ZkmsgApp {
     pub fn new(
@@ -149,6 +169,12 @@ impl ZkmsgApp {
             migration,
             wizard: None,
             retire: None,
+            delete: None,
+            lock_root: zkmsg_core::profiles::profile_root(&launch_path),
+            lock: Some(LockUi::new()),
+            panic: None,
+            reopen: None,
+            last_input: std::time::Instant::now(),
         }
     }
 
@@ -164,6 +190,15 @@ impl ZkmsgApp {
     /// the profile. The single path through which a session becomes active
     /// (the deferred launch open included), so the title always tracks it.
     pub fn open_session(&mut self, ctx: &egui::Context, name: String, home: Home) {
+        // A profile written before the vault: seal its secret files under its
+        // Keychain key before anything reads them.
+        if home.config_path().exists() {
+            if let Err(e) = zkmsg_core::vault::has_plaintext(&home)
+                .and_then(|plain| if plain { zkmsg_core::vault::seal_profile(&home).map(|_| ()) } else { Ok(()) })
+            {
+                self.picker_error = Some(format!("sealing {name}'s files: {e:#}"));
+            }
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("zkmsg — {name}")));
         self.session = Some(ProfileSession::new(name, home));
     }
@@ -229,7 +264,7 @@ impl ZkmsgApp {
                             continue;
                         }
                         // Every profile can be archived (hidden here, directory
-                        // and keys kept); nothing is ever deleted.
+                        // and keys kept) or deleted for good.
                         ui.horizontal(|ui| {
                             let selected = entry.name == active_name;
                             if ui.selectable_label(selected, picker_label(entry)).clicked() && !selected {
@@ -237,6 +272,9 @@ impl ZkmsgApp {
                             }
                             if ui.small_button("archive…").clicked() {
                                 action = PickerAction::Archive(entry.name.clone());
+                            }
+                            if ui.small_button("delete…").clicked() {
+                                action = PickerAction::Delete(entry.name.clone(), false);
                             }
                         });
                     }
@@ -284,6 +322,9 @@ impl ZkmsgApp {
                                 if ui.small_button("unarchive").clicked() {
                                     action = PickerAction::Unarchive(entry.name.clone());
                                 }
+                                if ui.small_button("delete…").clicked() {
+                                    action = PickerAction::Delete(entry.name.clone(), true);
+                                }
                             });
                         }
                     }
@@ -324,6 +365,44 @@ impl ZkmsgApp {
         }
         self.picker_error = None;
         self.open_session(ctx, name, Home::new(dir));
+    }
+
+    /// Locks now: forgets the master key and every profile key, and drops
+    /// the session (its decrypted inbox included); unlocking reopens it.
+    fn lock_now(&mut self) {
+        zkmsg_core::applock::lock();
+        self.reopen = self.session.take().map(|s| (s.name.clone(), s.home_dir()));
+        self.wizard = None;
+        self.retire = None;
+        self.delete = None;
+        self.lock = Some(LockUi::new());
+    }
+
+    /// After a panic wipe (or the last wrong PIN): nothing is left to show;
+    /// the lock screen comes back as a first use.
+    fn after_wipe(&mut self, notice: String) {
+        self.session = None;
+        self.initial = None;
+        self.reopen = None;
+        self.profiles.clear();
+        self.wizard = None;
+        self.retire = None;
+        self.delete = None;
+        self.migration = None;
+        let mut lock = LockUi::new();
+        lock.notice(notice);
+        self.lock = Some(lock);
+    }
+
+    /// The panic dialog, over whatever else renders.
+    fn update_panic(&mut self, ctx: &egui::Context) {
+        let Some(mut panic) = self.panic.take() else { return };
+        match panic.update(ctx, &self.lock_root) {
+            PanicOutcome::None => self.panic = Some(panic),
+            PanicOutcome::Cancelled => {}
+            PanicOutcome::Wiped(r) if r.errors.is_empty() => self.after_wipe(format!("wiped {} profile(s)", r.profiles)),
+            PanicOutcome::Wiped(r) => self.after_wipe(format!("wipe INCOMPLETE: {}", r.errors.join("; "))),
+        }
     }
 
     /// Drives the New-profile wizard for one frame. Extracts the funding
@@ -449,6 +528,44 @@ impl ZkmsgApp {
 
 impl eframe::App for ZkmsgApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Locked: the lock screen owns the window; nothing of any profile
+        // renders (or is read) until the PIN is in.
+        if let Some(mut lock) = self.lock.take() {
+            match lock.update(ctx, &self.lock_root) {
+                LockOutcome::None => self.lock = Some(lock),
+                LockOutcome::Panic => {
+                    self.lock = Some(lock);
+                    self.panic = Some(PanicUi::new());
+                }
+                LockOutcome::Wiped(errors) => self.after_wipe(if errors.is_empty() {
+                    format!("{} wrong PINs in a row: everything was wiped", zkmsg_core::applock::MAX_ATTEMPTS)
+                } else {
+                    format!("{} wrong PINs in a row: the wipe is INCOMPLETE: {}", zkmsg_core::applock::MAX_ATTEMPTS, errors.join("; "))
+                }),
+                LockOutcome::Unlocked => {
+                    self.last_input = std::time::Instant::now();
+                    if let Some(root) = &self.root {
+                        self.profiles = list_profiles(root).unwrap_or_default();
+                    }
+                    if let Some((name, dir)) = self.reopen.take() {
+                        self.initial = Some((name, Home::new(dir)));
+                    }
+                }
+            }
+            self.update_panic(ctx);
+            return;
+        }
+        if ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
+            self.last_input = std::time::Instant::now();
+        }
+        if self.last_input.elapsed() > IDLE_LOCK && !self.work_in_flight()
+            && !self.session.as_ref().is_some_and(|s| s.worker_busy())
+        {
+            self.lock_now();
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(30));
+
         // A pending migration owns the whole frame: no session opens (not even
         // the deferred `initial`) until the user migrates or clicks "Not now".
         if self.migration.is_some() {
@@ -477,8 +594,15 @@ impl eframe::App for ZkmsgApp {
         let source_available = self.session.as_ref().is_some_and(|s| s.config.is_some());
         let active_name = self.session.as_ref().map(|s| s.name.clone());
         let mut picker_action = PickerAction::None;
+        let mut lock_clicked = false;
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if ui.small_button("Panic wipe…").clicked() {
+                    self.panic = Some(PanicUi::new());
+                }
+                if ui.add_enabled(!app_busy, egui::Button::new("Lock").small()).clicked() {
+                    lock_clicked = true;
+                }
                 if let Some(session) = &mut self.session {
                     ui.selectable_value(&mut session.tab, Tab::Status, "Status");
                     ui.selectable_value(&mut session.tab, Tab::Compose, "Compose");
@@ -503,6 +627,10 @@ impl eframe::App for ZkmsgApp {
                 }
             });
         });
+        if lock_clicked {
+            self.lock_now();
+            return;
+        }
         match picker_action {
             PickerAction::None => {}
             PickerAction::Switch(name, dir) => self.switch_profile(ctx, name, dir),
@@ -530,6 +658,17 @@ impl eframe::App for ZkmsgApp {
                     .and_then(|p| Home::new(p.dir.clone()).load_config().ok())
                     .is_some_and(|c| c.burner);
                 self.retire = Some(RetireUi::new(name, is_burner));
+            }
+            PickerAction::Delete(name, archived) => {
+                if let Some(root) = self.root.clone() {
+                    match DeleteUi::new(&root, &name, archived) {
+                        Ok(d) => {
+                            self.picker_error = None;
+                            self.delete = Some(d);
+                        }
+                        Err(e) => self.picker_error = Some(e),
+                    }
+                }
             }
             PickerAction::Unarchive(name) => {
                 if let Some(root) = self.root.clone() {
@@ -652,6 +791,36 @@ impl eframe::App for ZkmsgApp {
                 }
             }
         }
+
+        // The delete dialog, same rules as archive: it waits on any flow in
+        // flight, and drops the session if it deletes the active profile.
+        if let Some(mut delete) = self.delete.take() {
+            delete.app_busy = self.work_in_flight()
+                || self.session.as_ref().is_some_and(|s| s.worker_busy());
+            let Some(root) = self.root.clone() else {
+                self.delete = None;
+                return;
+            };
+            match delete.update(ctx, &root) {
+                DeleteOutcome::None => self.delete = Some(delete),
+                DeleteOutcome::Cancelled => {}
+                DeleteOutcome::Deleted { name, archived, new_current } => {
+                    self.profiles = list_profiles(&root).unwrap_or_default();
+                    // An archived profile is never the open session, even
+                    // when a live one shares its name.
+                    if !archived && self.session.as_ref().is_some_and(|s| s.name == name) {
+                        self.session = None;
+                        // `current` moved on to another profile: open it.
+                        if let Some(Some(next)) = new_current {
+                            let dir = root.join(format!("{PROFILE_PREFIX}{next}"));
+                            self.open_session(ctx, next, Home::new(dir));
+                        }
+                    }
+                }
+            }
+        }
+
+        self.update_panic(ctx);
     }
 }
 

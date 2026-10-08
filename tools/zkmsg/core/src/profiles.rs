@@ -106,6 +106,22 @@ pub fn resolve_cli_home(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// The profile root `home` belongs to: itself, or the parent of a
+/// `.zkmsg-<name>` profile dir. The app lock and the panic wipe act on it.
+pub fn profile_root(home: &Path) -> PathBuf {
+    match classify_home(home) {
+        HomeKind::Profile(p) => {
+            let is_child = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(PROFILE_PREFIX));
+            match (is_child, p.parent()) {
+                (true, Some(parent)) => parent.to_path_buf(),
+                _ => p,
+            }
+        }
+        HomeKind::Root { root, .. } => root,
+        HomeKind::Empty(p) => p,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LegacySource {
     pub dir: PathBuf,

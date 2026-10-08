@@ -22,6 +22,8 @@ rand.workspace = true
 hex.workspace = true
 sha3.workspace = true
 ml-kem.workspace = true
+# The app PIN's KDF (applock).
+argon2 = "0.5"
 
 [dev-dependencies]
 starknet-core = "0.16"

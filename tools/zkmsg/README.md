@@ -256,6 +256,60 @@ because moving it anywhere would draw the on-chain edge the burner
 exists to avoid. (Retired 2026-10-01, along with the optional
 `from:` line: messages carry no sender line.)
 
+## Deleting an identity, and secrets at rest (2026-10-08)
+
+A profile's secret files — `keys.json`, `tickets*.json`, `quota.json`,
+`inbox.json` and `sends/*.json` — are sealed (AES-256-GCM, the file's
+path as associated data) under a random per-profile key that lives in
+the macOS login Keychain (service `zkmsg.profile-key`, account = the id
+in the profile's `vault.json`), never on disk. Older profiles are sealed
+in place the first time the CLI or GUI opens them. `core/src/vault.rs`.
+
+Deleting a profile (`zkmsg delete-profile <name>`, or "delete…" in the
+GUI picker, live or archived) is a crypto-shred: the Keychain key goes
+first, so every sealed byte an SSD still holds stops decrypting; then the
+account's entry in sncast's accounts file (unless another profile uses it,
+or `--keep-account-key`), then the directory, then `current`. Before
+that, unspent tickets can move to another profile on the same pool
+(`--move-tickets-to`): a ticket is a bearer secret nothing on chain ties
+to an identity. The account's balance is read only on request
+(`--check-balance`, or "check" in the dialog: it asks the RPC about the
+address from your connection) and is **abandoned, never swept** — a transfer to another account would link the two on chain.
+Nothing happens on chain: the registration stays, and messages sent to
+the deleted handle become unreadable to everyone. You confirm by typing
+the handle. `core/src/wipe.rs`.
+
+**App PIN** (`core/src/applock.rs`). On first use the CLI or GUI asks you
+to set an app PIN (at least 6 characters; not your login password, never
+biometrics). One random master key wraps every profile key, and the
+master key is itself kept only as AES-256-GCM under
+Argon2id(PIN, salt; 256 MiB, 3 passes) in the login Keychain
+(`zkmsg.app-lock`). The CLI asks for the PIN on every command
+(`ZKMSG_PIN` for scripts); the GUI shows a lock screen at launch, after
+10 idle minutes and on "Lock". From the 5th wrong PIN each try waits
+(30 s up to 1 h); the 10th in a row runs the panic wipe. `zkmsg
+change-pin` re-wraps the master key. Strength, honestly: guessing offline
+needs the login Keychain item first and then ~1 s of 256 MiB work per
+guess, so a 6-digit PIN falls in days to someone who has both; use a
+longer PIN or a passphrase on a laptop. (The phone binds its PIN to the
+Secure Enclave instead.)
+
+**Panic wipe**: `zkmsg panic-wipe` or "Panic wipe…" on the GUI's lock
+screen and top bar; no network. The app PIN is its one confirmation, and
+a wrong one counts as an unlock attempt (no free guessing through the
+wipe prompt; the 10th wrong PIN wipes anyway). It
+deletes every profile key and the app lock from the Keychain first (all
+sealed files become unreadable at once), then the profiles' account keys
+from sncast's accounts file, then the whole profile root (`~/.zkmsg`).
+`ZKMSG_KEYCHAIN_NAMESPACE=<word>` prefixes the Keychain services, for
+test runs that must not touch your real items.
+
+Limits, honestly: the account's private key sits in sncast's plain
+accounts file, which delete rewrites (an ordinary file rewrite, not a
+shred); a deleted Keychain item can linger in the keychain database,
+encrypted under the login keychain; any plain copy you made of a profile
+(a backup directory) is untouched.
+
 First GUI-driven send shipped 2026-07-07 (fact `0x5b824d25…f6e25`,
 47.2 STRK); first wizard-born identity (carol) created, funded and
 registered in-app 2026-07-08, and her first send (fact

@@ -3,7 +3,8 @@
 //! and the `member_secret` — the app's long-lived secrets),
 //! `tickets.json` (mode 0600: the v4 fee tickets, bearer value),
 //! `quota.json` (the epoch's used quota slots), `sends/<id>.json` (send
-//! checkpoints).
+//! checkpoints). The secret ones are sealed under the profile's Keychain
+//! key (`vault`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -273,8 +274,10 @@ impl Home {
     }
 
     pub fn load_keys(&self) -> Result<Keys> {
-        let raw = fs::read_to_string(self.keys_path())
-            .with_context(|| format!("no keys at {} — run `zkmsg init`", self.dir.display()))?;
+        if !self.keys_path().exists() {
+            bail!("no keys at {} — run `zkmsg init`", self.dir.display());
+        }
+        let raw = crate::vault::read_to_string(self, &self.keys_path())?;
         Ok(serde_json::from_str(&raw)?)
     }
 
@@ -284,15 +287,14 @@ impl Home {
         if self.keys_path().exists() {
             bail!("{} already exists; refusing to overwrite scan keys", self.keys_path().display());
         }
-        fs::create_dir_all(&self.dir)?;
-        write_atomic(&self.keys_path(), serde_json::to_string_pretty(keys)?.as_bytes(), 0o600)
+        crate::vault::write(self, &self.keys_path(), serde_json::to_string_pretty(keys)?.as_bytes())
     }
 
     /// Updates mutable key metadata (handle/leaf index after registration).
     /// Atomic and owner-only: the scan key and KEM seed in this file are
     /// irreplaceable, so it is never left truncated.
     pub fn update_keys(&self, keys: &Keys) -> Result<()> {
-        write_atomic(&self.keys_path(), serde_json::to_string_pretty(keys)?.as_bytes(), 0o600)
+        crate::vault::write(self, &self.keys_path(), serde_json::to_string_pretty(keys)?.as_bytes())
     }
 
     /// Loads keys, adding a fresh ML-KEM seed first if the profile predates

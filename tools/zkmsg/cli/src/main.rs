@@ -95,17 +95,75 @@ enum Command {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Delete a profile (live or archived) from this machine: shred its
+    /// Keychain key, remove its account key from sncast's file and its
+    /// directory. Nothing on chain changes; the account's balance is NOT
+    /// moved (a sweep would link the accounts) and is lost with the key.
+    /// Wipe EVERY identity on this machine at once, offline: all profile
+    /// keys and the app lock in the Keychain, the profiles' account keys in
+    /// sncast's accounts file, and zkmsg's files under the profile root.
+    /// The app PIN is the confirmation (a wrong one counts as an attempt).
+    PanicWipe,
+    /// Change the app PIN (asks the current one first; that attempt counts).
+    ChangePin,
+    DeleteProfile {
+        /// Profile name under the profile root.
+        name: String,
+        /// The profile is an archived one (under `archive/`).
+        #[arg(long)]
+        archived: bool,
+        /// Move unspent tickets to this profile first (same pool).
+        #[arg(long)]
+        move_tickets_to: Option<String>,
+        /// Keep the account's entry in sncast's accounts file.
+        #[arg(long)]
+        keep_account_key: bool,
+        /// Read the account's balance first (asks the RPC about its address,
+        /// from this machine's connection).
+        #[arg(long)]
+        check_balance: bool,
+        /// The handle (or, without one, the profile name), instead of typing
+        /// it at the prompt.
+        #[arg(long)]
+        confirm: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let root = zkmsg_core::profiles::profile_root(&cli.home_dir());
+    if let Command::PanicWipe = &cli.command {
+        return cmd_panic_wipe(&root);
+    }
+    gate(&root)?;
+    if let Command::ChangePin = &cli.command {
+        return cmd_change_pin(&root);
+    }
     if let Command::MigrateStore { profile: Some(name), account } = &cli.command {
         let dir = cli.home_dir().join(format!("{}{name}", zkmsg_core::profiles::PROFILE_PREFIX));
         ensure!(dir.join("config.json").exists(), "no profile '{name}' at {}", dir.display());
         return cmd_migrate_store(&Home::new(dir), account.as_deref());
     }
+    if let Command::DeleteProfile { name, archived, move_tickets_to, keep_account_key, check_balance, confirm } =
+        &cli.command
+    {
+        return cmd_delete_profile(
+            &cli.home_dir(),
+            name,
+            *archived,
+            move_tickets_to.as_deref(),
+            *keep_account_key,
+            *check_balance,
+            confirm.as_deref(),
+        );
+    }
     let dir = zkmsg_core::profiles::resolve_cli_home(&cli.home_dir())?;
     let home = Home::new(dir);
+    // Profiles written before the vault: seal their secret files now.
+    if home.config_path().exists() && zkmsg_core::vault::has_plaintext(&home)? {
+        let n = zkmsg_core::vault::seal_profile(&home)?;
+        eprintln!("sealed {n} file(s) of {} under its Keychain profile key", home.dir.display());
+    }
 
     match cli.command {
         Command::Init { account, store } => cmd_init(&home, account, store),
@@ -117,7 +175,213 @@ fn main() -> Result<()> {
         Command::Inbox => cmd_inbox(&home),
         Command::Status => cmd_status(&home),
         Command::MigrateStore { account, .. } => cmd_migrate_store(&home, account.as_deref()),
+        Command::DeleteProfile { .. } | Command::PanicWipe | Command::ChangePin => {
+            unreachable!("handled before the home resolves")
+        }
     }
+}
+
+fn cmd_delete_profile(
+    root: &std::path::Path,
+    name: &str,
+    archived: bool,
+    move_tickets_to: Option<&str>,
+    keep_account_key: bool,
+    check_balance: bool,
+    confirm: Option<&str>,
+) -> Result<()> {
+    use zkmsg_core::wipe;
+    let plan = wipe::plan_delete(root, name, archived)?;
+    let opts = wipe::WipeOptions { delete_account_key: !keep_account_key };
+    println!("delete profile '{name}'{}", if plan.archived { " (archived)" } else { "" });
+    println!("  directory : {}", plan.dir.display());
+    println!("  handle    : {}", plan.handle.as_deref().unwrap_or("(none)"));
+    if let Some(account) = &plan.account {
+        let address = plan.account_address.as_deref().unwrap_or("address unknown");
+        println!("  account   : {account} ({address})");
+        let balance = if !check_balance {
+            "not checked (--check-balance asks the RPC)".to_string()
+        } else {
+            match wipe::account_balance_fri(&plan) {
+                Ok(fri) => wipe::strk_label(fri),
+                Err(e) => format!("unknown ({e:#})"),
+            }
+        };
+        println!("  balance   : {balance} — NOT moved: a sweep would link the accounts on chain");
+        if plan.removes_account_key(&opts) {
+            println!("  its private key is removed from sncast's accounts file: the balance is lost");
+        } else if plan.account_address.is_none() {
+            println!("  its key is not in sncast's accounts file");
+        } else if !plan.account_shared_with.is_empty() {
+            println!("  its key stays: also used by {}", plan.account_shared_with.join(", "));
+        } else {
+            println!("  its key stays in sncast's accounts file (--keep-account-key)");
+        }
+    }
+    let tickets = plan.movable_tickets;
+    match move_tickets_to {
+        Some(target) => println!("  tickets   : {tickets} move to '{target}'"),
+        None if tickets > 0 => println!(
+            "  tickets   : {tickets} unspent ABANDONED (--move-tickets-to <profile> keeps them{})",
+            if plan.ticket_targets.is_empty() {
+                String::new()
+            } else {
+                format!("; candidates: {}", plan.ticket_targets.join(", "))
+            }
+        ),
+        None => {}
+    }
+    if plan.tickets_in_flight > 0 {
+        println!("  {} ticket(s) reserved by a submitted send are not moved", plan.tickets_in_flight);
+    }
+    if plan.incomplete_sends > 0 {
+        println!("  {} incomplete send(s) are abandoned", plan.incomplete_sends);
+    }
+    if !plan.key_shared_with.is_empty() {
+        println!(
+            "  its Keychain key is NOT shredded: copies of this directory share it ({})",
+            plan.key_shared_with.join(", ")
+        );
+    }
+    println!("  on chain  : nothing changes; messages to this handle become unreadable to everyone");
+
+    let typed = match confirm {
+        Some(c) => c.to_string(),
+        None => {
+            print!("type '{}' to delete: ", plan.confirm_text());
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line.trim_end_matches(['\n', '\r']).to_string()
+        }
+    };
+    let (moved, report) = wipe::delete_profile(root, &plan, &typed, move_tickets_to, opts)?;
+    if let Some(m) = moved {
+        println!(
+            "moved {} ticket(s){}",
+            m.moved,
+            if m.already_there > 0 { format!(" ({} already there)", m.already_there) } else { String::new() }
+        );
+    }
+    println!(
+        "deleted '{name}': {}",
+        if report.shredded { "profile key shredded, directory removed" } else { "directory removed (no key shredded)" }
+    );
+    if let Some(account) = report.account_key_removed {
+        println!("removed account '{account}' from sncast's accounts file");
+    }
+    match report.new_current {
+        Some(Some(next)) => println!("current profile is now '{next}'"),
+        Some(None) => println!("no profiles left"),
+        None => {}
+    }
+    Ok(())
+}
+
+/// The app PIN: `ZKMSG_PIN` if set (scripts), else asked without echo.
+fn read_pin(prompt: &str) -> Result<String> {
+    if let Ok(pin) = std::env::var("ZKMSG_PIN") {
+        return Ok(pin);
+    }
+    rpassword::prompt_password(prompt)
+        .context("no terminal to ask for the app PIN on (scripts can set ZKMSG_PIN)")
+}
+
+/// Every command but `panic-wipe` runs unlocked: on first use it sets the
+/// app PIN, after that it asks for it.
+fn gate(root: &std::path::Path) -> Result<()> {
+    use zkmsg_core::applock::{self, LockState, MAX_ATTEMPTS, Unlock};
+    match applock::state()? {
+        LockState::Unlocked => Ok(()),
+        LockState::NotSet => {
+            eprintln!(
+                "first use: set an app PIN (at least {} characters). It unlocks every profile on \
+                 this machine; {MAX_ATTEMPTS} wrong entries in a row wipe them all.",
+                applock::MIN_PIN_LEN
+            );
+            let pin = read_pin("new app PIN: ")?;
+            applock::validate_pin(&pin)?;
+            if std::env::var("ZKMSG_PIN").is_err() {
+                ensure!(read_pin("again: ")? == pin, "the two entries differ — nothing was set");
+            }
+            let wrapped = applock::set_pin(&pin, root)?;
+            eprintln!("app PIN set ({wrapped} profile key(s) now behind it)");
+            Ok(())
+        }
+        LockState::Locked { wait_secs, .. } if wait_secs > 0 => {
+            anyhow::bail!("too many wrong PINs: try again in {}", wait_label(wait_secs))
+        }
+        LockState::Locked { .. } => match applock::unlock(&read_pin("app PIN: ")?, root)? {
+            Unlock::Unlocked => Ok(()),
+            Unlock::Wait { secs } => anyhow::bail!("too many wrong PINs: try again in {}", wait_label(secs)),
+            Unlock::Wrong { attempts_left, wait_secs } => anyhow::bail!(
+                "wrong PIN — {attempts_left} attempt(s) left; the last one wipes every identity here{}",
+                if wait_secs > 0 { format!(" (next try in {})", wait_label(wait_secs)) } else { String::new() }
+            ),
+            Unlock::Wiped { errors } if errors.is_empty() => {
+                anyhow::bail!("{MAX_ATTEMPTS} wrong PINs in a row: every identity on this machine was wiped")
+            }
+            Unlock::Wiped { errors } => anyhow::bail!(
+                "{MAX_ATTEMPTS} wrong PINs in a row: the wipe ran but is INCOMPLETE: {}",
+                errors.join("; ")
+            ),
+        },
+    }
+}
+
+fn wait_label(secs: u64) -> String {
+    if secs >= 60 { format!("{} min", secs.div_ceil(60)) } else { format!("{secs} s") }
+}
+
+fn cmd_change_pin(root: &std::path::Path) -> Result<()> {
+    use zkmsg_core::applock::{self, Unlock};
+    let old = read_pin("current app PIN: ")?;
+    let new = rpassword::prompt_password("new app PIN: ")?;
+    applock::validate_pin(&new)?;
+    ensure!(rpassword::prompt_password("again: ")? == new, "the two entries differ — nothing changed");
+    match applock::change_pin(&old, &new, root)? {
+        Unlock::Unlocked => println!("app PIN changed"),
+        other => anyhow::bail!("PIN not changed: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_panic_wipe(root: &std::path::Path) -> Result<()> {
+    use zkmsg_core::applock::{self, LockState};
+    use zkmsg_core::wipe::{self, PanicAttempt};
+    let pin = if applock::state()? == LockState::NotSet {
+        // No PIN was ever set: nothing is behind one; a plain confirmation.
+        print!("wipe EVERY identity on this machine ({}), for good? type 'wipe': ", root.display());
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        ensure!(line.trim() == "wipe", "not confirmed — nothing was touched");
+        String::new()
+    } else {
+        eprintln!("panic wipe: EVERY identity on this machine ({}), for good", root.display());
+        read_pin("app PIN to confirm: ")?
+    };
+    let r = match wipe::panic_wipe_with_pin(root, &pin)? {
+        PanicAttempt::Wiped(r) => r,
+        PanicAttempt::Wrong { attempts_left, .. } => anyhow::bail!(
+            "wrong PIN — nothing was wiped; {attempts_left} attempt(s) left (the last one wipes anyway)"
+        ),
+        PanicAttempt::Wait { secs } => anyhow::bail!("too many wrong PINs: try again in {}", wait_label(secs)),
+    };
+    println!(
+        "wiped: {} profile(s), {} profile key(s) shredded, the app lock, {} account key(s){}",
+        r.profiles,
+        r.keys_shredded,
+        r.account_keys_removed.len(),
+        if r.account_keys_removed.is_empty() { String::new() } else { format!(" ({})", r.account_keys_removed.join(", ")) }
+    );
+    for e in &r.errors {
+        eprintln!("NOT done: {e}");
+    }
+    ensure!(r.errors.is_empty(), "the panic wipe was incomplete (see above)");
+    Ok(())
 }
 
 fn cmd_init(home: &Home, account: String, store: Option<String>) -> Result<()> {
@@ -229,7 +493,7 @@ fn cmd_inbox(home: &Home) -> Result<()> {
     for m in &messages {
         println!("#{:<4} {}  {}", m.nonce, &m.commitment[..18], m.text);
     }
-    std::fs::write(home.inbox_cache_path(), serde_json::to_string_pretty(&messages)?)?;
+    zkmsg_core::vault::write(home, &home.inbox_cache_path(), serde_json::to_string_pretty(&messages)?.as_bytes())?;
     Ok(())
 }
 

@@ -15,3 +15,5 @@ anyhow.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 starknet-types-core.workspace = true
+# The app PIN prompt, without echo.
+rpassword = "7"
