@@ -16,6 +16,7 @@ use zkmsg_core::profiles::{
 };
 
 use crate::delete_view::{DeleteOutcome, DeleteUi};
+use crate::lock_view::{LockOutcome, LockUi, PanicOutcome, PanicUi};
 use crate::migrate_view::{self, MigrateAction, MigrationUi};
 use crate::retire_view::{RetireOutcome, RetireUi};
 use crate::session::{ProfileSession, Tab};
@@ -80,7 +81,20 @@ pub struct ZkmsgApp {
 
     /// The delete dialog, when open; owned here for the same reason.
     delete: Option<DeleteUi>,
+
+    /// The profile root the app lock and the panic wipe act on.
+    lock_root: PathBuf,
+    /// `Some` while locked (app PIN): the lock screen owns the window.
+    lock: Option<LockUi>,
+    /// The panic-wipe dialog, when open (from the lock screen or the top bar).
+    panic: Option<PanicUi>,
+    /// The session to reopen on unlock after a lock.
+    reopen: Option<(String, PathBuf)>,
+    last_input: std::time::Instant,
 }
+
+/// Unlocked and untouched this long (and nothing running): lock.
+const IDLE_LOCK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 impl ZkmsgApp {
     pub fn new(
@@ -156,6 +170,11 @@ impl ZkmsgApp {
             wizard: None,
             retire: None,
             delete: None,
+            lock_root: zkmsg_core::profiles::profile_root(&launch_path),
+            lock: Some(LockUi::new()),
+            panic: None,
+            reopen: None,
+            last_input: std::time::Instant::now(),
         }
     }
 
@@ -348,6 +367,44 @@ impl ZkmsgApp {
         self.open_session(ctx, name, Home::new(dir));
     }
 
+    /// Locks now: forgets the master key and every profile key, and drops
+    /// the session (its decrypted inbox included); unlocking reopens it.
+    fn lock_now(&mut self) {
+        zkmsg_core::applock::lock();
+        self.reopen = self.session.take().map(|s| (s.name.clone(), s.home_dir()));
+        self.wizard = None;
+        self.retire = None;
+        self.delete = None;
+        self.lock = Some(LockUi::new());
+    }
+
+    /// After a panic wipe (or the last wrong PIN): nothing is left to show;
+    /// the lock screen comes back as a first use.
+    fn after_wipe(&mut self, notice: String) {
+        self.session = None;
+        self.initial = None;
+        self.reopen = None;
+        self.profiles.clear();
+        self.wizard = None;
+        self.retire = None;
+        self.delete = None;
+        self.migration = None;
+        let mut lock = LockUi::new();
+        lock.notice(notice);
+        self.lock = Some(lock);
+    }
+
+    /// The panic dialog, over whatever else renders.
+    fn update_panic(&mut self, ctx: &egui::Context) {
+        let Some(mut panic) = self.panic.take() else { return };
+        match panic.update(ctx, &self.lock_root) {
+            PanicOutcome::None => self.panic = Some(panic),
+            PanicOutcome::Cancelled => {}
+            PanicOutcome::Wiped(r) if r.errors.is_empty() => self.after_wipe(format!("wiped {} profile(s)", r.profiles)),
+            PanicOutcome::Wiped(r) => self.after_wipe(format!("wipe INCOMPLETE: {}", r.errors.join("; "))),
+        }
+    }
+
     /// Drives the New-profile wizard for one frame. Extracts the funding
     /// source (the active session's account + rpc) so the wizard can borrow
     /// them without a `self` borrow conflict, then acts on its outcome: on
@@ -471,6 +528,44 @@ impl ZkmsgApp {
 
 impl eframe::App for ZkmsgApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Locked: the lock screen owns the window; nothing of any profile
+        // renders (or is read) until the PIN is in.
+        if let Some(mut lock) = self.lock.take() {
+            match lock.update(ctx, &self.lock_root) {
+                LockOutcome::None => self.lock = Some(lock),
+                LockOutcome::Panic => {
+                    self.lock = Some(lock);
+                    self.panic = Some(PanicUi);
+                }
+                LockOutcome::Wiped(errors) => self.after_wipe(if errors.is_empty() {
+                    format!("{} wrong PINs in a row: everything was wiped", zkmsg_core::applock::MAX_ATTEMPTS)
+                } else {
+                    format!("{} wrong PINs in a row: the wipe is INCOMPLETE: {}", zkmsg_core::applock::MAX_ATTEMPTS, errors.join("; "))
+                }),
+                LockOutcome::Unlocked => {
+                    self.last_input = std::time::Instant::now();
+                    if let Some(root) = &self.root {
+                        self.profiles = list_profiles(root).unwrap_or_default();
+                    }
+                    if let Some((name, dir)) = self.reopen.take() {
+                        self.initial = Some((name, Home::new(dir)));
+                    }
+                }
+            }
+            self.update_panic(ctx);
+            return;
+        }
+        if ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
+            self.last_input = std::time::Instant::now();
+        }
+        if self.last_input.elapsed() > IDLE_LOCK && !self.work_in_flight()
+            && !self.session.as_ref().is_some_and(|s| s.worker_busy())
+        {
+            self.lock_now();
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(30));
+
         // A pending migration owns the whole frame: no session opens (not even
         // the deferred `initial`) until the user migrates or clicks "Not now".
         if self.migration.is_some() {
@@ -499,8 +594,15 @@ impl eframe::App for ZkmsgApp {
         let source_available = self.session.as_ref().is_some_and(|s| s.config.is_some());
         let active_name = self.session.as_ref().map(|s| s.name.clone());
         let mut picker_action = PickerAction::None;
+        let mut lock_clicked = false;
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if ui.small_button("Panic wipe…").clicked() {
+                    self.panic = Some(PanicUi);
+                }
+                if ui.add_enabled(!app_busy, egui::Button::new("Lock").small()).clicked() {
+                    lock_clicked = true;
+                }
                 if let Some(session) = &mut self.session {
                     ui.selectable_value(&mut session.tab, Tab::Status, "Status");
                     ui.selectable_value(&mut session.tab, Tab::Compose, "Compose");
@@ -525,6 +627,10 @@ impl eframe::App for ZkmsgApp {
                 }
             });
         });
+        if lock_clicked {
+            self.lock_now();
+            return;
+        }
         match picker_action {
             PickerAction::None => {}
             PickerAction::Switch(name, dir) => self.switch_profile(ctx, name, dir),
@@ -713,6 +819,8 @@ impl eframe::App for ZkmsgApp {
                 }
             }
         }
+
+        self.update_panic(ctx);
     }
 }
 

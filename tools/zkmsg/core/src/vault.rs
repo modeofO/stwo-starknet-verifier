@@ -17,15 +17,13 @@
 //!     the file's path relative to the profile dir as associated data, so a
 //!     sealed file cannot be swapped for another's.
 //!   * Keychain: generic password, service `zkmsg.profile-key`, account =
-//!     the id, password = hex(K).
+//!     the id, value = K wrapped under the app's master key (`applock`: the
+//!     app PIN unlocks it), or bare K for a key stored before the PIN.
 //!
 //! Reads accept plaintext too (profiles written before the vault);
 //! `seal_profile` converts them, and every write seals.
 //!
-//! The Keychain is reached through `/usr/bin/security`: an item it creates
-//! trusts that Apple-signed tool, so rebuilding zkmsg (a new code signature
-//! each time) never raises an access prompt. `add` takes the secret on
-//! stdin (`security -i`), never in argv where `ps` would show it.
+//! The Keychain is reached through `keychain` (`/usr/bin/security`).
 //!
 //! What this does not cover: the account's private key lives in sncast's
 //! accounts file, outside the profile (`wipe` removes its entry, a plain
@@ -51,154 +49,115 @@ const NONCE_LEN: usize = 12;
 pub const KEY_LEN: usize = 32;
 pub const KEYCHAIN_SERVICE: &str = "zkmsg.profile-key";
 const VAULT_FILE: &str = "vault.json";
+/// First bytes of a profile key wrapped under the app's master key
+/// (`applock`); a bare 32-byte value is a key stored before the app PIN.
+const WRAPPED: &[u8; 4] = b"zkk1";
 
-/// Where profile keys are kept.
-pub trait KeyStore: Send + Sync {
-    fn get(&self, id: &str) -> Result<Option<[u8; KEY_LEN]>>;
-    fn put(&self, id: &str, key: &[u8; KEY_LEN]) -> Result<()>;
-    /// Deleting a key that is not there is not an error.
-    fn delete(&self, id: &str) -> Result<()>;
+/// The Keychain service profile keys live in.
+pub fn keychain_service() -> String {
+    crate::keychain::service(KEYCHAIN_SERVICE)
 }
 
-/// The macOS login Keychain, via `/usr/bin/security`.
-pub struct SecurityCli;
-
-const SECURITY: &str = "/usr/bin/security";
-/// `security`'s exit status for "item not found".
-const ERR_SEC_ITEM_NOT_FOUND: i32 = 44;
-
-impl KeyStore for SecurityCli {
-    fn get(&self, id: &str) -> Result<Option<[u8; KEY_LEN]>> {
-        check_id(id)?;
-        let out = std::process::Command::new(SECURITY)
-            .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", id, "-w"])
-            .output()
-            .context("running /usr/bin/security")?;
-        if out.status.code() == Some(ERR_SEC_ITEM_NOT_FOUND) {
-            return Ok(None);
-        }
-        ensure!(
-            out.status.success(),
-            "reading profile key {id} from the Keychain: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        Ok(Some(parse_key(String::from_utf8_lossy(&out.stdout).trim())?))
-    }
-
-    fn put(&self, id: &str, key: &[u8; KEY_LEN]) -> Result<()> {
-        use std::io::Write;
-        check_id(id)?;
-        let mut child = std::process::Command::new(SECURITY)
-            .arg("-i")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("running /usr/bin/security")?;
-        let line = format!(
-            "add-generic-password -U -s {KEYCHAIN_SERVICE} -a {id} -l zkmsg-profile-key -w {}\n",
-            hex::encode(key)
-        );
-        child.stdin.take().context("security stdin")?.write_all(line.as_bytes())?;
-        let out = child.wait_with_output()?;
-        // `security -i` exits 0 whatever its commands did: read it back.
-        ensure!(
-            self.get(id)?.as_ref() == Some(key),
-            "storing profile key {id} in the Keychain failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        Ok(())
-    }
-
-    fn delete(&self, id: &str) -> Result<()> {
-        check_id(id)?;
-        let out = std::process::Command::new(SECURITY)
-            .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", id])
-            .output()
-            .context("running /usr/bin/security")?;
-        ensure!(
-            out.status.success() || out.status.code() == Some(ERR_SEC_ITEM_NOT_FOUND),
-            "deleting profile key {id} from the Keychain: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        ensure!(self.get(id)?.is_none(), "profile key {id} is still in the Keychain after delete");
-        Ok(())
-    }
+/// Unwrapped profile keys this process has read. Cleared by `forget_keys`
+/// (the app locking).
+fn cache() -> &'static Mutex<HashMap<String, [u8; KEY_LEN]>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, [u8; KEY_LEN]>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
-/// Keys in process memory: tests, and `ZKMSG_KEYSTORE=memory` for other
-/// crates' tests. Nothing survives the process.
-#[derive(Default)]
-pub struct MemoryKeyStore(Mutex<HashMap<String, [u8; KEY_LEN]>>);
-
-impl KeyStore for MemoryKeyStore {
-    fn get(&self, id: &str) -> Result<Option<[u8; KEY_LEN]>> {
-        Ok(self.0.lock().unwrap().get(id).copied())
-    }
-    fn put(&self, id: &str, key: &[u8; KEY_LEN]) -> Result<()> {
-        self.0.lock().unwrap().insert(id.to_string(), *key);
-        Ok(())
-    }
-    fn delete(&self, id: &str) -> Result<()> {
-        self.0.lock().unwrap().remove(id);
-        Ok(())
-    }
+/// Drops every unwrapped profile key held in memory.
+pub fn forget_keys() {
+    cache().lock().unwrap().clear();
 }
 
-/// The process's key store, with a read cache in front (each Keychain read
-/// is a subprocess).
-struct Cached {
-    inner: Box<dyn KeyStore>,
-    cache: Mutex<HashMap<String, [u8; KEY_LEN]>>,
+fn wrap_aad(id: &str) -> String {
+    format!("zkmsg.profile-key/{id}")
 }
 
-fn store() -> &'static Cached {
-    static STORE: OnceLock<Cached> = OnceLock::new();
-    STORE.get_or_init(|| {
-        let memory = cfg!(test) || std::env::var("ZKMSG_KEYSTORE").is_ok_and(|v| v == "memory");
-        let inner: Box<dyn KeyStore> =
-            if memory { Box::<MemoryKeyStore>::default() } else { Box::new(SecurityCli) };
-        Cached { inner, cache: Mutex::new(HashMap::new()) }
-    })
+/// A profile key as the Keychain holds it: wrapped under the master key
+/// once the app has a PIN, bare before.
+fn stored_form(id: &str, key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
+    match crate::applock::master_key_if_set()? {
+        None => Ok(key.to_vec()),
+        Some(mk) => Ok([WRAPPED.as_slice(), &seal(&mk, &wrap_aad(id), key)?[MAGIC.len()..]].concat()),
+    }
 }
 
 fn key_get(id: &str) -> Result<Option<[u8; KEY_LEN]>> {
-    let s = store();
-    if let Some(k) = s.cache.lock().unwrap().get(id) {
+    check_id(id)?;
+    if let Some(k) = cache().lock().unwrap().get(id) {
         return Ok(Some(*k));
     }
-    let k = s.inner.get(id)?;
-    if let Some(k) = k {
-        s.cache.lock().unwrap().insert(id.to_string(), k);
-    }
-    Ok(k)
+    let Some(stored) = crate::keychain::store().get(&keychain_service(), id)? else { return Ok(None) };
+    let key: [u8; KEY_LEN] = if let Some(body) = stored.strip_prefix(WRAPPED.as_slice()) {
+        let mk = crate::applock::master_key()?;
+        let sealed = [MAGIC.as_slice(), body].concat();
+        open(&mk, &wrap_aad(id), &sealed)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("profile key {id} is not {KEY_LEN} bytes"))?
+    } else {
+        let key: [u8; KEY_LEN] =
+            stored.try_into().map_err(|_| anyhow::anyhow!("profile key {id} is not {KEY_LEN} bytes"))?;
+        // Stored before the app had a PIN: wrap it now that it has one.
+        if crate::applock::master_key_if_set()?.is_some() {
+            key_put(id, &key)?;
+        }
+        key
+    };
+    cache().lock().unwrap().insert(id.to_string(), key);
+    Ok(Some(key))
 }
 
 fn key_put(id: &str, key: &[u8; KEY_LEN]) -> Result<()> {
-    store().inner.put(id, key)?;
-    store().cache.lock().unwrap().insert(id.to_string(), *key);
+    check_id(id)?;
+    crate::keychain::store().put(&keychain_service(), id, &stored_form(id, key)?)?;
+    cache().lock().unwrap().insert(id.to_string(), *key);
     Ok(())
 }
 
 fn key_delete(id: &str) -> Result<()> {
-    store().cache.lock().unwrap().remove(id);
-    store().inner.delete(id)
+    check_id(id)?;
+    cache().lock().unwrap().remove(id);
+    crate::keychain::store().delete(&keychain_service(), id)
 }
 
-/// Ids are 32 lowercase hex digits: safe as a `security -i` token.
+/// Rewraps the profile key `id` under the current master key (after the PIN
+/// is set). Returns whether there was one.
+pub fn rewrap(id: &str) -> Result<bool> {
+    cache().lock().unwrap().remove(id);
+    match key_get(id)? {
+        Some(k) => {
+            key_put(id, &k)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Set by `shred_all`: this process creates no new vault afterwards (until
+/// a new app PIN is set).
+static WIPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn clear_wiped() {
+    WIPED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Deletes every profile key in the Keychain, whatever profile it belonged
+/// to (the panic wipe). Returns how many.
+pub fn shred_all() -> Result<usize> {
+    #[cfg(not(test))]
+    WIPED.store(true, std::sync::atomic::Ordering::SeqCst);
+    forget_keys();
+    crate::keychain::store().delete_all(&keychain_service())
+}
+
+/// Ids are 32 lowercase hex digits.
 fn check_id(id: &str) -> Result<()> {
     ensure!(
         id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "malformed profile key id {id:?}"
     );
     Ok(())
-}
-
-fn parse_key(hex_key: &str) -> Result<[u8; KEY_LEN]> {
-    hex::decode(hex_key)
-        .context("profile key hex")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("profile key is not {KEY_LEN} bytes"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -240,6 +199,13 @@ fn profile_key_or_create(home: &Home) -> Result<[u8; KEY_LEN]> {
     if let Some(k) = profile_key(home)? {
         return Ok(k);
     }
+    // After a panic wipe in this process, a straggling worker must not
+    // recreate a profile (under a fresh, unprotected key).
+    ensure!(
+        !WIPED.load(std::sync::atomic::Ordering::SeqCst),
+        "everything was wiped: not creating {}",
+        home.dir.display()
+    );
     let mut id = [0u8; 16];
     let mut key = [0u8; KEY_LEN];
     rand::rngs::OsRng.fill_bytes(&mut id);
@@ -281,7 +247,7 @@ pub fn is_sealed(bytes: &[u8]) -> bool {
     bytes.starts_with(MAGIC)
 }
 
-fn seal(key: &[u8; KEY_LEN], aad: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn seal(key: &[u8; KEY_LEN], aad: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let ct = Aes256Gcm::new(key.into())
@@ -290,7 +256,7 @@ fn seal(key: &[u8; KEY_LEN], aad: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok([MAGIC.as_slice(), &nonce, &ct].concat())
 }
 
-fn open(key: &[u8; KEY_LEN], aad: &str, sealed: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn open(key: &[u8; KEY_LEN], aad: &str, sealed: &[u8]) -> Result<Vec<u8>> {
     ensure!(sealed.len() >= MAGIC.len() + NONCE_LEN + 16, "{aad}: sealed file is truncated");
     let (nonce, ct) = sealed[MAGIC.len()..].split_at(NONCE_LEN);
     Aes256Gcm::new(key.into())

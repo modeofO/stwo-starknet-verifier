@@ -117,7 +117,7 @@ pub fn profile_dir(root: &Path, name: &str, archived: bool) -> Result<PathBuf> {
 }
 
 /// Every profile dir under `root`, live and archived (complete or not).
-fn all_profile_dirs(root: &Path) -> Vec<PathBuf> {
+pub fn all_profile_dirs(root: &Path) -> Vec<PathBuf> {
     let mut out = vec![];
     for parent in [root.to_path_buf(), root.join(ARCHIVE_DIR)] {
         let Ok(rd) = fs::read_dir(&parent) else { continue };
@@ -368,6 +368,104 @@ pub fn account_balance_fri(plan: &DeletePlan) -> Result<u128> {
 pub fn strk_label(fri: u128) -> String {
     const ONE: u128 = 1_000_000_000_000_000_000;
     format!("{}.{:04} STRK", fri / ONE, (fri % ONE) / (ONE / 10_000))
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PanicReport {
+    pub profiles: usize,
+    pub keys_shredded: usize,
+    pub account_keys_removed: Vec<String>,
+    /// What could not be done; everything else still was.
+    pub errors: Vec<String>,
+}
+
+/// The panic wipe: every identity on this machine, at once, offline, with
+/// no questions. Order is by what matters most if it is interrupted:
+///
+///   1. every profile key in the Keychain (all sealed files under any root
+///      become unreadable at once) and the app lock;
+///   2. each profile's account entry in sncast's accounts file;
+///   3. what zkmsg owns under the root: every `.zkmsg-<name>` profile, the
+///      archive, `current`, and a legacy flat profile's own files; then the
+///      root itself if that left it empty. Nothing else under the root is
+///      touched, whatever `--home` pointed at.
+///
+/// It keeps going past a failed step and reports what failed.
+pub fn panic_wipe(root: &Path) -> Result<PanicReport> {
+    let dirs = all_profile_dirs(root);
+    let mut accounts: Vec<String> = dirs.iter().filter_map(|d| profile_account(d)).collect();
+    accounts.sort();
+    accounts.dedup();
+    let mut report = PanicReport { profiles: dirs.len(), ..Default::default() };
+
+    match crate::vault::shred_all() {
+        Ok(n) => report.keys_shredded = n,
+        Err(e) => report.errors.push(format!("profile keys: {e:#}")),
+    }
+    if let Err(e) = crate::applock::destroy() {
+        report.errors.push(format!("app lock: {e:#}"));
+    }
+    match sncast_accounts_path() {
+        Ok(path) => {
+            for account in &accounts {
+                match remove_sncast_account(&path, account) {
+                    Ok(true) => report.account_keys_removed.push(account.clone()),
+                    Ok(false) => {}
+                    Err(e) => report.errors.push(format!("sncast account {account}: {e:#}")),
+                }
+            }
+        }
+        Err(e) => report.errors.push(format!("sncast accounts file: {e:#}")),
+    }
+    for path in owned_entries(root) {
+        let removed = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+        if let Err(e) = removed {
+            report.errors.push(format!("removing {}: {e}", path.display()));
+        }
+    }
+    // Only if empty: never a directory holding anything zkmsg did not make.
+    let archive = root.join(ARCHIVE_DIR);
+    if archive.is_dir() {
+        let _ = fs::remove_file(archive.join(".DS_Store"));
+        let _ = fs::remove_dir(&archive);
+    }
+    let _ = fs::remove_file(root.join(".DS_Store")).ok().filter(|_| is_empty_but_ds_store(root));
+    let _ = fs::remove_dir(root);
+    Ok(report)
+}
+
+fn is_empty_but_ds_store(dir: &Path) -> bool {
+    fs::read_dir(dir).map(|rd| rd.flatten().all(|e| e.file_name() == ".DS_Store")).unwrap_or(false)
+}
+
+/// The files and dirs under `root` that zkmsg made: profile dirs (live and
+/// archived), `current`, and a legacy flat profile's files at the root.
+fn owned_entries(root: &Path) -> Vec<PathBuf> {
+    let mut out = all_profile_dirs(root);
+    if root.join("current").is_file() {
+        out.push(root.join("current"));
+    }
+    if root.join("config.json").is_file() {
+        const LEGACY: [&str; 13] = [
+            "config.json", "keys.json", "sends", "inbox.json", "proofs", "vault.json", "tickets.json",
+            "quota.json", "setup.json", "daemon-token", "sync-cache.json", "registrations.json", "inbox-cache.json",
+        ];
+        for name in LEGACY {
+            let p = root.join(name);
+            if p.symlink_metadata().is_ok() {
+                out.push(p);
+            }
+        }
+        if let Ok(rd) = fs::read_dir(root) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("tickets-") && n.ends_with(".json") {
+                    out.push(e.path());
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn sncast_accounts_path() -> Result<PathBuf> {
@@ -646,6 +744,66 @@ mod tests {
         assert!(!r.shredded && !copy.dir.exists());
         assert!(carol.load_keys().is_ok(), "the original still opens");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn panic_wipe_takes_everything_offline() {
+        let root = tmp("panic");
+        let carol = mk(&root, "carol", Some("carol"), "a1", STORE);
+        mk(&root, "mode", Some("mode"), "a2", STORE);
+        mk(&root, "burner-aa11bb", None, "a3", STORE);
+        crate::profiles::archive_profile(&root, "burner-aa11bb").unwrap();
+        wallet_with(&carol, &[TicketState::Unspent]);
+        write_current(&root, "carol").unwrap();
+        crate::applock::set_pin("123456", &root).unwrap();
+        let leftover = fs::read(carol.keys_path()).unwrap();
+
+        let r = panic_wipe(&root).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.profiles, r.keys_shredded), (3, 3));
+        assert!(!root.exists(), "nothing else was there: the root goes too");
+        assert_eq!(crate::applock::state().unwrap(), crate::applock::LockState::NotSet);
+        // Lingering sealed bytes no longer open.
+        fs::create_dir_all(&carol.dir).unwrap();
+        fs::write(carol.keys_path(), &leftover).unwrap();
+        assert!(carol.load_keys().is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn panic_wipe_never_touches_what_zkmsg_did_not_make() {
+        let root = tmp("panic-foreign");
+        mk(&root, "carol", Some("carol"), "a1", STORE);
+        fs::write(root.join("thesis.pdf"), "mine").unwrap();
+        fs::create_dir_all(root.join("photos")).unwrap();
+        fs::write(root.join("photos/a.jpg"), "x").unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join("archive/notes.txt"), "keep").unwrap();
+        let r = panic_wipe(&root).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(!root.join(".zkmsg-carol").exists());
+        assert_eq!(fs::read_to_string(root.join("thesis.pdf")).unwrap(), "mine");
+        assert!(root.join("photos/a.jpg").exists());
+        assert!(root.join("archive/notes.txt").exists());
+
+        // An empty `--home` (no zkmsg in it at all) is left exactly as it was.
+        let empty = tmp("panic-empty");
+        fs::write(empty.join("doc.txt"), "x").unwrap();
+        panic_wipe(&empty).unwrap();
+        assert!(empty.join("doc.txt").exists());
+
+        // A legacy flat profile at the root: its own files only.
+        let flat = tmp("panic-flat");
+        fs::write(flat.join("config.json"), "{}").unwrap();
+        fs::write(flat.join("keys.json"), "{}").unwrap();
+        fs::write(flat.join("tickets-050f.json"), "{}").unwrap();
+        fs::write(flat.join("other.txt"), "keep").unwrap();
+        panic_wipe(&flat).unwrap();
+        assert!(!flat.join("keys.json").exists() && !flat.join("tickets-050f.json").exists());
+        assert!(flat.join("other.txt").exists());
+        for d in [root, empty, flat] {
+            fs::remove_dir_all(d).unwrap();
+        }
     }
 
     #[test]

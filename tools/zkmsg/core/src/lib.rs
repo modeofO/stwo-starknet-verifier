@@ -2,11 +2,13 @@
 //! chain driver, the SNIP-36 send, send state, config/home, inbox scan).
 pub mod account_tx;
 pub mod app;
+pub mod applock;
 pub mod chain;
 pub mod config;
 pub mod crypto;
 pub mod inbox;
 pub mod invoke_v3;
+pub mod keychain;
 pub mod pipeline;
 pub mod profiles;
 pub mod registry;

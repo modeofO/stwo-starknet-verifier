@@ -99,6 +99,16 @@ enum Command {
     /// Keychain key, remove its account key from sncast's file and its
     /// directory. Nothing on chain changes; the account's balance is NOT
     /// moved (a sweep would link the accounts) and is lost with the key.
+    /// Wipe EVERY identity on this machine at once, offline: all profile
+    /// keys and the app lock in the Keychain, the profiles' account keys in
+    /// sncast's accounts file, and the whole profile root. No PIN needed.
+    PanicWipe {
+        /// Skip the one confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Change the app PIN (asks the current one first; that attempt counts).
+    ChangePin,
     DeleteProfile {
         /// Profile name under the profile root.
         name: String,
@@ -124,6 +134,14 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let root = zkmsg_core::profiles::profile_root(&cli.home_dir());
+    if let Command::PanicWipe { yes } = &cli.command {
+        return cmd_panic_wipe(&root, *yes);
+    }
+    gate(&root)?;
+    if let Command::ChangePin = &cli.command {
+        return cmd_change_pin(&root);
+    }
     if let Command::MigrateStore { profile: Some(name), account } = &cli.command {
         let dir = cli.home_dir().join(format!("{}{name}", zkmsg_core::profiles::PROFILE_PREFIX));
         ensure!(dir.join("config.json").exists(), "no profile '{name}' at {}", dir.display());
@@ -160,7 +178,9 @@ fn main() -> Result<()> {
         Command::Inbox => cmd_inbox(&home),
         Command::Status => cmd_status(&home),
         Command::MigrateStore { account, .. } => cmd_migrate_store(&home, account.as_deref()),
-        Command::DeleteProfile { .. } => unreachable!("handled before the home resolves"),
+        Command::DeleteProfile { .. } | Command::PanicWipe { .. } | Command::ChangePin => {
+            unreachable!("handled before the home resolves")
+        }
     }
 }
 
@@ -259,6 +279,98 @@ fn cmd_delete_profile(
         Some(None) => println!("no profiles left"),
         None => {}
     }
+    Ok(())
+}
+
+/// The app PIN: `ZKMSG_PIN` if set (scripts), else asked without echo.
+fn read_pin(prompt: &str) -> Result<String> {
+    if let Ok(pin) = std::env::var("ZKMSG_PIN") {
+        return Ok(pin);
+    }
+    rpassword::prompt_password(prompt)
+        .context("no terminal to ask for the app PIN on (scripts can set ZKMSG_PIN)")
+}
+
+/// Every command but `panic-wipe` runs unlocked: on first use it sets the
+/// app PIN, after that it asks for it.
+fn gate(root: &std::path::Path) -> Result<()> {
+    use zkmsg_core::applock::{self, LockState, MAX_ATTEMPTS, Unlock};
+    match applock::state()? {
+        LockState::Unlocked => Ok(()),
+        LockState::NotSet => {
+            eprintln!(
+                "first use: set an app PIN (at least {} characters). It unlocks every profile on \
+                 this machine; {MAX_ATTEMPTS} wrong entries in a row wipe them all.",
+                applock::MIN_PIN_LEN
+            );
+            let pin = read_pin("new app PIN: ")?;
+            applock::validate_pin(&pin)?;
+            if std::env::var("ZKMSG_PIN").is_err() {
+                ensure!(read_pin("again: ")? == pin, "the two entries differ — nothing was set");
+            }
+            let wrapped = applock::set_pin(&pin, root)?;
+            eprintln!("app PIN set ({wrapped} profile key(s) now behind it)");
+            Ok(())
+        }
+        LockState::Locked { wait_secs, .. } if wait_secs > 0 => {
+            anyhow::bail!("too many wrong PINs: try again in {}", wait_label(wait_secs))
+        }
+        LockState::Locked { .. } => match applock::unlock(&read_pin("app PIN: ")?, root)? {
+            Unlock::Unlocked => Ok(()),
+            Unlock::Wait { secs } => anyhow::bail!("too many wrong PINs: try again in {}", wait_label(secs)),
+            Unlock::Wrong { attempts_left, wait_secs } => anyhow::bail!(
+                "wrong PIN — {attempts_left} attempt(s) left; the last one wipes every identity here{}",
+                if wait_secs > 0 { format!(" (next try in {})", wait_label(wait_secs)) } else { String::new() }
+            ),
+            Unlock::Wiped { errors } if errors.is_empty() => {
+                anyhow::bail!("{MAX_ATTEMPTS} wrong PINs in a row: every identity on this machine was wiped")
+            }
+            Unlock::Wiped { errors } => anyhow::bail!(
+                "{MAX_ATTEMPTS} wrong PINs in a row: the wipe ran but is INCOMPLETE: {}",
+                errors.join("; ")
+            ),
+        },
+    }
+}
+
+fn wait_label(secs: u64) -> String {
+    if secs >= 60 { format!("{} min", secs.div_ceil(60)) } else { format!("{secs} s") }
+}
+
+fn cmd_change_pin(root: &std::path::Path) -> Result<()> {
+    use zkmsg_core::applock::{self, Unlock};
+    let old = read_pin("current app PIN: ")?;
+    let new = rpassword::prompt_password("new app PIN: ")?;
+    applock::validate_pin(&new)?;
+    ensure!(rpassword::prompt_password("again: ")? == new, "the two entries differ — nothing changed");
+    match applock::change_pin(&old, &new, root)? {
+        Unlock::Unlocked => println!("app PIN changed"),
+        other => anyhow::bail!("PIN not changed: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_panic_wipe(root: &std::path::Path, yes: bool) -> Result<()> {
+    if !yes {
+        print!("wipe EVERY identity on this machine ({}), for good? type 'wipe': ", root.display());
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        ensure!(line.trim() == "wipe", "not confirmed — nothing was touched");
+    }
+    let r = zkmsg_core::wipe::panic_wipe(root)?;
+    println!(
+        "wiped: {} profile(s), {} profile key(s) shredded, the app lock, {} account key(s){}",
+        r.profiles,
+        r.keys_shredded,
+        r.account_keys_removed.len(),
+        if r.account_keys_removed.is_empty() { String::new() } else { format!(" ({})", r.account_keys_removed.join(", ")) }
+    );
+    for e in &r.errors {
+        eprintln!("NOT done: {e}");
+    }
+    ensure!(r.errors.is_empty(), "the panic wipe was incomplete (see above)");
     Ok(())
 }
 

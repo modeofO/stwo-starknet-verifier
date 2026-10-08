@@ -279,6 +279,29 @@ Nothing happens on chain: the registration stays, and messages sent to
 the deleted handle become unreadable to everyone. You confirm by typing
 the handle. `core/src/wipe.rs`.
 
+**App PIN** (`core/src/applock.rs`). On first use the CLI or GUI asks you
+to set an app PIN (at least 6 characters; not your login password, never
+biometrics). One random master key wraps every profile key, and the
+master key is itself kept only as AES-256-GCM under
+Argon2id(PIN, salt; 256 MiB, 3 passes) in the login Keychain
+(`zkmsg.app-lock`). The CLI asks for the PIN on every command
+(`ZKMSG_PIN` for scripts); the GUI shows a lock screen at launch, after
+10 idle minutes and on "Lock". From the 5th wrong PIN each try waits
+(30 s up to 1 h); the 10th in a row runs the panic wipe. `zkmsg
+change-pin` re-wraps the master key. Strength, honestly: guessing offline
+needs the login Keychain item first and then ~1 s of 256 MiB work per
+guess, so a 6-digit PIN falls in days to someone who has both; use a
+longer PIN or a passphrase on a laptop. (The phone binds its PIN to the
+Secure Enclave instead.)
+
+**Panic wipe**: `zkmsg panic-wipe` (one confirmation, no PIN, no
+network) or "Panic wipe…" on the GUI's lock screen and top bar. It
+deletes every profile key and the app lock from the Keychain first (all
+sealed files become unreadable at once), then the profiles' account keys
+from sncast's accounts file, then the whole profile root (`~/.zkmsg`).
+`ZKMSG_KEYCHAIN_NAMESPACE=<word>` prefixes the Keychain services, for
+test runs that must not touch your real items.
+
 Limits, honestly: the account's private key sits in sncast's plain
 accounts file, which delete rewrites (an ordinary file rewrite, not a
 shred); a deleted Keychain item can linger in the keychain database,
