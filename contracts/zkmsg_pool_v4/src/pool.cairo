@@ -39,8 +39,8 @@
 //!     nullifier, epoch, quota, ticket_root, ticket_nullifier]) with the
 //!     epoch derived from the facts' base block and the quota this store
 //!     was built with;
-//!   * member root known, commitment unused, member nullifier unspent, epoch
-//!     fresh, ticket root known, ticket unspent;
+//!   * member root known, envelope (commitment, content) unused, member
+//!     nullifier unspent, epoch fresh, ticket root known, ticket unspent;
 //!   * content length within [MIN, MAX] (MAX keeps the MessageSent event
 //!     under the 300-felt event data limit, another execute-revert source);
 //!   * fee fields within policy (src/policy.cairo).
@@ -106,7 +106,10 @@ pub trait IZkmsgPoolV4<TContractState> {
     fn n_tickets(self: @TContractState) -> u32;
     fn ticket_price(self: @TContractState) -> u128;
     fn is_nullifier_spent(self: @TContractState, nullifier: felt252) -> bool;
-    fn is_commitment_consumed(self: @TContractState, commitment: felt252) -> bool;
+    /// Whether this exact envelope (commitment + content) was published.
+    fn is_envelope_consumed(
+        self: @TContractState, commitment: felt252, content_hash: felt252,
+    ) -> bool;
     fn n_messages(self: @TContractState) -> u64;
     fn prover(self: @TContractState) -> ContractAddress;
     /// (epoch_blocks, max_epoch_lag, quota).
@@ -144,6 +147,18 @@ pub fn content_hash(content: @ByteArray) -> felt252 {
 
 pub fn kem_digest(kem_pubkey: @ByteArray) -> felt252 {
     bytearray_hash(kem_pubkey)
+}
+
+/// What the store refuses to publish twice: the commitment TOGETHER with
+/// the content it tags. Keyed on the commitment alone, any member who saw a
+/// pending send could prove and land the same commitment over other content
+/// first, and the real send would be refused (red team 04-crypto F9). Now
+/// that copy publishes beside it (and fails the recipient's decryption)
+/// while the real one still lands; only an exact copy, which delivers the
+/// real message anyway, is refused. Replays of one proof are already stopped
+/// by its member and ticket nullifiers.
+pub fn envelope_key(commitment: felt252, content_hash: felt252) -> felt252 {
+    core::poseidon::poseidon_hash_span(array![commitment, content_hash].span())
 }
 
 pub const KEM_PUBKEY_LEN: u32 = 1184;
@@ -226,7 +241,8 @@ pub mod ZkmsgPoolV4 {
     use crate::prover::{leaf_v3, send_payload_v4};
     use super::{
         IERC20Dispatcher, IERC20DispatcherTrait, KEM_PUBKEY_LEN, MAX_CONTENT_LEN,
-        MAX_TICKETS_PER_BUY, MIN_CONTENT_LEN, SendCall, content_hash, decode_pool_calls, kem_digest,
+        MAX_TICKETS_PER_BUY, MIN_CONTENT_LEN, SendCall, content_hash, decode_pool_calls, envelope_key,
+        kem_digest,
     };
 
     const ROOT_HISTORY_SIZE: u8 = 64;
@@ -262,7 +278,7 @@ pub mod ZkmsgPoolV4 {
         spent_tickets: Map<felt252, bool>,
         // Messages.
         message_nonce: u64,
-        consumed_commitments: Map<felt252, bool>,
+        consumed_envelopes: Map<felt252, bool>,
         spent_nullifiers: Map<felt252, bool>,
     }
 
@@ -418,7 +434,10 @@ pub mod ZkmsgPoolV4 {
     /// validate requires it unspent (then spends it), execute requires it
     /// already spent by this transaction's validate.
     fn admit(self: @ContractState, send: @SendCall, content_hash: felt252) {
-        assert(!self.consumed_commitments.read(*send.commitment), 'commitment consumed');
+        assert(
+            !self.consumed_envelopes.read(envelope_key(*send.commitment, content_hash)),
+            'envelope consumed',
+        );
         assert(!self.spent_nullifiers.read(*send.nullifier), 'nullifier spent');
         assert(is_known_root_internal(self, *send.merkle_root), 'unknown merkle root');
         assert(self.known_ticket_roots.read(*send.ticket_root), 'unknown ticket root');
@@ -569,8 +588,9 @@ pub mod ZkmsgPoolV4 {
             };
             // Spent by this transaction's own __validate__.
             assert(self.spent_tickets.read(ticket_nullifier), 'ticket not burnt');
-            admit(@self, @send, content_hash(@send.content));
-            self.consumed_commitments.write(commitment, true);
+            let hash = content_hash(@send.content);
+            admit(@self, @send, hash);
+            self.consumed_envelopes.write(envelope_key(commitment, hash), true);
             self.spent_nullifiers.write(nullifier, true);
             let nonce = self.message_nonce.read();
             self.message_nonce.write(nonce + 1);
@@ -654,8 +674,10 @@ pub mod ZkmsgPoolV4 {
             self.spent_nullifiers.read(nullifier)
         }
 
-        fn is_commitment_consumed(self: @ContractState, commitment: felt252) -> bool {
-            self.consumed_commitments.read(commitment)
+        fn is_envelope_consumed(
+            self: @ContractState, commitment: felt252, content_hash: felt252,
+        ) -> bool {
+            self.consumed_envelopes.read(envelope_key(commitment, content_hash))
         }
 
         fn n_messages(self: @ContractState) -> u64 {

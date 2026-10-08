@@ -1,4 +1,5 @@
-//! SPIKE: accountless zkmsg sends through a shared pool account.
+//! zkmsg v4: accountless sends through a shared pool account, paid by
+//! single-send tickets (docs/zkmsg-deployment.md, "zkmsg v4").
 //!
 //!   facts.cairo           pure proof-facts parsing, epoch rules
 //!   policy.cairo          pure fee-field policy for the signature-less pool

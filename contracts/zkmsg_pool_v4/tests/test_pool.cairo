@@ -96,7 +96,7 @@ fn validate_then_execute_publishes() {
     execute(f, calls);
     assert_eq!(f.pool.n_messages(), 1);
     assert!(f.pool.is_nullifier_spent(nullifier));
-    assert!(f.pool.is_commitment_consumed(C1));
+    assert!(f.pool.is_envelope_consumed(C1, content_hash(@content())));
     let events = spy.get_events().events;
     assert_eq!(events.len(), 1);
     let (from, event) = events.at(0);
@@ -225,13 +225,28 @@ fn one_epoch_behind_is_still_accepted() {
 // --- validate refuses everything execute would revert on ---------------------
 
 #[test]
-#[should_panic(expected: ('commitment consumed',))]
-fn a_replayed_commitment_is_rejected_in_validate() {
+#[should_panic(expected: ('envelope consumed',))]
+fn a_replayed_envelope_is_rejected_in_validate() {
     let f = setup();
     publish(f, @alice_send(C1, 0));
-    // Same commitment, new slot and ticket: a consumed commitment.
+    // Same commitment and content, new slot and ticket: a consumed envelope.
     let (calls, _) = prepare(f, @alice_send(C1, 1));
     validate(f, calls);
+}
+
+/// F9: a member who front-runs a pending send with its commitment over
+/// other content no longer blocks it. Both land; only the real one opens
+/// for the recipient.
+#[test]
+fn a_front_run_commitment_does_not_block_the_real_send() {
+    let f = setup();
+    let mut forged = alice_send(C1, 0);
+    forged.content = bytes(1200);
+    publish(f, @forged);
+    publish(f, @alice_send(C1, 1));
+    assert_eq!(f.pool.n_messages(), 2);
+    assert!(f.pool.is_envelope_consumed(C1, content_hash(@content())));
+    assert!(f.pool.is_envelope_consumed(C1, content_hash(@bytes(1200))));
 }
 
 #[test]

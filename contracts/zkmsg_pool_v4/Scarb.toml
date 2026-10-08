@@ -4,9 +4,10 @@ name = "zkmsg_pool_v4"
 version = "0.1.0"
 edition = "2024_07"
 
-# SPIKE (pool-spike branch): accountless zkmsg sends. A shared pool account
-# publishes every send, so no member's account signs or pays for one. Local
-# prototype only; nothing here is deployed. See src/lib.cairo.
+# zkmsg v4: accountless sends. A shared pool account (the store itself)
+# publishes every send, paid by single-send tickets, so no member's account
+# signs or pays for one. Deployed on Sepolia (docs/zkmsg-deployment.md).
+# See src/lib.cairo.
 
 [dependencies]
 starknet = "2.18.0"
