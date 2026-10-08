@@ -12,6 +12,16 @@
 //! A member therefore gets at most `quota` sends per epoch, and nobody can
 //! tell two sends of one member from sends of two members.
 //!
+//! Fees are paid by a TICKET: a fixed-denomination bearer note bought from
+//! the pool (`buy_tickets`). The statement also proves
+//!
+//!   * poseidon([TICKET_V4, t]) is a leaf under `ticket_root`, and
+//!   * ticket_nullifier = poseidon([TICKET_NULL_V4, store, t]),
+//!
+//! for a ticket secret `t` the buyer chose. The ticket is not tied to the
+//! member: whoever holds `t` can spend it, and the spend names neither the
+//! ticket's leaf nor its buyer.
+//!
 //! `epoch` and `quota` are public and travel in the payload. The prover does
 //! not trust them: the store recomputes the message hash with the epoch IT
 //! derives from the facts' base block number and the quota IT was built
@@ -19,7 +29,7 @@
 //!
 //! The single L2->L1 message: `to_address` 0 and payload
 //! `[store, commitment, ephemeral_pubkey, merkle_root, content_hash,
-//!   nullifier, epoch, quota]`.
+//!   nullifier, epoch, quota, ticket_root, ticket_nullifier]`.
 //!
 //! The leaf is v3's unchanged, so registration (and the registry rebuild) is
 //! v3's.
@@ -32,6 +42,9 @@ pub const MEMBER_V3: felt252 = 'zkmsg-member-v3';
 pub const LEAF_V3: felt252 = 'zkmsg-leaf-v3';
 /// Domain tag of the rate-limit nullifier.
 pub const NULLIFIER_V4: felt252 = 'zkmsg-nullifier-v4';
+/// Domain tags of a fee ticket's leaf and its spend.
+pub const TICKET_V4: felt252 = 'zkmsg-ticket-v4';
+pub const TICKET_NULL_V4: felt252 = 'zkmsg-ticket-null-v4';
 
 #[starknet::interface]
 pub trait IZkmsgSendProverV4<T> {
@@ -44,6 +57,7 @@ pub trait IZkmsgSendProverV4<T> {
         merkle_root: felt252,
         epoch: u64,
         quota: u32,
+        ticket_root: felt252,
         // --- witness ---
         sender_scan_pub: felt252,
         sender_kem_digest: felt252,
@@ -51,6 +65,9 @@ pub trait IZkmsgSendProverV4<T> {
         slot: u32,
         sender_leaf_index: u32,
         sender_path: Span<felt252>,
+        ticket_secret: felt252,
+        ticket_index: u32,
+        ticket_path: Span<felt252>,
     );
 }
 
@@ -72,6 +89,17 @@ pub fn nullifier_v4(store: felt252, member_secret: felt252, epoch: u64, slot: u3
     )
 }
 
+/// A ticket's leaf: poseidon_hash_many([TICKET_V4, t]). What the buyer
+/// publishes in `buy_tickets`.
+pub fn ticket_leaf(ticket_secret: felt252) -> felt252 {
+    core::poseidon::poseidon_hash_span(array![TICKET_V4, ticket_secret].span())
+}
+
+/// A ticket's spend tag: poseidon_hash_many([TICKET_NULL_V4, store, t]).
+pub fn ticket_nullifier(store: felt252, ticket_secret: felt252) -> felt252 {
+    core::poseidon::poseidon_hash_span(array![TICKET_NULL_V4, store, ticket_secret].span())
+}
+
 /// The payload `prove_send` emits; shared with the store and the tests.
 pub fn send_payload_v4(
     store: felt252,
@@ -82,10 +110,12 @@ pub fn send_payload_v4(
     nullifier: felt252,
     epoch: u64,
     quota: u32,
+    ticket_root: felt252,
+    ticket_nullifier: felt252,
 ) -> Array<felt252> {
     array![
         store, commitment, ephemeral_pubkey, merkle_root, content_hash, nullifier, epoch.into(),
-        quota.into(),
+        quota.into(), ticket_root, ticket_nullifier,
     ]
 }
 
@@ -93,7 +123,10 @@ pub fn send_payload_v4(
 pub mod ZkmsgSendProverV4 {
     use starknet::SyscallResultTrait;
     use starknet::syscalls::send_message_to_l1_syscall;
-    use super::{leaf_v3, member_commit, nullifier_v4, send_payload_v4, verify_proof};
+    use super::{
+        leaf_v3, member_commit, nullifier_v4, send_payload_v4, ticket_leaf, ticket_nullifier,
+        verify_proof,
+    };
 
     #[storage]
     struct Storage {}
@@ -109,18 +142,26 @@ pub mod ZkmsgSendProverV4 {
             merkle_root: felt252,
             epoch: u64,
             quota: u32,
+            ticket_root: felt252,
             sender_scan_pub: felt252,
             sender_kem_digest: felt252,
             member_secret: felt252,
             slot: u32,
             sender_leaf_index: u32,
             sender_path: Span<felt252>,
+            ticket_secret: felt252,
+            ticket_index: u32,
+            ticket_path: Span<felt252>,
         ) {
             assert(slot < quota, 'slot over quota');
             let leaf = leaf_v3(sender_scan_pub, sender_kem_digest, member_commit(member_secret));
             assert(
                 verify_proof(merkle_root, leaf, sender_leaf_index, sender_path),
                 'sender not a member',
+            );
+            assert(
+                verify_proof(ticket_root, ticket_leaf(ticket_secret), ticket_index, ticket_path),
+                'no such ticket',
             );
             let nullifier = nullifier_v4(store, member_secret, epoch, slot);
             send_message_to_l1_syscall(
@@ -134,6 +175,8 @@ pub mod ZkmsgSendProverV4 {
                     nullifier,
                     epoch,
                     quota,
+                    ticket_root,
+                    ticket_nullifier(store, ticket_secret),
                 )
                     .span(),
             )

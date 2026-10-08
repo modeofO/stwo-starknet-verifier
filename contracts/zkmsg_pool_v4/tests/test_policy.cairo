@@ -25,10 +25,10 @@ fn good_bounds_pass() {
 
 #[test]
 fn worst_case_fee_counts_the_tip_on_l2_gas() {
-    // 150M * 20e9 + 2000 * 1e5 = 3e18 + 2e8; tip 7 adds 150M * 7.
+    // 150M * 10e9 + 2000 * 1e5 = 1.5e18 + 2e8; tip 7 adds 150M * 7.
     let bounds = good_bounds();
-    assert_eq!(max_possible_fee(bounds.span(), 0), 3_000_000_000_200_000_000);
-    assert_eq!(max_possible_fee(bounds.span(), 7), 3_000_000_001_250_000_000);
+    assert_eq!(max_possible_fee(bounds.span(), 0), 1_500_000_000_200_000_000);
+    assert_eq!(max_possible_fee(bounds.span(), 7), 1_500_000_001_250_000_000);
     assert_eq!(l2_gas_bound(bounds.span()), 150_000_000);
 }
 
@@ -42,14 +42,14 @@ fn rejects_a_price_spike() {
 #[test]
 #[should_panic(expected: ('fee over policy',))]
 fn rejects_a_huge_amount_at_a_fair_price() {
-    check(TX_V3, l2(1_000_000_000, 20_000_000_000), 0);
+    check(TX_V3, l2(1_000_000_000, 10_000_000_000), 0);
 }
 
 #[test]
 fn accepts_the_exact_ceiling() {
-    // 250M * 20e9 = 5e18 = MAX_FEE.
-    check(TX_V3, l2(250_000_000, 20_000_000_000), 0);
-    assert_eq!(MAX_FEE, 5_000_000_000_000_000_000);
+    // 100M * 30e9 = 3e18 = MAX_FEE (one ticket).
+    check(TX_V3, l2(100_000_000, 30_000_000_000), 0);
+    assert_eq!(MAX_FEE, 3_000_000_000_000_000_000);
 }
 
 /// An L2 bound too small for the send would run execute out of gas: a

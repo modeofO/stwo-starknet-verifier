@@ -1,0 +1,11 @@
+[package]
+name = "poseidon-many"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Local helper for scripts/devnet_e2e.py: prints poseidon_hash_many(args).
+[dependencies]
+starknet-crypto = "0.8.1"
+
+[workspace]

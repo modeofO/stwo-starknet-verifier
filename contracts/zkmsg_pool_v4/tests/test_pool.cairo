@@ -9,24 +9,27 @@
 //! gateway's proof verification, fees actually charged, nonces.
 
 use snforge_std::{
-    EventSpyTrait, spy_events, start_cheat_block_number_global, start_cheat_signature_global,
-    start_cheat_tip_global, stop_cheat_proof_facts_global,
+    CheatSpan, ContractClassTrait, DeclareResultTrait, EventSpyTrait, cheat_caller_address, declare,
+    spy_events, start_cheat_block_number_global, start_cheat_resource_bounds_global,
+    start_cheat_signature_global, start_cheat_tip_global, stop_cheat_proof_facts_global,
 };
-use starknet::VALIDATED;
 use starknet::account::Call;
+use starknet::{ResourcesBounds, VALIDATED};
+use zkmsg_pool_v4::mock_strk::{IMockStrkDispatcher, IMockStrkDispatcherTrait};
+use zkmsg_pool_v4::policy::{FeePolicy, L2_GAS};
 use zkmsg_pool_v4::pool::{
     IPoolAccountDispatcher, IPoolAccountDispatcherTrait, IZkmsgPoolV4Dispatcher,
     IZkmsgPoolV4DispatcherTrait, content_hash,
 };
-use zkmsg_pool_v4::prover::IZkmsgSendProverV4Dispatcher;
+use zkmsg_pool_v4::prover::{IZkmsgSendProverV4Dispatcher, ticket_leaf};
 use crate::common::{
-    ALICE, BASE_BLOCK, C1, C2, C3, C4, EPOCH, EPOCH_BLOCKS, NOW, QUOTA, Send, addr, alice_send,
-    as_protocol, bytes, deploy_pool_with, deploy_prover, facts, prove, register_as, send_calls,
+    ALICE, BASE_BLOCK, BUYER, C1, C2, C3, C4, EPOCH, EPOCH_BLOCKS, MIN_L2_GAS, N_TICKETS, Proven,
+    QUOTA, Send, TICKET_PRICE, addr, alice_send, as_protocol, buy, bytes, deploy_pool_with,
+    deploy_prover, deploy_strk, facts, pool_args, prove, register_as, send_calls, ticket_secret,
     tx_env,
 };
 use crate::vector::{
-    ALICE_KEM_DIGEST, ALICE_M_COMMIT, ALICE_SCAN_PUB, EPHEMERAL_PUBKEY, ROOT, alice_kem_pubkey,
-    content,
+    ALICE_M_COMMIT, ALICE_SCAN_PUB, EPHEMERAL_PUBKEY, ROOT, alice_kem_pubkey, content,
 };
 
 #[derive(Drop, Copy)]
@@ -34,23 +37,24 @@ struct Fixture {
     prover: IZkmsgSendProverV4Dispatcher,
     pool: IZkmsgPoolV4Dispatcher,
     account: IPoolAccountDispatcher,
+    strk: IMockStrkDispatcher,
 }
 
 fn setup() -> Fixture {
     let prover = deploy_prover();
-    let (pool, account) = deploy_pool_with(prover.contract_address, QUOTA);
-    Fixture { prover, pool, account }
+    let (pool, account, strk) = deploy_pool_with(prover.contract_address, QUOTA);
+    Fixture { prover, pool, account, strk }
 }
 
 /// Proves `send`, sets up its publish transaction at base block `base`, and
-/// returns (calls, nullifier).
-fn prepare_at(f: Fixture, send: @Send, base: u64) -> (Array<Call>, felt252) {
-    let (nullifier, message) = prove(f.prover, f.pool.contract_address, send);
-    tx_env(facts(base, message).span());
-    (send_calls(f.pool.contract_address, send, nullifier), nullifier)
+/// returns (calls, what the proof binds).
+fn prepare_at(f: Fixture, send: @Send, base: u64) -> (Array<Call>, Proven) {
+    let p = prove(f.prover, f.pool, send);
+    tx_env(facts(base, p.message).span());
+    (send_calls(f.pool.contract_address, send, p), p)
 }
 
-fn prepare(f: Fixture, send: @Send) -> (Array<Call>, felt252) {
+fn prepare(f: Fixture, send: @Send) -> (Array<Call>, Proven) {
     prepare_at(f, send, BASE_BLOCK)
 }
 
@@ -65,11 +69,11 @@ fn execute(f: Fixture, calls: Array<Call>) {
 }
 
 /// The full publish: validate then execute, as the sequencer runs them.
-fn publish(f: Fixture, send: @Send) -> felt252 {
-    let (calls, nullifier) = prepare(f, send);
+fn publish(f: Fixture, send: @Send) -> Proven {
+    let (calls, p) = prepare(f, send);
     assert_eq!(validate(f, calls.clone()), VALIDATED);
     execute(f, calls);
-    nullifier
+    p
 }
 
 // --- the happy path ----------------------------------------------------------
@@ -78,10 +82,13 @@ fn publish(f: Fixture, send: @Send) -> felt252 {
 fn validate_then_execute_publishes() {
     let f = setup();
     let send = alice_send(C1, 0);
-    let (calls, nullifier) = prepare(f, @send);
+    let (calls, p) = prepare(f, @send);
+    let nullifier = p.nullifier;
     assert!(!f.pool.is_nullifier_spent(nullifier));
+    assert!(!f.pool.is_ticket_spent(p.ticket_nullifier));
     assert_eq!(validate(f, calls.clone()), VALIDATED);
-    // Validate writes nothing.
+    // Validate burns the ticket and nothing else.
+    assert!(f.pool.is_ticket_spent(p.ticket_nullifier));
     assert!(!f.pool.is_nullifier_spent(nullifier));
     assert_eq!(f.pool.n_messages(), 0);
 
@@ -103,8 +110,18 @@ fn validate_then_execute_publishes() {
 fn check_send_matches_validate() {
     let f = setup();
     let send = alice_send(C1, 0);
-    let (_, nullifier) = prepare(f, @send);
-    f.pool.check_send(C1, EPHEMERAL_PUBKEY, ROOT, nullifier, content_hash(@content()));
+    let (_, p) = prepare(f, @send);
+    f
+        .pool
+        .check_send(
+            C1,
+            EPHEMERAL_PUBKEY,
+            ROOT,
+            p.nullifier,
+            p.ticket_root,
+            p.ticket_nullifier,
+            content_hash(@content()),
+        );
 }
 
 // --- quota: k-per-epoch via the nullifier ------------------------------------
@@ -125,7 +142,9 @@ fn quota_slots_each_publish_once() {
 fn a_reused_slot_is_rejected_in_validate() {
     let f = setup();
     publish(f, @alice_send(C1, 0));
-    let (calls, _) = prepare(f, @alice_send(C2, 0));
+    let mut again = alice_send(C2, 0);
+    again.ticket = 5; // a fresh ticket: only the quota slot is re-used
+    let (calls, _) = prepare(f, @again);
     validate(f, calls);
 }
 
@@ -160,6 +179,7 @@ fn the_next_epoch_refills_the_quota() {
     publish(f, @alice_send(C1, 0));
     let mut next = alice_send(C2, 0);
     next.epoch = EPOCH + 1;
+    next.ticket = 1;
     let base = (EPOCH + 1) * EPOCH_BLOCKS + 5;
     let (calls, _) = prepare_at(f, @next, base);
     start_cheat_block_number_global(base + 20);
@@ -209,7 +229,7 @@ fn one_epoch_behind_is_still_accepted() {
 fn a_replayed_commitment_is_rejected_in_validate() {
     let f = setup();
     publish(f, @alice_send(C1, 0));
-    // Same commitment, new slot: a fresh nullifier but a consumed commitment.
+    // Same commitment, new slot and ticket: a consumed commitment.
     let (calls, _) = prepare(f, @alice_send(C1, 1));
     validate(f, calls);
 }
@@ -218,9 +238,10 @@ fn a_replayed_commitment_is_rejected_in_validate() {
 #[should_panic(expected: ('unknown merkle root',))]
 fn an_unknown_root_is_rejected_in_validate() {
     let f = setup();
-    let (_, nullifier) = prepare(f, @alice_send(C1, 0));
+    let (_, p) = prepare(f, @alice_send(C1, 0));
     let mut calldata: Array<felt252> = array![];
-    (C1, EPHEMERAL_PUBKEY, ROOT + 1, nullifier, content()).serialize(ref calldata);
+    (C1, EPHEMERAL_PUBKEY, ROOT + 1, p.nullifier, p.ticket_root, p.ticket_nullifier, content())
+        .serialize(ref calldata);
     let calls = array![
         Call {
             to: f.pool.contract_address,
@@ -246,10 +267,10 @@ fn a_transaction_without_facts_is_rejected() {
 fn other_content_is_rejected_in_validate() {
     let f = setup();
     let send = alice_send(C1, 0);
-    let (_, nullifier) = prepare(f, @send);
+    let (_, p) = prepare(f, @send);
     let mut other = send.clone();
     other.content.append_byte(0);
-    validate(f, send_calls(f.pool.contract_address, @other, nullifier));
+    validate(f, send_calls(f.pool.contract_address, @other, p));
 }
 
 /// A different nullifier than the proof's (e.g. a fresh random one to dodge
@@ -259,8 +280,9 @@ fn other_content_is_rejected_in_validate() {
 fn a_forged_nullifier_is_rejected() {
     let f = setup();
     let send = alice_send(C1, 0);
-    let (_, nullifier) = prepare(f, @send);
-    validate(f, send_calls(f.pool.contract_address, @send, nullifier + 1));
+    let (_, mut p) = prepare(f, @send);
+    p.nullifier += 1;
+    validate(f, send_calls(f.pool.contract_address, @send, p));
 }
 
 #[test]
@@ -409,7 +431,7 @@ fn validate_is_protocol_only() {
 }
 
 /// Another contract cannot drive the pool's `__execute__` (it would skip
-/// validate's fee policy).
+/// validate's fee policy and the ticket burn).
 #[test]
 #[should_panic(expected: ('protocol only',))]
 fn execute_is_protocol_only() {
@@ -440,18 +462,161 @@ fn the_pool_cannot_register() {
     );
 }
 
-/// A member may still publish from their own account (and be named, and
-/// pay) — same rules, same nullifier.
+/// `send_message` is reachable only through the pool's own `__execute__`:
+/// a member calling it from their own account would skip the ticket.
 #[test]
-fn a_member_can_publish_directly() {
+#[should_panic(expected: ('send through the pool',))]
+fn send_message_is_pool_only() {
     let f = setup();
     let send = alice_send(C1, 0);
-    let (_, nullifier) = prepare(f, @send);
-    snforge_std::cheat_caller_address(
-        f.pool.contract_address, addr(ALICE), snforge_std::CheatSpan::TargetCalls(1),
+    let (_, p) = prepare(f, @send);
+    cheat_caller_address(f.pool.contract_address, addr(ALICE), CheatSpan::TargetCalls(1));
+    f
+        .pool
+        .send_message(
+            C1, EPHEMERAL_PUBKEY, ROOT, p.nullifier, p.ticket_root, p.ticket_nullifier, content(),
+        );
+}
+
+// --- tickets: users fund the pool, one burnt per send ------------------------------
+
+#[test]
+fn buying_tickets_pays_the_pool() {
+    let f = setup();
+    let price: u256 = TICKET_PRICE.into();
+    assert_eq!(f.pool.n_tickets(), N_TICKETS);
+    assert_eq!(f.strk.balance_of(f.pool.contract_address), price * N_TICKETS.into());
+    assert_eq!(f.strk.balance_of(addr(BUYER)), 0);
+    assert!(f.pool.is_known_ticket_root(f.pool.get_ticket_root()));
+    let mut spy = spy_events();
+    buy(f.pool, f.strk, N_TICKETS, 2);
+    // One TicketBought per leaf: [selector], data [leaf, index].
+    let events = spy.get_events().events;
+    let (_, last) = events.at(events.len() - 1);
+    assert_eq!(*last.keys.at(0), selector!("TicketBought"));
+    assert(
+        last.data == @array![ticket_leaf(ticket_secret(N_TICKETS + 1)), (N_TICKETS + 1).into()],
+        'ticket event',
     );
-    f.pool.send_message(C1, EPHEMERAL_PUBKEY, ROOT, nullifier, content());
-    assert!(f.pool.is_nullifier_spent(nullifier));
-    let _ = ALICE_KEM_DIGEST;
-    let _ = NOW;
+}
+
+#[test]
+#[should_panic(expected: ('insufficient allowance',))]
+fn tickets_must_be_paid_for() {
+    let f = setup();
+    cheat_caller_address(f.pool.contract_address, addr(BUYER), CheatSpan::TargetCalls(1));
+    f.pool.buy_tickets(array![ticket_leaf(0x5ee)]);
+}
+
+#[test]
+#[should_panic(expected: ('pool cannot buy',))]
+fn the_pool_cannot_buy_tickets_with_its_own_funds() {
+    let f = setup();
+    cheat_caller_address(
+        f.pool.contract_address, f.pool.contract_address, CheatSpan::TargetCalls(1),
+    );
+    f.pool.buy_tickets(array![ticket_leaf(0x5ee)]);
+}
+
+/// A ticket pays once. Here: a new quota slot and commitment, same ticket.
+#[test]
+#[should_panic(expected: ('ticket spent',))]
+fn a_spent_ticket_is_rejected_in_validate() {
+    let f = setup();
+    publish(f, @alice_send(C1, 0));
+    let mut again = alice_send(C2, 1);
+    again.ticket = 0;
+    let (calls, _) = prepare(f, @again);
+    validate(f, calls);
+}
+
+/// The burn happens in validate: a second validate of the very same
+/// transaction (e.g. the same tx later in the block) is rejected.
+#[test]
+#[should_panic(expected: ('ticket spent',))]
+fn validate_burns_the_ticket() {
+    let f = setup();
+    let (calls, _) = prepare(f, @alice_send(C1, 0));
+    validate(f, calls.clone());
+    validate(f, calls);
+}
+
+/// Execute without this transaction's validate having burnt the ticket.
+#[test]
+#[should_panic(expected: ('ticket not burnt',))]
+fn execute_requires_the_burn() {
+    let f = setup();
+    let (calls, _) = prepare(f, @alice_send(C1, 0));
+    execute(f, calls);
+}
+
+/// A secret that was never bought has no leaf: no proof can be made.
+#[test]
+#[should_panic(expected: ('no such ticket',))]
+fn an_unbought_ticket_cannot_be_proven() {
+    let f = setup();
+    let mut send = alice_send(C1, 0);
+    send.ticket = N_TICKETS; // index past the bought leaves
+    prepare(f, @send);
+}
+
+#[test]
+#[should_panic(expected: ('unknown ticket root',))]
+fn an_unknown_ticket_root_is_rejected() {
+    let f = setup();
+    let send = alice_send(C1, 0);
+    let (_, mut p) = prepare(f, @send);
+    p.ticket_root += 1;
+    validate(f, send_calls(f.pool.contract_address, @send, p));
+}
+
+/// Purchases after the proof was made move the ticket root; every root the
+/// append-only ticket tree ever had stays acceptable.
+#[test]
+fn a_proof_survives_later_purchases() {
+    let f = setup();
+    let (calls, p) = prepare(f, @alice_send(C1, 0));
+    buy(f.pool, f.strk, N_TICKETS, 32);
+    assert(f.pool.get_ticket_root() != p.ticket_root, 'root did not move');
+    assert_eq!(validate(f, calls.clone()), VALIDATED);
+    execute(f, calls);
+    assert_eq!(f.pool.n_messages(), 1);
+}
+
+/// The worst-case fee may not exceed the ticket: 100M L2 gas at 35e9
+/// = 3.5 STRK > 3 STRK.
+#[test]
+#[should_panic(expected: ('fee over policy',))]
+fn a_fee_bound_over_the_ticket_is_rejected() {
+    let f = setup();
+    let (calls, _) = prepare(f, @alice_send(C1, 0));
+    start_cheat_resource_bounds_global(
+        array![
+            ResourcesBounds {
+                resource: L2_GAS, max_amount: MIN_L2_GAS, max_price_per_unit: 35_000_000_000,
+            },
+        ]
+            .span(),
+    );
+    validate(f, calls);
+}
+
+#[test]
+#[should_panic]
+fn the_policy_may_not_exceed_the_ticket_price() {
+    let strk = deploy_strk();
+    let class = declare("ZkmsgPoolV4").unwrap().contract_class();
+    let mut args: Array<felt252> = array![
+        0x9407e2, strk.contract_address.into(), TICKET_PRICE.into(), EPOCH_BLOCKS.into(), 1,
+        QUOTA.into(),
+    ];
+    FeePolicy { max_fee: TICKET_PRICE + 1, max_tip: 0, min_l2_gas: MIN_L2_GAS }.serialize(ref args);
+    class.deploy(@args).unwrap();
+}
+
+#[test]
+fn pool_args_are_well_formed() {
+    let strk = deploy_strk();
+    let class = declare("ZkmsgPoolV4").unwrap().contract_class();
+    class.deploy(@pool_args(addr(0x9407e2), strk.contract_address, QUOTA)).unwrap();
 }

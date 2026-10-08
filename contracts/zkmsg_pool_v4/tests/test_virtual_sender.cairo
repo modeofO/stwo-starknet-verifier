@@ -6,8 +6,10 @@ use snforge_std::{
 };
 use starknet::account::{AccountContractDispatcher, AccountContractDispatcherTrait, Call};
 use starknet::{ContractAddress, ResourcesBounds, VALIDATED};
+use zkmsg_pool_v4::merkle::{TREE_DEPTH, hash_pair, zero_hash};
 use zkmsg_pool_v4::policy::{L1_DATA_GAS, L1_GAS, L2_GAS};
 use zkmsg_pool_v4::pool::content_hash;
+use zkmsg_pool_v4::prover::ticket_leaf;
 use crate::common::{EPOCH, QUOTA, addr, deploy_prover, good_bounds};
 use crate::vector::{
     ALICE_KEM_DIGEST, ALICE_MEMBER_SECRET, ALICE_SCAN_PUB, COMMITMENT, EPHEMERAL_PUBKEY, ROOT,
@@ -34,6 +36,12 @@ fn protocol(account: ContractAddress) {
 }
 
 fn prove_send_call(prover: ContractAddress) -> Call {
+    let mut ticket_path = array![];
+    let mut ticket_root = ticket_leaf(0x7111c37);
+    for level in 0..TREE_DEPTH {
+        ticket_path.append(zero_hash(level));
+        ticket_root = hash_pair(ticket_root, zero_hash(level));
+    }
     let mut calldata: Array<felt252> = array![];
     (
         0x5702e,
@@ -43,6 +51,7 @@ fn prove_send_call(prover: ContractAddress) -> Call {
         ROOT,
         EPOCH,
         QUOTA,
+        ticket_root,
         ALICE_SCAN_PUB,
         ALICE_KEM_DIGEST,
         ALICE_MEMBER_SECRET,
@@ -51,6 +60,7 @@ fn prove_send_call(prover: ContractAddress) -> Call {
     )
         .serialize(ref calldata);
     alice_path().span().serialize(ref calldata);
+    (0x7111c37, 0_u32, ticket_path.span()).serialize(ref calldata);
     Call { to: prover, selector: selector!("prove_send"), calldata: calldata.span() }
 }
 

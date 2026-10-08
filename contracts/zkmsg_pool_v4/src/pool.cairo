@@ -1,37 +1,53 @@
-//! zkmsg v4: the message store IS the shared pool account.
+//! zkmsg v4: the message store IS the shared pool account, paid by tickets.
 //!
 //! Every send is published by THIS contract as the transaction's sender and
 //! paid from its own STRK balance, so no member's account signs, pays for or
 //! appears in a send. Authorization is the SNIP-36 proof in the transaction's
-//! `proof_facts` plus a fresh nullifier; there is no signature.
+//! `proof_facts`; there is no signature.
 //!
 //! Why store and account are one contract: blockifier forbids
 //! `call_contract` to any contract other than the account itself in
 //! `__validate__` (crates/blockifier/src/execution/syscalls/
 //! hint_processor.rs:530-537), so a separate pool account could not read the
-//! store's roots, commitments or nullifiers while validating. Here they are
-//! the account's own storage.
+//! store's roots, commitments or nullifiers while validating.
 //!
-//! The invariant that keeps the pool from being drained: whatever passes
-//! `__validate__` cannot revert in `__execute__`. A validate failure is a
-//! rejection (no fee); an execute revert is charged. So `__validate__` runs
-//! the full admission rule set (`admit`) plus the fee policy, and execute
-//! runs `admit` again on the same state before writing.
+//! FUNDING: users only. The pool never spends more than users paid in.
+//!
+//!   * `buy_tickets(leaves)` takes `ticket_price` STRK per leaf from the
+//!     caller and appends each leaf poseidon([TICKET_V4, t]) to the ticket
+//!     tree. Any quantity, any time, from any account.
+//!   * A send proves (inside prove_send) knowledge of some ticket's `t` under
+//!     a known ticket root and reveals only its ticket nullifier.
+//!   * `__validate__` caps the transaction's worst-case fee at the ticket
+//!     price (policy.max_fee <= ticket_price, checked at construction) and
+//!     SPENDS the ticket nullifier right there. Validate writes survive an
+//!     execute revert (blockifier account_transaction.rs:719, "if execution
+//!     later fails, only keep the validation diff"), so even an unforeseen
+//!     revert is paid for by a burnt ticket. Hence:
+//!       total fees charged <= (tickets spent) * ticket_price
+//!                          <= (tickets bought) * ticket_price = STRK paid in.
+//!   * Surplus (ticket price - actual fee) stays in the pool. No refunds: a
+//!     refund would need a destination, which re-links the send.
+//!
+//! The invariant that keeps sends from wasting tickets: whatever passes
+//! `__validate__` does not revert in `__execute__`. Validate runs the full
+//! admission rule set (`admit`) plus the fee policy:
 //!
 //!   * exactly one call: this contract's `send_message`;
 //!   * proof facts: one virtual-OS message whose hash is
-//!     poseidon([prover, 0, 8, store, commitment, E, root, content_hash,
-//!     nullifier, epoch, quota]) with the epoch derived from the facts' base
-//!     block and the quota this store was built with;
-//!   * root known, commitment unused, nullifier unspent, epoch fresh;
+//!     poseidon([prover, 0, 10, store, commitment, E, root, content_hash,
+//!     nullifier, epoch, quota, ticket_root, ticket_nullifier]) with the
+//!     epoch derived from the facts' base block and the quota this store
+//!     was built with;
+//!   * member root known, commitment unused, member nullifier unspent, epoch
+//!     fresh, ticket root known, ticket unspent;
 //!   * content length within [MIN, MAX] (MAX keeps the MessageSent event
 //!     under the 300-felt event data limit, another execute-revert source);
 //!   * fee fields within policy (src/policy.cairo).
 //!
-//! Registration is v3's and is called by members from their own accounts
-//! (registration is public by design). Funding: anyone transfers STRK here.
+//! Registration is v3's, called by members from their own accounts.
 //! No owner, no withdraw: the only call this account will ever pay for is
-//! `send_message`.
+//! its own `send_message`.
 
 use starknet::ContractAddress;
 use starknet::account::Call;
@@ -47,27 +63,33 @@ pub trait IZkmsgPoolV4<TContractState> {
         m_commit: felt252,
     );
 
-    /// Publishes a proven send. Normally reached through the pool's own
-    /// `__execute__`; a member may also call it from their own account (and
-    /// pay, and be named) — the rules are the same.
+    /// Buys one ticket per leaf at `ticket_price` STRK each (the caller must
+    /// have approved the pool). Leaves are poseidon([TICKET_V4, t]).
+    fn buy_tickets(ref self: TContractState, leaves: Array<felt252>);
+
+    /// Publishes a proven send. Only the pool's own `__execute__` reaches it
+    /// (after `__validate__` spent the ticket).
     fn send_message(
         ref self: TContractState,
         commitment: felt252,
         ephemeral_pubkey: felt252,
         merkle_root: felt252,
         nullifier: felt252,
+        ticket_root: felt252,
+        ticket_nullifier: felt252,
         content: ByteArray,
     );
 
     /// Every admission rule without writing; reads the CURRENT transaction's
-    /// proof facts. For clients' pre-flight `starknet_call` with simulated
-    /// facts, and for tests.
+    /// proof facts. For clients' simulation and for tests.
     fn check_send(
         self: @TContractState,
         commitment: felt252,
         ephemeral_pubkey: felt252,
         merkle_root: felt252,
         nullifier: felt252,
+        ticket_root: felt252,
+        ticket_nullifier: felt252,
         content_hash: felt252,
     );
 
@@ -77,6 +99,12 @@ pub trait IZkmsgPoolV4<TContractState> {
     fn get_merkle_root(self: @TContractState) -> felt252;
     fn get_merkle_path(self: @TContractState, leaf_index: u32) -> Array<felt252>;
     fn is_known_root(self: @TContractState, root: felt252) -> bool;
+    fn get_ticket_root(self: @TContractState) -> felt252;
+    fn get_ticket_path(self: @TContractState, ticket_index: u32) -> Array<felt252>;
+    fn is_known_ticket_root(self: @TContractState, root: felt252) -> bool;
+    fn is_ticket_spent(self: @TContractState, ticket_nullifier: felt252) -> bool;
+    fn n_tickets(self: @TContractState) -> u32;
+    fn ticket_price(self: @TContractState) -> u128;
     fn is_nullifier_spent(self: @TContractState, nullifier: felt252) -> bool;
     fn is_commitment_consumed(self: @TContractState, commitment: felt252) -> bool;
     fn n_messages(self: @TContractState) -> u64;
@@ -86,12 +114,21 @@ pub trait IZkmsgPoolV4<TContractState> {
     fn fee_policy(self: @TContractState) -> FeePolicy;
 }
 
-/// The SRC-6 account entry points the protocol calls.
+/// The SRC-6 account entry points the protocol calls. `__validate__` takes
+/// `ref self`: it spends the ticket.
 #[starknet::interface]
 pub trait IPoolAccount<TContractState> {
-    fn __validate__(self: @TContractState, calls: Array<Call>) -> felt252;
+    fn __validate__(ref self: TContractState, calls: Array<Call>) -> felt252;
     fn __execute__(ref self: TContractState, calls: Array<Call>) -> Array<Span<felt252>>;
     fn __validate_declare__(self: @TContractState, class_hash: felt252) -> felt252;
+}
+
+#[starknet::interface]
+pub trait IERC20<T> {
+    fn transfer_from(
+        ref self: T, sender: ContractAddress, recipient: ContractAddress, amount: u256,
+    ) -> bool;
+    fn balance_of(self: @T, account: ContractAddress) -> u256;
 }
 
 /// Poseidon over the Cairo serialization of a ByteArray.
@@ -118,6 +155,8 @@ pub const MIN_CONTENT_LEN: u32 = 1088 + 12 + 16;
 /// so anything past 9175 bytes would revert in execute. 8 KiB leaves margin
 /// and fits the gateway's 5000-felt calldata cap.
 pub const MAX_CONTENT_LEN: u32 = 8192;
+/// Tickets per `buy_tickets` call (bounds the call's gas).
+pub const MAX_TICKETS_PER_BUY: u32 = 32;
 
 /// A `send_message` call decoded from account calldata.
 #[derive(Drop, PartialEq, Debug)]
@@ -126,6 +165,8 @@ pub struct SendCall {
     pub ephemeral_pubkey: felt252,
     pub merkle_root: felt252,
     pub nullifier: felt252,
+    pub ticket_root: felt252,
+    pub ticket_nullifier: felt252,
     pub content: ByteArray,
 }
 
@@ -138,13 +179,31 @@ pub fn decode_pool_calls(calls: Span<Call>, this: ContractAddress) -> SendCall {
     assert(*call.to == this, 'pool only calls itself');
     assert(*call.selector == selector!("send_message"), 'pool only sends messages');
     let mut calldata = *call.calldata;
-    let send: Option<(felt252, felt252, felt252, felt252, ByteArray)> = Serde::deserialize(
+    let send: Option<(felt252, felt252, felt252, felt252, felt252, felt252, ByteArray)> =
+        Serde::deserialize(
         ref calldata,
     );
-    let (commitment, ephemeral_pubkey, merkle_root, nullifier, content) = send
+    let (
+        commitment,
+        ephemeral_pubkey,
+        merkle_root,
+        nullifier,
+        ticket_root,
+        ticket_nullifier,
+        content,
+    ) =
+        send
         .expect('bad send calldata');
     assert(calldata.is_empty(), 'trailing calldata');
-    SendCall { commitment, ephemeral_pubkey, merkle_root, nullifier, content }
+    SendCall {
+        commitment,
+        ephemeral_pubkey,
+        merkle_root,
+        nullifier,
+        ticket_root,
+        ticket_nullifier,
+        content,
+    }
 }
 
 #[starknet::contract(account)]
@@ -155,7 +214,7 @@ pub mod ZkmsgPoolV4 {
         Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess,
         StoragePointerWriteAccess,
     };
-    use starknet::syscalls::get_execution_info_v3_syscall;
+    use starknet::syscalls::{call_contract_syscall, get_execution_info_v3_syscall};
     use starknet::{
         ContractAddress, SyscallResultTrait, VALIDATED, get_caller_address, get_contract_address,
     };
@@ -166,31 +225,42 @@ pub mod ZkmsgPoolV4 {
     use crate::policy::{FeePolicy, check_fee_fields};
     use crate::prover::{leaf_v3, send_payload_v4};
     use super::{
-        KEM_PUBKEY_LEN, MAX_CONTENT_LEN, MIN_CONTENT_LEN, content_hash, decode_pool_calls,
-        kem_digest,
+        IERC20Dispatcher, IERC20DispatcherTrait, KEM_PUBKEY_LEN, MAX_CONTENT_LEN,
+        MAX_TICKETS_PER_BUY, MIN_CONTENT_LEN, SendCall, content_hash, decode_pool_calls, kem_digest,
     };
 
     const ROOT_HISTORY_SIZE: u8 = 64;
-    const MAX_LEAVES: felt252 = 1048576; // 2^20
+    const MAX_LEAVES: u32 = 1048576; // 2^20
+    const MEMBERS: u8 = 0;
+    const TICKETS: u8 = 1;
 
     #[storage]
     struct Storage {
         prover: ContractAddress,
+        strk: ContractAddress,
+        ticket_price: u128,
         epoch_blocks: u64,
         max_epoch_lag: u64,
         quota: u32,
         fee_policy: FeePolicy,
+        // Members.
         registered: Map<ContractAddress, bool>,
         scan_pubkeys: Map<ContractAddress, felt252>,
         kem_digests: Map<ContractAddress, felt252>,
         m_commits: Map<ContractAddress, felt252>,
         handles: Map<felt252, ContractAddress>,
         leaf_indices: Map<ContractAddress, u32>,
-        tree_nodes: Map<felt252, felt252>,
-        next_leaf_index: u32,
-        merkle_root: felt252,
         root_history: Map<u8, felt252>,
         root_history_index: u8,
+        // Both trees: (tree, level, index) -> node; tree -> next leaf, root.
+        tree_nodes: Map<(u8, u32, u32), felt252>,
+        next_leaf: Map<u8, u32>,
+        roots: Map<u8, felt252>,
+        // Tickets: the tree is append-only and a ticket stays a ticket, so
+        // every root it ever had stays acceptable (no eviction race).
+        known_ticket_roots: Map<felt252, bool>,
+        spent_tickets: Map<felt252, bool>,
+        // Messages.
         message_nonce: u64,
         consumed_commitments: Map<felt252, bool>,
         spent_nullifiers: Map<felt252, bool>,
@@ -200,6 +270,7 @@ pub mod ZkmsgPoolV4 {
     #[derive(Drop, starknet::Event)]
     enum Event {
         UserRegistered: UserRegistered,
+        TicketBought: TicketBought,
         MessageSent: MessageSent,
     }
 
@@ -214,7 +285,13 @@ pub mod ZkmsgPoolV4 {
         kem_pubkey: ByteArray,
     }
 
-    /// v3's layout (the nullifier is in the calldata, not repeated here).
+    /// One per ticket, so clients rebuild the ticket tree from events alone.
+    #[derive(Drop, starknet::Event)]
+    struct TicketBought {
+        leaf: felt252,
+        index: u32,
+    }
+
     #[derive(Drop, starknet::Event)]
     struct MessageSent {
         #[key]
@@ -228,12 +305,14 @@ pub mod ZkmsgPoolV4 {
     fn constructor(
         ref self: ContractState,
         prover: ContractAddress,
+        strk: ContractAddress,
+        ticket_price: u128,
         epoch_blocks: u64,
         max_epoch_lag: u64,
         quota: u32,
         fee_policy: FeePolicy,
     ) {
-        assert(!prover.is_zero(), 'zero prover');
+        assert(!prover.is_zero() && !strk.is_zero(), 'zero address');
         // A multiple of the validate rounding keeps the rounded "now" from
         // ever sitting in an earlier epoch than a real base block.
         assert(
@@ -242,21 +321,22 @@ pub mod ZkmsgPoolV4 {
         );
         assert(quota != 0, 'zero quota');
         assert(fee_policy.max_fee != 0 && fee_policy.min_l2_gas != 0, 'empty fee policy');
+        // The solvency invariant: one send can never cost more than the
+        // one ticket it burns.
+        assert(fee_policy.max_fee <= ticket_price, 'max fee over ticket price');
         self.prover.write(prover);
+        self.strk.write(strk);
+        self.ticket_price.write(ticket_price);
         self.epoch_blocks.write(epoch_blocks);
         self.max_epoch_lag.write(max_epoch_lag);
         self.quota.write(quota);
         self.fee_policy.write(fee_policy);
+        self.roots.write(MEMBERS, zero_hash(TREE_DEPTH));
+        self.roots.write(TICKETS, zero_hash(TREE_DEPTH));
     }
 
-    fn tree_key(level: u32, index: u32) -> felt252 {
-        let level_felt: felt252 = level.into();
-        let index_felt: felt252 = index.into();
-        level_felt * MAX_LEAVES + index_felt
-    }
-
-    fn read_node(self: @ContractState, level: u32, index: u32) -> felt252 {
-        let value = self.tree_nodes.read(tree_key(level, index));
+    fn read_node(self: @ContractState, tree: u8, level: u32, index: u32) -> felt252 {
+        let value = self.tree_nodes.read((tree, level, index));
         if value == 0 {
             zero_hash(level)
         } else {
@@ -264,10 +344,11 @@ pub mod ZkmsgPoolV4 {
         }
     }
 
-    fn insert_leaf(ref self: ContractState, leaf: felt252) -> u32 {
-        let leaf_index = self.next_leaf_index.read();
-        assert(leaf_index < 1048576, 'tree is full');
-        self.tree_nodes.write(tree_key(0, leaf_index), leaf);
+    /// The incremental insert (v3's walk), for either tree.
+    fn insert_leaf(ref self: ContractState, tree: u8, leaf: felt252) -> (u32, felt252) {
+        let leaf_index = self.next_leaf.read(tree);
+        assert(leaf_index < MAX_LEAVES, 'tree is full');
+        self.tree_nodes.write((tree, 0, leaf_index), leaf);
         let mut current_index = leaf_index;
         let mut current_hash = leaf;
         let mut level: u32 = 0;
@@ -277,27 +358,41 @@ pub mod ZkmsgPoolV4 {
             } else {
                 current_index - 1
             };
-            let sibling_hash = read_node(@self, level, sibling_index);
+            let sibling_hash = read_node(@self, tree, level, sibling_index);
             let parent_hash = if current_index % 2 == 0 {
                 hash_pair(current_hash, sibling_hash)
             } else {
                 hash_pair(sibling_hash, current_hash)
             };
             current_index = current_index / 2;
-            self.tree_nodes.write(tree_key(level + 1, current_index), parent_hash);
+            self.tree_nodes.write((tree, level + 1, current_index), parent_hash);
             current_hash = parent_hash;
             level += 1;
         }
-        self.merkle_root.write(current_hash);
-        let history_index = self.root_history_index.read();
-        self.root_history.write(history_index, current_hash);
-        self.root_history_index.write((history_index + 1) % ROOT_HISTORY_SIZE);
-        self.next_leaf_index.write(leaf_index + 1);
-        leaf_index
+        self.roots.write(tree, current_hash);
+        self.next_leaf.write(tree, leaf_index + 1);
+        (leaf_index, current_hash)
+    }
+
+    fn path(self: @ContractState, tree: u8, leaf_index: u32) -> Array<felt252> {
+        let mut out: Array<felt252> = array![];
+        let mut current_index = leaf_index;
+        let mut level: u32 = 0;
+        while level < TREE_DEPTH {
+            let sibling_index = if current_index % 2 == 0 {
+                current_index + 1
+            } else {
+                current_index - 1
+            };
+            out.append(read_node(self, tree, level, sibling_index));
+            current_index = current_index / 2;
+            level += 1;
+        }
+        out
     }
 
     fn is_known_root_internal(self: @ContractState, root: felt252) -> bool {
-        if root == self.merkle_root.read() {
+        if root == self.roots.read(MEMBERS) {
             return true;
         }
         let mut i: u8 = 0;
@@ -317,20 +412,16 @@ pub mod ZkmsgPoolV4 {
         assert(content.len() <= MAX_CONTENT_LEN, 'content too long');
     }
 
-    /// The single admission rule set, shared by validate, `check_send` and
-    /// execute. Reads only own storage and execution info, so it is legal in
-    /// `__validate__`.
-    fn admit(
-        self: @ContractState,
-        commitment: felt252,
-        ephemeral_pubkey: felt252,
-        merkle_root: felt252,
-        nullifier: felt252,
-        content_hash: felt252,
-    ) {
-        assert(!self.consumed_commitments.read(commitment), 'commitment consumed');
-        assert(!self.spent_nullifiers.read(nullifier), 'nullifier spent');
-        assert(is_known_root_internal(self, merkle_root), 'unknown merkle root');
+    /// The admission rule set, shared by validate, `check_send` and execute.
+    /// Reads only own storage and execution info, so it is legal in
+    /// `__validate__`. The ticket's unspent-ness is checked by the caller:
+    /// validate requires it unspent (then spends it), execute requires it
+    /// already spent by this transaction's validate.
+    fn admit(self: @ContractState, send: @SendCall, content_hash: felt252) {
+        assert(!self.consumed_commitments.read(*send.commitment), 'commitment consumed');
+        assert(!self.spent_nullifiers.read(*send.nullifier), 'nullifier spent');
+        assert(is_known_root_internal(self, *send.merkle_root), 'unknown merkle root');
+        assert(self.known_ticket_roots.read(*send.ticket_root), 'unknown ticket root');
 
         let info = get_execution_info_v3_syscall().unwrap_syscall();
         let facts = parse_send_facts(info.tx_info.proof_facts);
@@ -346,38 +437,23 @@ pub mod ZkmsgPoolV4 {
 
         let payload = send_payload_v4(
             get_contract_address().into(),
-            commitment,
-            ephemeral_pubkey,
-            merkle_root,
+            *send.commitment,
+            *send.ephemeral_pubkey,
+            *send.merkle_root,
             content_hash,
-            nullifier,
+            *send.nullifier,
             epoch,
             self.quota.read(),
+            *send.ticket_root,
+            *send.ticket_nullifier,
         );
         let expected = message_hash(self.prover.read().into(), 0, payload.span());
         assert(facts.message_hash == expected, 'no proof for this send');
     }
 
-    fn publish(
-        ref self: ContractState,
-        commitment: felt252,
-        ephemeral_pubkey: felt252,
-        merkle_root: felt252,
-        nullifier: felt252,
-        content: ByteArray,
-    ) {
-        check_content_len(@content);
-        admit(@self, commitment, ephemeral_pubkey, merkle_root, nullifier, content_hash(@content));
-        self.consumed_commitments.write(commitment, true);
-        self.spent_nullifiers.write(nullifier, true);
-        let nonce = self.message_nonce.read();
-        self.message_nonce.write(nonce + 1);
-        self.emit(MessageSent { commitment, ephemeral_pubkey, nonce, content });
-    }
-
     #[abi(embed_v0)]
     impl AccountImpl of super::IPoolAccount<ContractState> {
-        fn __validate__(self: @ContractState, calls: Array<Call>) -> felt252 {
+        fn __validate__(ref self: ContractState, calls: Array<Call>) -> felt252 {
             assert(get_caller_address().is_zero(), 'protocol only');
             let tx = get_execution_info_v3_syscall().unwrap_syscall().tx_info;
             check_fee_fields(
@@ -393,29 +469,19 @@ pub mod ZkmsgPoolV4 {
             );
             let send = decode_pool_calls(calls.span(), get_contract_address());
             check_content_len(@send.content);
-            admit(
-                self,
-                send.commitment,
-                send.ephemeral_pubkey,
-                send.merkle_root,
-                send.nullifier,
-                content_hash(@send.content),
-            );
+            assert(!self.spent_tickets.read(send.ticket_nullifier), 'ticket spent');
+            admit(@self, @send, content_hash(@send.content));
+            // Burn the ticket now: this write survives an execute revert, so
+            // whatever this transaction ends up costing is paid by it.
+            self.spent_tickets.write(send.ticket_nullifier, true);
             VALIDATED
         }
 
         fn __execute__(ref self: ContractState, calls: Array<Call>) -> Array<Span<felt252>> {
             assert(get_caller_address().is_zero(), 'protocol only');
-            let send = decode_pool_calls(calls.span(), get_contract_address());
-            publish(
-                ref self,
-                send.commitment,
-                send.ephemeral_pubkey,
-                send.merkle_root,
-                send.nullifier,
-                send.content,
-            );
-            array![array![].span()]
+            // Validate already allowed exactly this one call to ourselves.
+            let call = calls.at(0);
+            array![call_contract_syscall(*call.to, *call.selector, *call.calldata).unwrap_syscall()]
         }
 
         fn __validate_declare__(self: @ContractState, class_hash: felt252) -> felt252 {
@@ -433,8 +499,6 @@ pub mod ZkmsgPoolV4 {
             m_commit: felt252,
         ) {
             let caller = get_caller_address();
-            // The pool itself is never a member: its own `__execute__` only
-            // reaches `send_message`, but be explicit.
             assert(caller != get_contract_address(), 'pool cannot register');
             assert(!self.registered.read(caller), 'already registered');
             assert(handle != 0, 'zero handle');
@@ -448,7 +512,12 @@ pub mod ZkmsgPoolV4 {
             self.kem_digests.write(caller, digest);
             self.m_commits.write(caller, m_commit);
             self.handles.write(handle, caller);
-            let leaf_index = insert_leaf(ref self, leaf_v3(scan_pubkey, digest, m_commit));
+            let (leaf_index, root) = insert_leaf(
+                ref self, MEMBERS, leaf_v3(scan_pubkey, digest, m_commit),
+            );
+            let history_index = self.root_history_index.read();
+            self.root_history.write(history_index, root);
+            self.root_history_index.write((history_index + 1) % ROOT_HISTORY_SIZE);
             self.leaf_indices.write(caller, leaf_index);
             self
                 .emit(
@@ -458,15 +527,54 @@ pub mod ZkmsgPoolV4 {
                 );
         }
 
+        fn buy_tickets(ref self: ContractState, leaves: Array<felt252>) {
+            let n = leaves.len();
+            assert(n != 0 && n <= MAX_TICKETS_PER_BUY, 'buy 1..32 tickets');
+            let this = get_contract_address();
+            // The pool's own __execute__ only reaches send_message, but a
+            // ticket bought with the pool's own STRK would mint free sends.
+            assert(get_caller_address() != this, 'pool cannot buy');
+            let price: u256 = self.ticket_price.read().into();
+            let paid = IERC20Dispatcher { contract_address: self.strk.read() }
+                .transfer_from(get_caller_address(), this, price * n.into());
+            assert(paid, 'payment failed');
+            for leaf in leaves {
+                assert(leaf != 0, 'zero ticket');
+                let (index, root) = insert_leaf(ref self, TICKETS, leaf);
+                self.known_ticket_roots.write(root, true);
+                self.emit(TicketBought { leaf, index });
+            }
+        }
+
         fn send_message(
             ref self: ContractState,
             commitment: felt252,
             ephemeral_pubkey: felt252,
             merkle_root: felt252,
             nullifier: felt252,
+            ticket_root: felt252,
+            ticket_nullifier: felt252,
             content: ByteArray,
         ) {
-            publish(ref self, commitment, ephemeral_pubkey, merkle_root, nullifier, content);
+            assert(get_caller_address() == get_contract_address(), 'send through the pool');
+            check_content_len(@content);
+            let send = SendCall {
+                commitment,
+                ephemeral_pubkey,
+                merkle_root,
+                nullifier,
+                ticket_root,
+                ticket_nullifier,
+                content,
+            };
+            // Spent by this transaction's own __validate__.
+            assert(self.spent_tickets.read(ticket_nullifier), 'ticket not burnt');
+            admit(@self, @send, content_hash(@send.content));
+            self.consumed_commitments.write(commitment, true);
+            self.spent_nullifiers.write(nullifier, true);
+            let nonce = self.message_nonce.read();
+            self.message_nonce.write(nonce + 1);
+            self.emit(MessageSent { commitment, ephemeral_pubkey, nonce, content: send.content });
         }
 
         fn check_send(
@@ -475,9 +583,21 @@ pub mod ZkmsgPoolV4 {
             ephemeral_pubkey: felt252,
             merkle_root: felt252,
             nullifier: felt252,
+            ticket_root: felt252,
+            ticket_nullifier: felt252,
             content_hash: felt252,
         ) {
-            admit(self, commitment, ephemeral_pubkey, merkle_root, nullifier, content_hash);
+            assert(!self.spent_tickets.read(ticket_nullifier), 'ticket spent');
+            let send = SendCall {
+                commitment,
+                ephemeral_pubkey,
+                merkle_root,
+                nullifier,
+                ticket_root,
+                ticket_nullifier,
+                content: Default::default(),
+            };
+            admit(self, @send, content_hash);
         }
 
         fn get_user(
@@ -495,28 +615,39 @@ pub mod ZkmsgPoolV4 {
         }
 
         fn get_merkle_root(self: @ContractState) -> felt252 {
-            self.merkle_root.read()
+            self.roots.read(MEMBERS)
         }
 
         fn get_merkle_path(self: @ContractState, leaf_index: u32) -> Array<felt252> {
-            let mut path: Array<felt252> = array![];
-            let mut current_index = leaf_index;
-            let mut level: u32 = 0;
-            while level < TREE_DEPTH {
-                let sibling_index = if current_index % 2 == 0 {
-                    current_index + 1
-                } else {
-                    current_index - 1
-                };
-                path.append(read_node(self, level, sibling_index));
-                current_index = current_index / 2;
-                level += 1;
-            }
-            path
+            path(self, MEMBERS, leaf_index)
         }
 
         fn is_known_root(self: @ContractState, root: felt252) -> bool {
             is_known_root_internal(self, root)
+        }
+
+        fn get_ticket_root(self: @ContractState) -> felt252 {
+            self.roots.read(TICKETS)
+        }
+
+        fn get_ticket_path(self: @ContractState, ticket_index: u32) -> Array<felt252> {
+            path(self, TICKETS, ticket_index)
+        }
+
+        fn is_known_ticket_root(self: @ContractState, root: felt252) -> bool {
+            self.known_ticket_roots.read(root)
+        }
+
+        fn is_ticket_spent(self: @ContractState, ticket_nullifier: felt252) -> bool {
+            self.spent_tickets.read(ticket_nullifier)
+        }
+
+        fn n_tickets(self: @ContractState) -> u32 {
+            self.next_leaf.read(TICKETS)
+        }
+
+        fn ticket_price(self: @ContractState) -> u128 {
+            self.ticket_price.read()
         }
 
         fn is_nullifier_spent(self: @ContractState, nullifier: felt252) -> bool {
