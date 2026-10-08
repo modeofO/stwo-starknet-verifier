@@ -311,14 +311,14 @@ impl ProfileSession {
     /// Offered on any profile not yet on the v3 store. Local-only (config +
     /// keys rewrite, no transaction); the register panel takes over after.
     fn migrate_offer(&mut self, ui: &mut egui::Ui) {
-        let on_v2 = self.config.as_ref().is_some_and(zkmsg_core::app::on_current_store);
-        if on_v2 {
+        let on_current = self.config.as_ref().is_some_and(zkmsg_core::app::on_current_store);
+        if on_current {
             return;
         }
         ui.horizontal(|ui| {
             ui.label(
-                "This profile points at a retired store, which is no longer read. The v2 store \
-                 adds post-quantum key exchange and membership.",
+                "This profile points at a retired store, which is no longer read. The v3 store \
+                 has post-quantum key exchange and hash-based membership.",
             );
             ui.add_enabled_ui(!self.busy && !self.work_in_flight(), |ui| {
                 if ui.button("Move to v3 store…").clicked() {

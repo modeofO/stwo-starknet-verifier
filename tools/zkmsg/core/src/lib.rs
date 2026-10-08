@@ -8,6 +8,7 @@ pub mod inbox;
 pub mod invoke_v3;
 pub mod pipeline;
 pub mod profiles;
+pub mod registry;
 pub mod sequencer;
 pub mod setup;
 pub mod state;

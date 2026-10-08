@@ -31,7 +31,8 @@ pub enum SetupStepKind {
     Fund,
     /// `sncast account deploy` — the DEPLOY_ACCOUNT tx.
     Deploy,
-    /// scan keypair + `config.json` for the profile.
+    /// `keys.json` (scan keypair, ML-KEM seed, membership secret) +
+    /// `config.json` for the profile.
     Init,
     /// on-chain handle registration.
     Register,

@@ -22,6 +22,7 @@ use starknet_api::core::ChainId;
 use starknet_api::rpc_transaction::RpcTransaction;
 use starknet_transaction_prover::config::ProverConfig;
 use starknet_transaction_prover::proving::virtual_snos_prover::RpcVirtualSnosProver;
+use starknet_transaction_prover::running::runner::RunnerConfig;
 
 static LOG_INIT: Once = Once::new();
 
@@ -38,6 +39,36 @@ fn init_logging(log_path: Option<&str>) {
     });
 }
 
+/// The prover configuration for one request.
+///
+/// State prefetch is off. With it on (the library default), the executor first sends the whole
+/// virtual transaction to the RPC as `starknet_simulateTransactions` to learn its initial reads,
+/// and that transaction's calldata is the send's witness (member secret, leaf, Merkle path). Off,
+/// the executor reads state key by key (`getStorageAt`, `getNonce`, `getClassHashAt`,
+/// `getClass`), so the RPC sees which storage slots the send touches but never the calldata.
+///
+/// `prefetch_state` is `pub(crate)` in `starknet_transaction_prover`, so it is set through the
+/// runner config's serde form: serialize the defaults, flip the one flag, deserialize. Every other
+/// field keeps its library default.
+pub fn prover_config(chain_id: ChainId, rpc_url: String) -> Result<ProverConfig, String> {
+    let mut runner = serde_json::to_value(RunnerConfig::default())
+        .map_err(|e| format!("runner config: {e}"))?;
+    let flag = runner
+        .pointer_mut("/virtual_block_executor_config/prefetch_state")
+        .ok_or("runner config: no virtual_block_executor_config.prefetch_state")?;
+    *flag = json!(false);
+    let runner_config: RunnerConfig =
+        serde_json::from_value(runner).map_err(|e| format!("runner config: {e}"))?;
+    Ok(ProverConfig {
+        chain_id,
+        rpc_node_url: rpc_url,
+        runner_config,
+        // Matches `snip36 prove virtual-os` (--skip-fee-field-validation).
+        validate_zero_fee_fields: false,
+        ..ProverConfig::default()
+    })
+}
+
 /// Proves one request end to end. Blocking; run it off the main thread.
 pub fn prove_request(request: &Value) -> Result<Value, String> {
     init_logging(request.get("log_path").and_then(Value::as_str));
@@ -49,13 +80,7 @@ pub fn prove_request(request: &Value) -> Result<Value, String> {
     let transaction: RpcTransaction = serde_json::from_value(request["transaction"].clone())
         .map_err(|e| format!("transaction: {e}"))?;
 
-    let config = ProverConfig {
-        chain_id,
-        rpc_node_url: rpc_url,
-        // Matches `snip36 prove virtual-os` (--skip-fee-field-validation).
-        validate_zero_fee_fields: false,
-        ..ProverConfig::default()
-    };
+    let config = prover_config(chain_id, rpc_url)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -127,5 +152,43 @@ pub unsafe extern "C" fn snip36_prove(request: *const c_char) -> *mut c_char {
 pub unsafe extern "C" fn snip36_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         drop(unsafe { CString::from_raw(ptr) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The send's witness is the virtual transaction's calldata; with prefetch on it would go to
+    /// the RPC in `starknet_simulateTransactions`.
+    #[test]
+    fn prover_config_does_not_prefetch_state() {
+        let config =
+            prover_config(ChainId::Sepolia, "http://127.0.0.1:1".to_string()).unwrap();
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            value.pointer("/runner_config/virtual_block_executor_config/prefetch_state"),
+            Some(&json!(false))
+        );
+        assert_eq!(value["validate_zero_fee_fields"], json!(false));
+        assert_eq!(value["blocking_check_url"], Value::Null);
+
+        // Everything else is the library default.
+        let mut expected = serde_json::to_value(ProverConfig {
+            chain_id: ChainId::Sepolia,
+            rpc_node_url: "http://127.0.0.1:1".to_string(),
+            validate_zero_fee_fields: false,
+            ..ProverConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            expected.pointer("/runner_config/virtual_block_executor_config/prefetch_state"),
+            Some(&json!(true)),
+            "library default changed; revisit prover_config"
+        );
+        *expected
+            .pointer_mut("/runner_config/virtual_block_executor_config/prefetch_state")
+            .unwrap() = json!(false);
+        assert_eq!(value, expected);
     }
 }

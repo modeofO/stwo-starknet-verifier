@@ -1,6 +1,6 @@
 //! `~/.zkmsg` home layout: `config.json` (network + addresses + tool
-//! paths), `keys.json` (scan keypair, mode 0600 — the app's only
-//! long-lived secret), `sends/<id>.json` (pipeline checkpoints).
+//! paths), `keys.json` (mode 0600: the scan keypair, the ML-KEM `kem_seed`
+//! and the v3 `member_secret` — the app's long-lived secrets), `sends/<id>.json` (pipeline checkpoints).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
-/// MessageStoreV3 (contracts/messagezk_store_pq), deployed 2026-10-01
+/// MessageStoreV3 (contracts/messagezk_store_v3), deployed 2026-10-01
 /// (docs/zkmsg-deployment.md): hash-based (post-quantum) membership. Each
 /// identity holds a membership secret m; the leaf is
 /// poseidon(LEAF_V3, scan_pub, kem_digest, poseidon(MEMBER_V3, m)), and a send

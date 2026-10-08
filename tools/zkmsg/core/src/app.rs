@@ -64,8 +64,8 @@ pub fn status(home: &Home) -> Result<StatusReport> {
     })
 }
 
-/// Generates the scan keypair, writes `keys.json` (mode 0600, refuses to
-/// overwrite) and a default Sepolia `config.json`. Returns the scan
+/// Generates the scan keypair, the ML-KEM seed and the membership secret,
+/// writes `keys.json` (mode 0600, refuses to overwrite) and a default Sepolia `config.json`. Returns the scan
 /// pubkey.
 pub fn init_identity(
     home: &Home,
@@ -208,10 +208,13 @@ impl Member {
     }
 }
 
-/// Looks up a handle's scan pubkey + leaf index in the store.
+/// Looks up a handle's scan pubkey + leaf index among the store's
+/// registrations. All of them are read and the match is made locally: a
+/// `get_user(handle)` would tell the RPC whom this profile is about to
+/// write to.
 pub fn resolve_recipient(chain: &Chain, store: &str, handle: &str) -> Result<(Felt, u32)> {
-    let handle_felt = short_string_felt(handle)?;
-    let user = Member::parse(&chain.call(store, "get_user", &[felt_hex(&handle_felt)])?)?;
+    let registry = crate::registry::Registry::fetch(chain, store, None)?;
+    let user = registry.get(handle)?;
     Ok((user.scan_pub, user.leaf_index))
 }
 
@@ -260,7 +263,7 @@ pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
     Ok(migration)
 }
 
-/// Whether `config` points at the store this client reads and writes (v2).
+/// Whether `config` points at the store this client reads and writes (v3).
 /// Anything else needs `migrate_store` first.
 pub fn on_current_store(config: &Config) -> bool {
     is_current_store(&config.store)

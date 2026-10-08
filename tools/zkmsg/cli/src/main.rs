@@ -50,7 +50,8 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate the scan keypair, the ML-KEM seed and a default config
+    /// Generate the scan keypair, the ML-KEM seed, the membership secret and
+    /// a default config
     /// (refuses to overwrite).
     Init {
         /// sncast account name to send transactions from.
@@ -71,9 +72,10 @@ enum Command {
     Inbox,
     /// Config, balance, deployed addresses.
     Status,
-    /// Point a profile at the v2 (post-quantum) store. Registration is per
-    /// store: the handle is cleared and you register again. The scan key is
-    /// kept; an ML-KEM key is added if the profile predates v2.
+    /// Point a profile at the v3 store (hash-based post-quantum membership).
+    /// Registration is per store: the handle is cleared and you register
+    /// again. The scan key is kept, a fresh membership secret is minted, and
+    /// an ML-KEM key is added if the profile predates v2.
     MigrateStore {
         /// Profile name under the profile root (default: the current one).
         profile: Option<String>,
@@ -209,9 +211,9 @@ fn cmd_status(home: &Home) -> Result<()> {
     let route = if report.store.is_empty() {
         ""
     } else if is_current_store(&report.store) {
-        " (v2: hybrid ML-KEM + ECDH)"
+        " (v3: hash-based PQ membership + hybrid ML-KEM/ECDH)"
     } else {
-        " (not read any more — `zkmsg migrate-store` moves to v2)"
+        " (not read any more — `zkmsg migrate-store` moves to v3)"
     };
     println!(
         "store    : {}{route}",
