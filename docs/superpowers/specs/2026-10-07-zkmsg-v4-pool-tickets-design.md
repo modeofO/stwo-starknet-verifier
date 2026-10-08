@@ -37,7 +37,8 @@ Three contracts (`contracts/zkmsg_pool_v4`):
    facts' base block and the quota it was built with), the member root is
    known, the envelope is unused, the quota nullifier is unspent, the epoch
    is fresh, the ticket root is known and the ticket unspent, the content is
-   within [1116, 8192] bytes, and the fee fields are within policy. Then it
+   exactly 1372, 2140 or 5212 bytes (padded), and the fee fields are within
+   policy. Then it
    **burns the ticket** (validate's writes survive an execute revert).
    Blockifier forbids `call_contract` to other contracts in validate, which
    is why store and account must be one contract.
@@ -135,9 +136,8 @@ Cairo short strings: `'zkmsg-nullifier-v4'`, `'zkmsg-ticket-v4'`,
   `|padded| ∈ {256, 1024, 4096}` (smallest that fits; > 4094 refused);
   open requires `len ≤ |padded| − 2` and an all-zero tail. HKDF labels
   "zkmsg-v4" / "zkmsg-v4 aead" / "zkmsg-v4 tag" (v2's construction
-  otherwise). Content ∈ {1372, 2140, 5212} bytes. On-chain enforcement of
-  bucket sizes needs a pool redeploy (pending decision); the deployed pool
-  accepts 1116..8192.
+  otherwise). Content ∈ {1372, 2140, 5212} bytes, and the (redeployed)
+  pool accepts nothing else in validate or execute.
 - **Inbox**: a tag match that fails to open or unpad is dropped silently.
 - **Transaction policy** (`txpolicy.rs`): per kind fixed amounts (publish
   L2 100M, register 30M, `[approve, buy_tickets]` 80M; L1 data 4,096; L1
@@ -159,6 +159,6 @@ All of it is pinned in `v4_vectors.json` (`sealing_v4`, `policy`,
   public and each handle is tied to an account.
 - Ticket purchases are from an account too: with few buyers, "bought a
   ticket shortly before a send" narrows the sender down.
-- Ciphertext length is bucketed and timing is scheduled (above), but
-  only by convention until the pool enforces bucket sizes.
+- Timing is scheduled by convention (clients); bucket sizes are enforced
+  by the pool.
 - The phone still sends on v3, which the desktop no longer reads.

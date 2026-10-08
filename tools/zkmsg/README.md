@@ -92,7 +92,8 @@ every member's account out of the send:
 - **Padded, versioned sealing.** Plaintext is padded inside the AEAD to
   256 / 1024 / 4096 bytes (u16 length prefix, zero fill; over 4094 bytes
   is refused), sealed under "zkmsg-v4" HKDF labels: on chain a message is
-  1372, 2140 or 5212 bytes. A tag match that does not open (someone
+  1372, 2140 or 5212 bytes, the only sizes the pool accepts. A tag match
+  that does not open (someone
   front-running a commitment over other content) is dropped silently.
 - **One transaction shape for every client** (`core/src/txpolicy.rs`):
   fixed gas amounts per kind, price bounds ceil(1.5×) rounded up to 2
@@ -115,7 +116,10 @@ Golden vectors for ports: `core/testdata/v4_vectors.json`
 (`core/tests/v4_vectors.rs`; the same values are asserted against the
 contracts in `contracts/zkmsg_pool_v4/tests/test_vectors_v4.cairo`).
 
-First live run, 2026-10-07: carol ↔ mode, four sends through the pool
+Live, padded pool (2026-10-08): one send per bucket, 79.9M / 80.1M /
+82.5M L2 gas (1.45–1.50 STRK from the ticket), published 99–116 blocks
+after a 32-aligned base. First live run on the retired unpadded pool,
+2026-10-07: carol ↔ mode, four sends through the pool
 (two of them concurrent, at pool nonces 2 and 3), 1.43–1.44 STRK each from
 tickets, ~79.5M L2 gas, ~35 s wall; every recipient decrypts, neither
 user's account appears in any publish. See `docs/zkmsg-deployment.md`.

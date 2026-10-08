@@ -1,9 +1,11 @@
 # zkmsg SHIPPED on Sepolia — the first natively-proven private message (2026-07-05)
 
-> **Current: v4, the pool** — `ZkmsgPoolV4` `0x050f98ee…69b9` (store AND
-> publishing account, paid by single-send tickets) + `ZkmsgSendProverV4` +
-> `ZkmsgVirtualSenderV4`; see "zkmsg v4: the pool and tickets" at the end
-> of this file. Everything above that section is the record of retired
+> **Current: v4, the padded pool** — `ZkmsgPoolV4` `0x07ba1657…e9eb`
+> (store AND publishing account, paid by single-send tickets, content
+> exactly 1372 / 2140 / 5212 bytes) + `ZkmsgSendProverV4` +
+> `ZkmsgVirtualSenderV4`; see "zkmsg v4: the padded pool" at the end of
+> this file (the first, unpadded v4 pool `0x050f98ee…69b9` above it is
+> retired). Everything above that section is the record of retired
 > routes and stores: the lane-1 send route and its store (sections through
 > "Repro / try it"), the SNIP-36 v1 store, v2 and v3 (retired 2026-10-07:
 > every v3 send was published by the sender's own registering account).
@@ -342,7 +344,7 @@ KEM seed from v2 and gained a member secret on launch.
 Membership in both sends was proved by knowledge of `m`, with no EC step,
 and the scan private key was not in the witness.
 
-## zkmsg v4: the pool and tickets (Sepolia alpha, 2026-10-07)
+## zkmsg v4: the pool and tickets (Sepolia alpha, 2026-10-07; this first pool retired the same day)
 
 Design: `docs/superpowers/specs/2026-10-07-zkmsg-v4-pool-tickets-design.md`.
 Code: `contracts/zkmsg_pool_v4` (Scarb 2.18, sierra 1.8; 87 snforge tests,
@@ -499,3 +501,69 @@ The scheduled send: base 16257952 (≡ 0 mod 32), target 16258043, landed
 inbox decrypts it; neither member account appears in it. Pool after:
 5 tickets bought, 5 burnt, 5 messages, nonce 5, balance 7.8303 STRK.
 Running total on v4: 36.44 STRK.
+
+## zkmsg v4: the padded pool (Sepolia alpha, 2026-10-07/08) — CURRENT
+
+The user chose on-chain enforcement of the padded sizes, so the pool was
+redeployed (the prover and the virtual sender are unchanged and reused).
+The only contract change: `__validate__` and `send_message` accept content
+of exactly 1372, 2140 or 5212 bytes (`is_bucket_len`), replacing the
+1116..8192 range; the F9 envelope replay key stays. 91 snforge tests;
+`scripts/devnet_e2e.sh` (`CONTENT_LEN=…`) runs the real blockifier on every
+bucket (devnet L2 gas 79.74M / 80.31M / 82.77M).
+
+The first pool `0x050f98ee…69b9` is retired: it has no owner and no
+withdraw, so its 7.83 STRK (ticket surplus from 5 sends) stays there.
+
+| What | Value |
+|---|---|
+| `ZkmsgPoolV4` (padded) | `0x07ba165780beacf1e4dd8fae2cbeb3873afdd0e3b806fb60fb1563fc2860e9eb` |
+| pool class hash | `0x000b8131da3cca0a09e46c213dc063e450dcdd455684f572bfc6b479d552844f` |
+| pool deploy block | **16258239** (scan start) |
+| prover / virtual sender | unchanged (above) |
+| constructor | unchanged: ticket 3 STRK, epoch 5000, lag 1, quota 10, fee policy (3e18, 1e9, 100M) |
+
+Read back after deploy: `prover()`, `ticket_price()`, `rate_limit()`,
+`fee_policy()` as above, `n_tickets()` 0.
+
+| tx | hash | block | fee |
+|---|---|---|---|
+| declare padded pool (`deployer`, explicit bounds: sncast's own 1.5× estimate exceeded the balance) | `0x06179acfd6585aba5216a0d9c82073ef7beda566e1651c686fe937ca7c0fe5bc` | 16258230 | 16.4419 STRK |
+| deploy padded pool | `0x075e1a66ad9ff9bbe28edc45d1f736590ec8ec9ba424fcf66a2d5c2ce4b63393` | 16258239 | 0.1236 STRK |
+| register carol (leaf 0, native signing, policy bounds) | `0x04834eeb99acc6f94004b0d2a31a9b6574e2597ab7e39601b1a333438e10b710` | 16258313 | 0.3200 STRK |
+| register mode (leaf 1, native) | `0x06775d4e8efdd756dbcdada192a85784822406665d79b59184e7b97a0d1a789c` | 16258316 | 0.1683 STRK |
+| carol `[approve, buy_tickets]` × 2 (native) | `0x06ce62ebe68f7f851ad4681319243c11193a415d46677bc3d8c531b7ae1c1952` | 16258326 | 0.3512 STRK + 6 STRK |
+| mode `[approve, buy_tickets]` × 1 (native) | `0x03e2603c27181a69e9e059cc695b682dfa84616dec7cf11df5db71da22d4efc2` | 16258329 | 0.1282 STRK + 3 STRK |
+
+Both profiles were copied first to
+`~/.zkmsg-test-keys/{carol,mode}-v4-unpadded-final-2026-10-07/` (700/600,
+`diff -r` clean) and re-keyed by `migrate-store` (fresh scan key, ML-KEM
+seed, member secret); their spent first-pool ticket wallets were set aside
+as `tickets-050f98ee….json`. mode only bought one ticket: `deployer` could
+not hold 6 STRK plus the purchase's fee ceiling.
+
+### Live sends, one per bucket (padding, shared policy, schedule in place)
+
+Every publish: sender = the padded pool, signature `[]`, tip 0x5f5e100,
+L2 bound 100M @ 28 gfri, L1 data 4,096; neither member account appears in
+the transaction or receipt; the ticket and quota nullifiers read spent;
+each recipient's inbox decrypts.
+
+| send | publish tx | nonce | content | base (mod 32) → block | fee (ticket) | L2 gas | wall |
+|---|---|---|---|---|---|---|---|
+| carol → mode | `0x0555bfeabcb28cb5bcf8932ef1b0544a737c2cba38c6a886993deb1e9afef906` | 0 | 1372 B | 16258336 (0) → 16258435, +99 | 1.4531 STRK | 79,923,388 | 102 s |
+| mode → carol | `0x027297bd2d4f97f91f0e21425e35bcf641f28768d5d62f39d06c19cfdbb1f6c1` | 1 | 2140 B | 16258336 (0) → 16258452, +116 | 1.4566 STRK | 80,118,504 | 132 s |
+| carol → mode | `0x0127dff6976220d4826023e2d8868cbaa7aa62c56d694ae71603cd6dad8f35d4` | 2 | 5212 B | 16258400 (0) → 16258503, +103 | 1.5008 STRK | 82,549,752 | 118 s |
+
+Gas per bucket on Sepolia: 79.9M / 80.1M / 82.5M L2 gas (1.45 / 1.46 /
+1.50 STRK at ~18 gfri), all well inside the 100M floor and the 3 STRK
+ticket. The schedule picked targets base+91 / +110 / +95; inclusion added
+0–8 blocks. Wall time was 1.7–2.2 min rather than 2.5–3 min: the base
+already trails the head by 10–41 blocks when the send starts, and blocks
+ran faster than the 1.7 s estimate.
+
+Pool after: 3 tickets in (9 STRK), 3 burnt, fees 4.4105 STRK, balance
+4.5895 STRK, `n_messages` 3, nonce 3.
+
+Total spent on v4, everything (both pools): **62.97 STRK** (`deployer`
+50.57 → 4.10; `zkmsg-carol` 2925.62 → 2909.12).
