@@ -152,7 +152,7 @@ impl Gateway {
         bounds: Bounds,
         attachment: Option<&ProofAttachment<'_>>,
     ) -> Result<SignedInvoke> {
-        let mut invoke = self.invoke(signer.address, calls, nonce, bounds, attachment);
+        let mut invoke = self.invoke(signer.address, calls, nonce, bounds, 0, attachment);
         let [r, s] = signer.sign(&invoke.hash)?;
         invoke.body["signature"] = json!([felt_hex(&r), felt_hex(&s)]);
         Ok(invoke)
@@ -167,9 +167,10 @@ impl Gateway {
         calls: &[Call],
         nonce: Felt,
         bounds: Bounds,
+        tip: u64,
         attachment: Option<&ProofAttachment<'_>>,
     ) -> SignedInvoke {
-        self.invoke(sender, calls, nonce, bounds, attachment)
+        self.invoke(sender, calls, nonce, bounds, tip, attachment)
     }
 
     fn invoke(
@@ -178,6 +179,7 @@ impl Gateway {
         calls: &[Call],
         nonce: Felt,
         bounds: Bounds,
+        tip: u64,
         attachment: Option<&ProofAttachment<'_>>,
     ) -> SignedInvoke {
         let calldata = execute_calldata(calls);
@@ -187,7 +189,7 @@ impl Gateway {
             calldata: &calldata,
             chain_id: self.chain_id,
             nonce,
-            tip: 0,
+            tip,
             bounds,
             proof_facts,
         }
@@ -200,7 +202,7 @@ impl Gateway {
             "signature": [],
             "nonce": felt_hex(&nonce),
             "resource_bounds": bounds.gateway_json(),
-            "tip": "0x0",
+            "tip": format!("{tip:#x}"),
             "paymaster_data": [],
             "account_deployment_data": [],
             "nonce_data_availability_mode": 0,
@@ -381,7 +383,7 @@ mod tests {
         let facts = [Felt::THREE];
         let attachment = ProofAttachment { proof: "AAAA", proof_facts: &facts };
         let bounds = Bounds::default();
-        let tx = gateway.unsigned_invoke(pool, std::slice::from_ref(&call), Felt::from(4u64), bounds, Some(&attachment));
+        let tx = gateway.unsigned_invoke(pool, std::slice::from_ref(&call), Felt::from(4u64), bounds, 0, Some(&attachment));
         let calldata = execute_calldata(&[call.clone()]);
         let want = InvokeV3 {
             sender: pool,

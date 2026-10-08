@@ -61,6 +61,10 @@ pub struct SendState {
     /// which the v4 client no longer publishes).
     #[serde(default)]
     pub binding: Option<V4Binding>,
+    /// The publish goes out once the head reaches this block
+    /// (`txpolicy::publish_after`), fixed when the send is prepared.
+    #[serde(default)]
+    pub publish_after_block: Option<u64>,
 }
 
 /// The rest of a v4 send's public tuple (hex felts): the quota nullifier,
@@ -98,6 +102,7 @@ impl SendState {
             publish_nonce: None,
             publish_bounds: None,
             binding: None,
+            publish_after_block: None,
         }
     }
 

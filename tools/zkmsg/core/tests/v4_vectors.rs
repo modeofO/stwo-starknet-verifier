@@ -18,9 +18,12 @@ use starknet_types_core::felt::Felt;
 use zkmsg_core::chain::{bytearray_decode, felt_hex};
 use zkmsg_core::config::{SEPOLIA_POOL_V4, SEPOLIA_V4_SEND_PROVER, SEPOLIA_V4_VIRTUAL_SENDER};
 use zkmsg_core::crypto::{
-    envelope_key, leaf_v3, member_commit, nullifier_v4, nullifier_v4_domain, ticket_leaf,
-    ticket_null_v4_domain, ticket_nullifier, ticket_v4_domain,
+    Sealing, assemble_v2, ec_mul_gen_x, encap_deterministic, envelope_key, kem_keygen_from_seed,
+    leaf_v3, member_commit, nullifier_v4, nullifier_v4_domain, pad_v4, receive_v4,
+    seal_v2_with_nonce, ticket_leaf, ticket_null_v4_domain, ticket_nullifier, ticket_v4_domain,
+    unpad_v4,
 };
+use zkmsg_core::txpolicy::{self, TIP, TxKind};
 use zkmsg_core::invoke_v3::{Bounds, Call, InvokeV3, ResourceBounds, execute_calldata, short_string};
 use zkmsg_core::tree::MerkleTree;
 use zkmsg_core::virtual_send::{
@@ -118,8 +121,9 @@ fn build() -> Value {
         Felt::ONE,
         public.message_hash(prover),
     ];
+    let prices = (52_616_363_968_810u128, 18_090_898_182u128, 52_616u128);
     let bounds = PoolFeePolicy { max_fee: 3_000_000_000_000_000_000, max_tip: 1_000_000_000, min_l2_gas: 100_000_000 }
-        .bounds((52_616_363_968_810, 18_090_898_182, 52_616))
+        .bounds(prices)
         .unwrap();
     let publish_calldata = execute_calldata(std::slice::from_ref(&send_call));
     let publish_hash = InvokeV3 {
@@ -127,12 +131,61 @@ fn build() -> Value {
         calldata: &publish_calldata,
         chain_id: short_string("SN_SEPOLIA"),
         nonce: Felt::from(7u64),
-        tip: 0,
+        tip: TIP,
         bounds,
         proof_facts: &facts,
     }
     .hash();
     let vsender = f(SEPOLIA_V4_VIRTUAL_SENDER);
+
+    // v4 sealing: fixed randomness, one case per padding boundary.
+    let recipient_priv = Felt::from(31337u64);
+    let recipient_pub = ec_mul_gen_x(&recipient_priv);
+    let (dk, ek) = kem_keygen_from_seed(&[7u8; 64]);
+    let sealing: Vec<Value> = [0usize, 1, 254, 255, 1022, 1023, 4094]
+        .iter()
+        .map(|&n| {
+            let plaintext: Vec<u8> = (0..n).map(|i| b'a' + (i % 26) as u8).collect();
+            let padded = pad_v4(&plaintext).unwrap();
+            let encap = encap_deterministic(Sealing::V4, &Felt::from(271828u64), &recipient_pub, &ek, &[0x42u8; 32]).unwrap();
+            let blob = seal_v2_with_nonce(&encap.keys, &encap.ephemeral_pub, &[9u8; 12], &padded);
+            let sealed = assemble_v2(&encap, &blob);
+            let opened = receive_v4(&recipient_priv, &dk, &sealed.commitment, &sealed.ephemeral_pub, &sealed.content);
+            assert_eq!(opened.unwrap().unwrap(), plaintext);
+            json!({
+                "plaintext_len": n,
+                "padded_len": padded.len(),
+                "padded_hex": hex::encode(&padded),
+                "content_len": sealed.content.len(),
+                "content_hex": hex::encode(&sealed.content),
+                "commitment": felt_hex(&sealed.commitment),
+                "ephemeral_pub": felt_hex(&sealed.ephemeral_pub),
+                "content_hash": felt_hex(&sealed.content_hash),
+            })
+        })
+        .collect();
+    // Padded plaintexts a receiver must refuse.
+    let mut nonzero_tail = pad_v4(b"hello").unwrap();
+    nonzero_tail[100] = 1;
+    let mut long_len = pad_v4(b"hello").unwrap();
+    long_len[..2].copy_from_slice(&255u16.to_be_bytes());
+    let bad_padding: Vec<Value> = [("nonzero tail", nonzero_tail), ("length over bucket - 2", long_len), ("not a bucket size", vec![0u8; 300])]
+        .into_iter()
+        .map(|(why, padded)| {
+            assert!(unpad_v4(&padded).is_err(), "{why}");
+            json!({"why": why, "padded_hex": hex::encode(&padded)})
+        })
+        .collect();
+
+    let policy_bounds: Value = [TxKind::Publish, TxKind::Register, TxKind::BuyTickets]
+        .iter()
+        .map(|k| (k.name().to_string(), txpolicy::bounds(*k, prices).rpc_json()))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    let schedule: Vec<Value> = [16_257_200u64, 16_257_194, 16_257_193]
+        .iter()
+        .map(|&head| json!({"head": head, "base": txpolicy::base_block(head)}))
+        .collect();
 
     json!({
         "generator": "zkmsg-core tests/v4_vectors.rs (ZKMSG_WRITE_VECTORS=1 cargo test -p zkmsg-core --test v4_vectors)",
@@ -168,6 +221,43 @@ fn build() -> Value {
             "virtual_invoke": virtual_invoke(vsender, &[Call::new(prover, "prove_send", prove_calldata.clone())], Felt::ZERO),
             "send_message_calldata": hexes(&send_calldata),
         },
+        "sealing_v4": {
+            "hkdf": {"salt": "zkmsg-v4", "info_aead": "zkmsg-v4 aead", "info_tag": "zkmsg-v4 tag"},
+            "pad_buckets": zkmsg_core::crypto::PAD_BUCKETS,
+            "content_lens": zkmsg_core::crypto::content_lens_v4(),
+            "max_plaintext": zkmsg_core::crypto::MAX_PLAINTEXT_V4,
+            "recipient_scan_priv": felt_hex(&recipient_priv),
+            "recipient_kem_seed_byte": 7,
+            "ephemeral_priv": felt_hex(&Felt::from(271828u64)),
+            "kem_m_byte": 0x42,
+            "aead_nonce_byte": 9,
+            "plaintext": "bytes b'a' + (i % 26)",
+            "cases": sealing,
+            "bad_padding": bad_padding,
+            "receiver_rule": "a MessageSent whose tag matches but which does not open or unpad is dropped silently (front-run copies, F9)",
+        },
+        "policy": {
+            "tip": TIP,
+            "price_rule": "ceil(price * 3 / 2), rounded UP to 2 significant figures",
+            "publish_cap_rule": "if the L2 bound exceeds (max_fee - l1_data_amount*l1_data_bound)/l2_amount - tip, use that, rounded DOWN to 2 s.f.; refuse if below ceil(1.1 * l2 price)",
+            "l1_data_gas": txpolicy::L1_DATA_GAS,
+            "l2_gas": {"publish": TxKind::Publish.l2_gas(), "register": TxKind::Register.l2_gas(), "buy_tickets": TxKind::BuyTickets.l2_gas()},
+            "max_tickets_per_purchase": txpolicy::MAX_TICKETS_PER_PURCHASE,
+            "da_modes": "L1",
+            "paymaster_data": [],
+            "account_deployment_data": [],
+            "member_signature": "[r, s]",
+            "sample_prices": {"l1_gas": prices.0.to_string(), "l2_gas": prices.1.to_string(), "l1_data_gas": prices.2.to_string()},
+            "bounds": policy_bounds,
+        },
+        "schedule": {
+            "base_round": txpolicy::BASE_ROUND,
+            "base_min_age": txpolicy::BASE_MIN_AGE,
+            "publish_delay": txpolicy::PUBLISH_DELAY,
+            "publish_jitter": txpolicy::PUBLISH_JITTER,
+            "rule": "base = floor((head - 10) / 32) * 32; publish once head >= base + 90 + j, j uniform in 0..=20",
+            "examples": schedule,
+        },
         "publish": {
             "sender": felt_hex(&store),
             "nonce": "0x7",
@@ -176,6 +266,7 @@ fn build() -> Value {
             "calldata": hexes(&publish_calldata),
             "proof_facts": hexes(&facts),
             "signature": [],
+            "tip": TIP,
             "transaction_hash": felt_hex(&publish_hash),
         },
     })

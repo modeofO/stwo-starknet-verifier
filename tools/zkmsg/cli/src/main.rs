@@ -69,7 +69,8 @@ enum Command {
     /// paid by the pool, spending one of your tickets. Your account is not
     /// involved.
     Send { handle: String, text: String },
-    /// Buy single-send tickets (3 STRK each) from the profile's account.
+    /// Buy single-send tickets (3 STRK each, at most 8 per purchase) from
+    /// the profile's account, in one transaction.
     /// The secrets are saved to tickets.json (0600) before anything is sent.
     BuyTickets {
         #[arg(default_value_t = 1)]
@@ -166,8 +167,7 @@ fn cmd_send(home: &Home, handle: &str, text: &str) -> Result<()> {
 fn cmd_buy_tickets(home: &Home, count: usize) -> Result<()> {
     println!("buying {count} ticket(s) — the secrets are saved before anything is sent");
     let p = app::buy_tickets(home, count)?;
-    println!("approve tx {}", p.approve_tx);
-    println!("buy tx     {}", p.buy_tx);
+    println!("approve + buy tx {}", p.buy_tx);
     println!(
         "bought {} x {} STRK; wallet: {}",
         p.bought,
@@ -208,6 +208,10 @@ fn sink() -> impl FnMut(zkmsg_core::pipeline::PipelineEvent) {
         E::StepCompleted { kind, .. } => println!("[send] {kind:?} done"),
         E::Checkpointed { id } => println!("[send] proof saved — resumable as `zkmsg resume {id}`"),
         E::TxSubmitted { tx_hash, .. } => println!("[send] submitted {tx_hash}"),
+        E::Waiting { until_block, blocks_left } => println!(
+            "[send] proof ready — publishing in {} (at block {until_block}, the shared schedule)",
+            zkmsg_core::txpolicy::wait_label(blocks_left)
+        ),
         E::Completed => {}
     }
 }

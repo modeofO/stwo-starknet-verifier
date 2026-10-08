@@ -1,5 +1,6 @@
 //! zkmsg core — all logic behind the CLI and GUI (crypto, Merkle tree,
 //! chain driver, the SNIP-36 send, send state, config/home, inbox scan).
+pub mod account_tx;
 pub mod app;
 pub mod chain;
 pub mod config;
@@ -14,4 +15,5 @@ pub mod setup;
 pub mod state;
 pub mod tickets;
 pub mod tree;
+pub mod txpolicy;
 pub mod virtual_send;

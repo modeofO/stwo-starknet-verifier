@@ -29,6 +29,9 @@ pub struct SendFlow {
     /// The saved state's id once one exists (`Checkpointed`). A send that
     /// fails before its proof is saved has nothing to resume.
     pub checkpoint: Option<String>,
+    /// The scheduled publish's wait, `(until_block, blocks_left)` when it
+    /// started; cleared once the publish is submitted.
+    pub waiting: Option<(u64, u64)>,
 }
 
 impl SendFlow {
@@ -43,7 +46,7 @@ impl SendFlow {
             })
             .collect();
         let published = !state.steps.is_empty() && state.steps.iter().all(|s| s.done);
-        Self { steps, error: None, published, checkpoint: None }
+        Self { steps, error: None, published, checkpoint: None, waiting: None }
     }
 
     /// The checklist, before Prepare has produced a state.
@@ -52,7 +55,7 @@ impl SendFlow {
             .into_iter()
             .map(|kind| StepView { kind, status: StepStatus::Pending, tx_hash: None })
             .collect();
-        Self { steps, error: None, published: false, checkpoint: None }
+        Self { steps, error: None, published: false, checkpoint: None, waiting: None }
     }
 
     /// The first not-yet-Done step matching `kind` — plans can repeat a
@@ -71,6 +74,7 @@ impl SendFlow {
                 }
             }
             PipelineEvent::TxSubmitted { kind, tx_hash } => {
+                self.waiting = None;
                 if let Some(step) = self.find_pending_mut(&kind) {
                     step.tx_hash = Some(tx_hash);
                 }
@@ -92,6 +96,9 @@ impl SendFlow {
                 self.published = true;
             }
             PipelineEvent::Checkpointed { id } => self.checkpoint = Some(id),
+            PipelineEvent::Waiting { until_block, blocks_left } => {
+                self.waiting = Some((until_block, blocks_left));
+            }
         }
     }
 

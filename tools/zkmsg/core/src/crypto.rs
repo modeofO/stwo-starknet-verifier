@@ -86,6 +86,9 @@ pub const MIN_CONTENT_V2_LEN: usize = KEM_CT_LEN + NONCE_LEN + 16;
 const HKDF_SALT_V2: &[u8] = b"zkmsg-v2";
 const HKDF_INFO_AEAD_V2: &[u8] = b"zkmsg-v2 aead";
 const HKDF_INFO_TAG_V2: &[u8] = b"zkmsg-v2 tag";
+const HKDF_SALT_V4: &[u8] = b"zkmsg-v4";
+const HKDF_INFO_AEAD_V4: &[u8] = b"zkmsg-v4 aead";
+const HKDF_INFO_TAG_V4: &[u8] = b"zkmsg-v4 tag";
 
 /// The leaf domain tag: Cairo short string 'zkmsg-leaf-v2'.
 pub fn leaf_v2_domain() -> Felt {
@@ -153,6 +156,23 @@ pub struct HybridKeys {
     pub tag: Felt,
 }
 
+/// Which key schedule: v2's labels, or v4's (same construction, labels
+/// "zkmsg-v4", so a v4 ciphertext never opens as a v2/v3 one or back).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sealing {
+    V2,
+    V4,
+}
+
+impl Sealing {
+    fn labels(self) -> (&'static [u8], &'static [u8], &'static [u8]) {
+        match self {
+            Self::V2 => (HKDF_SALT_V2, HKDF_INFO_AEAD_V2, HKDF_INFO_TAG_V2),
+            Self::V4 => (HKDF_SALT_V4, HKDF_INFO_AEAD_V4, HKDF_INFO_TAG_V4),
+        }
+    }
+}
+
 pub fn derive_v2(
     ss_kem: &[u8; 32],
     ss_ec: &Felt,
@@ -160,6 +180,18 @@ pub fn derive_v2(
     recipient_scan_pub: &Felt,
     kem_ct: &[u8],
 ) -> HybridKeys {
+    derive(Sealing::V2, ss_kem, ss_ec, ephemeral_pub, recipient_scan_pub, kem_ct)
+}
+
+pub fn derive(
+    sealing: Sealing,
+    ss_kem: &[u8; 32],
+    ss_ec: &Felt,
+    ephemeral_pub: &Felt,
+    recipient_scan_pub: &Felt,
+    kem_ct: &[u8],
+) -> HybridKeys {
+    let (salt, info_aead, info_tag) = sealing.labels();
     let mut ikm = Vec::with_capacity(160);
     ikm.extend_from_slice(ss_kem);
     ikm.extend_from_slice(&ss_ec.to_bytes_be());
@@ -167,11 +199,11 @@ pub fn derive_v2(
     ikm.extend_from_slice(&recipient_scan_pub.to_bytes_be());
     ikm.extend_from_slice(&Sha3_256::digest(kem_ct));
 
-    let (prk, hk) = Hkdf::<Sha256>::extract(Some(HKDF_SALT_V2), &ikm);
+    let (prk, hk) = Hkdf::<Sha256>::extract(Some(salt), &ikm);
     let mut k = [0u8; 32];
-    hk.expand(HKDF_INFO_AEAD_V2, &mut k).expect("32 bytes is a valid HKDF length");
+    hk.expand(info_aead, &mut k).expect("32 bytes is a valid HKDF length");
     let mut tag = [0u8; 31];
-    hk.expand(HKDF_INFO_TAG_V2, &mut tag).expect("31 bytes is a valid HKDF length");
+    hk.expand(info_tag, &mut tag).expect("31 bytes is a valid HKDF length");
     HybridKeys {
         prk: prk.into(),
         k,
@@ -201,6 +233,16 @@ pub fn encap_v2_deterministic(
     recipient_ek: &[u8],
     m: &[u8; 32],
 ) -> Result<EncapV2> {
+    encap_deterministic(Sealing::V2, ephemeral_priv, recipient_scan_pub, recipient_ek, m)
+}
+
+pub fn encap_deterministic(
+    sealing: Sealing,
+    ephemeral_priv: &Felt,
+    recipient_scan_pub: &Felt,
+    recipient_ek: &[u8],
+    m: &[u8; 32],
+) -> Result<EncapV2> {
     let ek_bytes: &[u8; KEM_EK_LEN] = recipient_ek
         .try_into()
         .map_err(|_| anyhow!("KEM public key must be {KEM_EK_LEN} bytes, got {}", recipient_ek.len()))?;
@@ -212,17 +254,21 @@ pub fn encap_v2_deterministic(
     let ss_ec = ecdh_shared_x(ephemeral_priv, recipient_scan_pub)?;
     let ss_kem: [u8; 32] = ss.into();
     let kem_ct = ct.to_vec();
-    let keys = derive_v2(&ss_kem, &ss_ec, &ephemeral_pub, recipient_scan_pub, &kem_ct);
+    let keys = derive(sealing, &ss_kem, &ss_ec, &ephemeral_pub, recipient_scan_pub, &kem_ct);
     Ok(EncapV2 { ephemeral_pub, kem_ct, ss_kem, ss_ec, keys })
 }
 
-/// Encapsulates with fresh randomness. Returns the ephemeral scalar too:
-/// the v2 prover does not need it, but callers may log or discard it.
+/// Encapsulates with fresh randomness (v2 labels).
 pub fn encap_v2(recipient_scan_pub: &Felt, recipient_ek: &[u8]) -> Result<EncapV2> {
+    encap(Sealing::V2, recipient_scan_pub, recipient_ek)
+}
+
+/// Encapsulates with fresh randomness under `sealing`'s labels.
+pub fn encap(sealing: Sealing, recipient_scan_pub: &Felt, recipient_ek: &[u8]) -> Result<EncapV2> {
     let (ephemeral_priv, _) = scan_keygen();
     let mut m = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut m);
-    encap_v2_deterministic(&ephemeral_priv, recipient_scan_pub, recipient_ek, &m)
+    encap_deterministic(sealing, &ephemeral_priv, recipient_scan_pub, recipient_ek, &m)
 }
 
 /// Recipient side: recomputes the key schedule for one event. ML-KEM
@@ -234,13 +280,23 @@ pub fn decap_tag_v2(
     ephemeral_pub: &Felt,
     kem_ct: &[u8],
 ) -> Result<HybridKeys> {
+    decap_tag(Sealing::V2, scan_priv, dk, ephemeral_pub, kem_ct)
+}
+
+pub fn decap_tag(
+    sealing: Sealing,
+    scan_priv: &Felt,
+    dk: &DecapsulationKey768,
+    ephemeral_pub: &Felt,
+    kem_ct: &[u8],
+) -> Result<HybridKeys> {
     let ct: &[u8; KEM_CT_LEN] = kem_ct
         .try_into()
         .map_err(|_| anyhow!("KEM ciphertext must be {KEM_CT_LEN} bytes, got {}", kem_ct.len()))?;
     let ss_kem: [u8; 32] = dk.decapsulate(&(*ct).into()).into();
     let ss_ec = ecdh_shared_x(scan_priv, ephemeral_pub)?;
     let own_scan_pub = ec_mul_gen_x(scan_priv);
-    Ok(derive_v2(&ss_kem, &ss_ec, ephemeral_pub, &own_scan_pub, kem_ct))
+    Ok(derive(sealing, &ss_kem, &ss_ec, ephemeral_pub, &own_scan_pub, kem_ct))
 }
 
 fn aad_v2(tag: &Felt, ephemeral_pub: &Felt) -> [u8; 64] {
@@ -335,6 +391,86 @@ pub fn receive_v2(
         return None;
     }
     Some(open_v2(&keys, ephemeral_pub, blob))
+}
+
+// ---------------------------------------------------------------------------
+// v4 sealing: v2's hybrid construction under "zkmsg-v4" labels, with the
+// plaintext padded to a fixed bucket inside the AEAD so the on-chain length
+// says only which bucket:
+//
+//   padded  = len(plaintext) as u16 BE ‖ plaintext ‖ zeros, |padded| ∈ PAD_BUCKETS
+//   blob    = nonce(12) ‖ AES-256-GCM(k, nonce, padded, aad = tag ‖ E) ‖ tag16
+//   content = kem_ct(1088) ‖ blob   → 1372, 2140 or 5212 bytes
+//
+// The smallest bucket that fits is used; a plaintext over 4094 bytes is
+// refused. Opening requires the length to fit the bucket and every
+// trailing byte to be zero.
+// ---------------------------------------------------------------------------
+
+/// The sizes `padded` may have.
+pub const PAD_BUCKETS: [usize; 3] = [256, 1024, 4096];
+/// The longest plaintext: the top bucket less the u16 length prefix.
+pub const MAX_PLAINTEXT_V4: usize = 4096 - 2;
+/// Content bytes beyond `padded`: kem_ct, nonce, GCM tag.
+pub const CONTENT_OVERHEAD_V4: usize = KEM_CT_LEN + NONCE_LEN + 16;
+
+/// The on-chain content lengths a v4 send may have.
+pub fn content_lens_v4() -> [usize; 3] {
+    PAD_BUCKETS.map(|b| b + CONTENT_OVERHEAD_V4)
+}
+
+pub fn pad_v4(plaintext: &[u8]) -> Result<Vec<u8>> {
+    let bucket = PAD_BUCKETS
+        .iter()
+        .copied()
+        .find(|b| plaintext.len() + 2 <= *b)
+        .ok_or_else(|| anyhow!("message is {} bytes; at most {MAX_PLAINTEXT_V4} fit", plaintext.len()))?;
+    let mut padded = Vec::with_capacity(bucket);
+    padded.extend_from_slice(&(plaintext.len() as u16).to_be_bytes());
+    padded.extend_from_slice(plaintext);
+    padded.resize(bucket, 0);
+    Ok(padded)
+}
+
+pub fn unpad_v4(padded: &[u8]) -> Result<Vec<u8>> {
+    if !PAD_BUCKETS.contains(&padded.len()) {
+        bail!("padded plaintext is {} bytes, not a bucket size", padded.len());
+    }
+    let len = u16::from_be_bytes([padded[0], padded[1]]) as usize;
+    if len > padded.len() - 2 {
+        bail!("padding length {len} overruns the {}-byte bucket", padded.len());
+    }
+    if padded[2 + len..].iter().any(|b| *b != 0) {
+        bail!("padding is not all zero");
+    }
+    Ok(padded[2..2 + len].to_vec())
+}
+
+/// Encapsulate (v4 labels), pad, seal and assemble `content = kem_ct ‖ blob`.
+pub fn send_v4(recipient_scan_pub: &Felt, recipient_ek: &[u8], plaintext: &[u8]) -> Result<SealedV2> {
+    let padded = pad_v4(plaintext)?;
+    let encap = encap(Sealing::V4, recipient_scan_pub, recipient_ek)?;
+    let blob = seal_v2(&encap.keys, &encap.ephemeral_pub, &padded);
+    Ok(assemble_v2(&encap, &blob))
+}
+
+/// Detect and decrypt one v4 `MessageSent` event. `None`: not ours.
+/// `Some(Err)`: the tag matched but the blob did not open or unpad — which
+/// is what a front-run copy of someone's commitment over other content
+/// looks like; the inbox drops it.
+pub fn receive_v4(
+    scan_priv: &Felt,
+    dk: &DecapsulationKey768,
+    commitment: &Felt,
+    ephemeral_pub: &Felt,
+    content: &[u8],
+) -> Option<Result<Vec<u8>>> {
+    let (kem_ct, blob) = split_content_v2(content).ok()?;
+    let keys = decap_tag(Sealing::V4, scan_priv, dk, ephemeral_pub, kem_ct).ok()?;
+    if keys.tag != *commitment {
+        return None;
+    }
+    Some(open_v2(&keys, ephemeral_pub, blob).and_then(|padded| unpad_v4(&padded)))
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +766,48 @@ mod tests {
     }
 
     // --- v3 ----------------------------------------------------------------
+
+    #[test]
+    fn v4_pad_round_trips_and_boundaries() {
+        for (n, bucket) in [(0, 256), (1, 256), (254, 256), (255, 1024), (1022, 1024), (1023, 4096), (4094, 4096)] {
+            let text = vec![0xa5u8; n];
+            let padded = pad_v4(&text).unwrap();
+            assert_eq!(padded.len(), bucket, "{n} bytes");
+            assert_eq!(unpad_v4(&padded).unwrap(), text);
+        }
+        assert!(pad_v4(&[0u8; 4095]).unwrap_err().to_string().contains("4094"));
+        assert_eq!(content_lens_v4(), [1372, 2140, 5212]);
+    }
+
+    #[test]
+    fn v4_malformed_padding_is_refused() {
+        let mut padded = pad_v4(b"hello").unwrap();
+        padded[100] = 1;
+        assert!(unpad_v4(&padded).is_err(), "nonzero trailing byte");
+        let mut padded = pad_v4(b"hello").unwrap();
+        padded[..2].copy_from_slice(&255u16.to_be_bytes());
+        assert!(unpad_v4(&padded).is_err(), "length past bucket - 2");
+        assert!(unpad_v4(&[0u8; 300]).is_err(), "not a bucket size");
+        assert!(unpad_v4(&[0u8; 1]).is_err());
+    }
+
+    #[test]
+    fn v4_round_trip_and_label_separation() {
+        let (scan_priv, scan_pub, dk, ek) = alice_v2();
+        let sealed = send_v4(&scan_pub, &ek, b"padded hello").unwrap();
+        assert_eq!(sealed.content.len(), 1372);
+        let opened = receive_v4(&scan_priv, &dk, &sealed.commitment, &sealed.ephemeral_pub, &sealed.content);
+        assert_eq!(opened.unwrap().unwrap(), b"padded hello");
+        // A v4 envelope is not a v2 one, and back.
+        assert!(receive_v2(&scan_priv, &dk, &sealed.commitment, &sealed.ephemeral_pub, &sealed.content).is_none());
+        let v2 = send_v2(&scan_pub, &ek, b"old").unwrap();
+        assert!(receive_v4(&scan_priv, &dk, &v2.commitment, &v2.ephemeral_pub, &v2.content).is_none());
+        // Same tag, other content (a front-run copy): matched, refuses to open.
+        let mut forged = sealed.content.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert!(receive_v4(&scan_priv, &dk, &sealed.commitment, &sealed.ephemeral_pub, &forged).unwrap().is_err());
+    }
 
     #[test]
     fn v3_domains() {

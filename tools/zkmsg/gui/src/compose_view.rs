@@ -346,6 +346,13 @@ impl ProfileSession {
         if flow.steps.iter().any(|s| s.kind == StepKind::Prove && s.status == StepStatus::Running) {
             ui.label("proving takes ~20 s on an M-series Mac");
         }
+        if let Some((until_block, blocks_left)) = flow.waiting {
+            ui.label(format!(
+                "proof ready — publishing in {} (block {until_block}): every client waits the \
+                 same random 90–110 blocks after its proof's base block",
+                zkmsg_core::txpolicy::wait_label(blocks_left)
+            ));
+        }
 
         let has_failed = flow.steps.iter().any(|s| s.status == StepStatus::Failed);
         let is_done = flow.published;

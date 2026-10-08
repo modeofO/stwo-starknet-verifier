@@ -154,12 +154,14 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
         Err(e) => return Err(e.context("checking whether the handle is registered")),
     };
     let tx_hash = if already.is_none() {
-        let mut calldata = vec![felt_hex(&handle_felt), keys.scan_pub.clone()];
-        calldata.extend(bytearray_calldata(&ek));
-        calldata.push(felt_hex(&m_commit));
-        let tx = chain.invoke(&config.store, "register", &calldata, &Default::default())?;
-        chain.wait_receipt(&tx, std::time::Duration::from_secs(600))?;
-        Some(tx)
+        let mut calldata = vec![handle_felt, keys.scan_pub_felt()?];
+        for word in bytearray_calldata(&ek) {
+            calldata.push(Felt::from_hex(&word)?);
+        }
+        calldata.push(m_commit);
+        let call = crate::invoke_v3::Call::new(Felt::from_hex(&config.store)?, "register", calldata);
+        // Signed natively under the shared policy, like every client's.
+        Some(crate::account_tx::send(&chain, &config.account, &[call], crate::txpolicy::TxKind::Register)?)
     } else {
         None
     };
@@ -314,7 +316,7 @@ pub fn resume_send(
 /// What `buy_tickets` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketPurchase {
-    pub approve_tx: String,
+    /// The one `[approve, buy_tickets]` transaction.
     pub buy_tx: String,
     pub bought: usize,
     pub price_fri: u128,
@@ -324,13 +326,15 @@ pub struct TicketPurchase {
 }
 
 /// Buys `n` single-send tickets from the pool with the profile's account:
-/// fresh secrets are written to `tickets.json` (0600) first, then the STRK
-/// approval and `buy_tickets(leaves)`. The purchase shows the account
-/// bought tickets; nothing on chain ties a later send to them.
+/// fresh secrets are written to `tickets.json` (0600) first, then ONE
+/// natively signed `[approve, buy_tickets(leaves)]` transaction under the
+/// shared policy. The purchase shows the account bought tickets; nothing
+/// on chain ties a later send to them.
 pub fn buy_tickets(home: &Home, n: usize) -> Result<TicketPurchase> {
     let config = home.load_config()?;
     ensure!(is_current_store(&config.store), "{} is not the v4 pool — `zkmsg migrate-store` first", config.store);
-    ensure!((1..=crate::tickets::MAX_TICKETS_PER_BUY).contains(&n), "buy 1..={} tickets at a time", crate::tickets::MAX_TICKETS_PER_BUY);
+    let max = crate::txpolicy::MAX_TICKETS_PER_PURCHASE;
+    ensure!((1..=max).contains(&n), "buy 1..={max} tickets at a time");
     let chain = Chain::new(&config.rpc_url, &config.account);
     let price_fri = {
         let out = chain.call(&config.store, "ticket_price", &[])?;
@@ -344,26 +348,21 @@ pub fn buy_tickets(home: &Home, n: usize) -> Result<TicketPurchase> {
     // Bearer value: on disk before any transaction can make it real.
     wallet.save(home)?;
 
-    let approve_tx = chain.invoke(
-        STRK_TOKEN,
-        "approve",
-        &[config.store.clone(), format!("{total:#x}"), "0x0".into()],
-        &Default::default(),
-    )?;
-    chain.wait_receipt(&approve_tx, std::time::Duration::from_secs(600))?;
-    let mut calldata = vec![format!("{n:#x}")];
-    calldata.extend(leaves.iter().map(felt_hex));
-    let buy_tx = chain.invoke(&config.store, "buy_tickets", &calldata, &Default::default())?;
+    let pool = Felt::from_hex(&config.store)?;
+    let approve = crate::invoke_v3::Call::new(Felt::from_hex(STRK_TOKEN)?, "approve", vec![pool, Felt::from(total), Felt::ZERO]);
+    let mut leaves_calldata = vec![Felt::from(n as u64)];
+    leaves_calldata.extend_from_slice(&leaves);
+    let buy = crate::invoke_v3::Call::new(pool, "buy_tickets", leaves_calldata);
+    let buy_tx = crate::account_tx::send(&chain, &config.account, &[approve, buy], crate::txpolicy::TxKind::BuyTickets)?;
     for t in &mut wallet.tickets[first..] {
         t.buy_tx = Some(buy_tx.clone());
     }
     wallet.save(home)?;
-    chain.wait_receipt(&buy_tx, std::time::Duration::from_secs(600))?;
 
     let tree = TicketTree::fetch(&chain, &config.store, None)?;
     wallet.settle(&tree)?;
     wallet.save(home)?;
-    Ok(TicketPurchase { approve_tx, buy_tx, bought: n, price_fri, counts: wallet.counts() })
+    Ok(TicketPurchase { buy_tx, bought: n, price_fri, counts: wallet.counts() })
 }
 
 /// Settles pending purchases against ALL of the pool's ticket purchases

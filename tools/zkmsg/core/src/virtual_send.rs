@@ -60,7 +60,7 @@ use starknet_types_core::felt::Felt;
 use crate::chain::{Chain, bytearray_calldata, felt_hex, felt_to_u64, snkeccak};
 use crate::config::{Config, Home, Keys, is_current_store};
 use crate::crypto::{
-    kem_digest, leaf_v3, member_commit, nullifier_v4, send_v2, ticket_leaf, ticket_nullifier,
+    kem_digest, leaf_v3, member_commit, nullifier_v4, send_v4, ticket_leaf, ticket_nullifier,
 };
 use crate::invoke_v3::{Bounds, Call, ResourceBounds, execute_calldata};
 use crate::pipeline::PipelineEvent;
@@ -68,6 +68,7 @@ use crate::registry::Registry;
 use crate::sequencer::{Gateway, GatewayError, ProofAttachment};
 use crate::state::{SendState, StepKind, V4Binding};
 use crate::tickets::{QuotaLog, TicketState, TicketTree, Wallet};
+use crate::txpolicy::{self, TIP};
 use crate::tree::fold_path;
 
 /// The contracts a v4 send is bound to. The pool pins the prover; the
@@ -320,10 +321,6 @@ pub struct PoolFeePolicy {
     pub min_l2_gas: u64,
 }
 
-/// L1 data gas of a publish: measured 384 on devnet and Sepolia; the same
-/// constant on every client so the bounds don't fingerprint one.
-pub const PUBLISH_L1_DATA_GAS: u64 = 4_096;
-
 impl PoolFeePolicy {
     /// `fee_policy()` returns `(max_fee: u128, max_tip: u128, min_l2_gas: u64)`.
     pub fn from_felts(felts: &[Felt]) -> Result<Self> {
@@ -336,41 +333,10 @@ impl PoolFeePolicy {
         Ok(Self { max_fee: u128_of(&felts[0])?, max_tip: u128_of(&felts[1])?, min_l2_gas: felt_to_u64(&felts[2])? })
     }
 
-    /// Bounds within the policy at the latest prices `(l1, l2, l1_data)`:
-    /// L2 gas exactly `min_l2_gas` (≈ 25% over a measured publish), its price
-    /// up to 2× the current one but never past what `max_fee` leaves, no tip.
-    /// Refuses when that cap is under 1.1× the current price: the publish
-    /// would sit unincluded.
-    pub fn bounds(&self, (l1, l2, l1_data): (u128, u128, u128)) -> Result<Bounds> {
-        let l1_data_gas = ResourceBounds {
-            max_amount: PUBLISH_L1_DATA_GAS,
-            max_price_per_unit: l1_data.saturating_mul(3) / 2,
-        };
-        let room = self
-            .max_fee
-            .checked_sub(PUBLISH_L1_DATA_GAS as u128 * l1_data_gas.max_price_per_unit)
-            .context("L1 data gas alone exceeds the pool's fee cap")?;
-        let cap = room / self.min_l2_gas as u128;
-        ensure!(
-            cap >= l2.saturating_mul(11) / 10,
-            "L2 gas costs {l2} fri now; a ticket covers at most {cap} — wait for cheaper gas",
-        );
-        let bounds = Bounds {
-            l1_gas: ResourceBounds { max_amount: 0, max_price_per_unit: l1.saturating_mul(3) / 2 },
-            l2_gas: ResourceBounds { max_amount: self.min_l2_gas, max_price_per_unit: cap.min(l2.saturating_mul(2)) },
-            l1_data_gas,
-        };
-        ensure!(fee_ceiling_fri(&bounds) <= self.max_fee, "bounds exceed the pool's fee cap");
-        Ok(bounds)
+    /// Publish bounds per the shared policy (`txpolicy::publish_bounds`).
+    pub fn bounds(&self, prices: (u128, u128, u128)) -> Result<Bounds> {
+        crate::txpolicy::publish_bounds(prices, self.max_fee, self.max_tip, self.min_l2_gas)
     }
-}
-
-/// The most a transaction with `bounds` (and no tip) can be charged.
-pub fn fee_ceiling_fri(bounds: &Bounds) -> u128 {
-    [bounds.l1_gas, bounds.l2_gas, bounds.l1_data_gas]
-        .iter()
-        .map(|b| (b.max_amount as u128).saturating_mul(b.max_price_per_unit))
-        .fold(0u128, u128::saturating_add)
 }
 
 /// Runs `snip36-prove` on one virtual transaction at `block`. The request
@@ -446,6 +412,8 @@ pub fn run_prover(
 // --- the executor -----------------------------------------------------------
 
 const PUBLISH_POLL: Duration = Duration::from_secs(5);
+/// How often the scheduled publish re-reads the head while it waits.
+const SCHEDULE_POLL: Duration = Duration::from_secs(6);
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(1800);
 const TOO_RECENT_WAIT: Duration = Duration::from_secs(10);
 const PUBLISH_ATTEMPTS: usize = 12;
@@ -522,6 +490,7 @@ impl<'a> VirtualSender<'a> {
             block,
         );
         state.binding = Some(p.public.binding());
+        state.publish_after_block = Some(txpolicy::publish_after(block, txpolicy::jitter()));
         state.mark_done(0, None, Some(format!("block {block}, epoch {}", p.public.epoch)));
         sink(PipelineEvent::StepCompleted { kind: StepKind::Prepare, tx_hash: None, note: None });
 
@@ -573,6 +542,8 @@ impl<'a> VirtualSender<'a> {
     /// so the RPC can't tell who is sending to whom, or with which ticket.
     fn prepare(&self, keys: &Keys, handle: &str, text: &str) -> Result<Prepared> {
         let sender_handle = keys.handle.as_deref().context("not registered — run `zkmsg register`")?;
+        // Refuse an over-long message before any slot or ticket is taken.
+        crate::crypto::pad_v4(text.as_bytes())?;
         let scan_pub = keys.scan_pub_felt()?;
         let own_digest = kem_digest(&keys.kem_keypair()?.1);
         let member_secret = keys.member_secret_felt()?;
@@ -613,7 +584,7 @@ impl<'a> VirtualSender<'a> {
         let nonce = self.virtual_nonce(block)?;
         let slot = QuotaLog::take_slot(self.home, &store, epoch, quota)?;
 
-        let sealed = send_v2(&recipient.scan_pub, &recipient.kem_pubkey, text.as_bytes())?;
+        let sealed = send_v4(&recipient.scan_pub, &recipient.kem_pubkey, text.as_bytes())?;
         let public = PublicV4 {
             store: self.route.store,
             commitment: sealed.commitment,
@@ -656,7 +627,8 @@ impl<'a> VirtualSender<'a> {
         let store = self.store_hex();
         let mut mismatch = String::new();
         for _ in 0..2 {
-            let block = self.block_number()?;
+            // The shared schedule's base: a multiple of 32, ≥ 10 behind the head.
+            let block = txpolicy::base_block(self.block_number()?);
             let registry = Registry::fetch(&self.chain, &store, Some(block))?;
             let root = self.store_felt("get_merkle_root", &[], Some(block))?;
             let tickets = TicketTree::fetch(&self.chain, &store, Some(block))?;
@@ -726,6 +698,12 @@ impl<'a> VirtualSender<'a> {
             }
         }
 
+        // The shared schedule: never before base + 90..110 blocks, however
+        // fast this device proved.
+        if let Some(target) = state.publish_after_block {
+            wait_for_head(target, || self.block_number(), std::thread::sleep, SCHEDULE_POLL, sink)?;
+        }
+
         let known = self.store_felt("is_known_root", &[public.root], None)?;
         if known != Felt::ONE {
             self.release_ticket(&public);
@@ -762,6 +740,7 @@ impl<'a> VirtualSender<'a> {
                 std::slice::from_ref(&call),
                 nonce,
                 bounds,
+                TIP,
                 Some(&attachment),
             );
             let hex = felt_hex(&tx.hash);
@@ -956,6 +935,28 @@ impl<'a> VirtualSender<'a> {
     }
 }
 
+/// Waits until `head()` reaches `target`, reporting the wait once.
+fn wait_for_head(
+    target: u64,
+    mut head: impl FnMut() -> Result<u64>,
+    mut sleep: impl FnMut(Duration),
+    poll: Duration,
+    sink: &mut dyn FnMut(PipelineEvent),
+) -> Result<()> {
+    let mut reported = false;
+    loop {
+        let now = head()?;
+        if now >= target {
+            return Ok(());
+        }
+        if !reported {
+            sink(PipelineEvent::Waiting { until_block: target, blocks_left: target - now });
+            reported = true;
+        }
+        sleep(poll);
+    }
+}
+
 /// A rejection over the pool's nonce: stale (`INVALID_TRANSACTION_NONCE`) or
 /// already taken by a pending send (a duplicate in the mempool).
 fn is_nonce_rejection(e: &GatewayError) -> bool {
@@ -1089,29 +1090,36 @@ mod tests {
     }
 
     #[test]
-    fn pool_fee_bounds_stay_within_the_ticket() {
+    fn pool_fee_policy_reads_and_bounds() {
         let policy = PoolFeePolicy { max_fee: 3_000_000_000_000_000_000, max_tip: 1_000_000_000, min_l2_gas: 100_000_000 };
         assert_eq!(
             PoolFeePolicy::from_felts(&[Felt::from(policy.max_fee), Felt::from(policy.max_tip), Felt::from(policy.min_l2_gas)]).unwrap(),
             policy
         );
-        // Sepolia 2026-10-07: l2 18.09 gfri, l1 52,616 gfri, l1 data 52,616 fri.
-        let prices = (52_616_363_968_810, 18_090_898_182, 52_616);
-        let b = policy.bounds(prices).unwrap();
-        assert_eq!(b.l2_gas.max_amount, 100_000_000);
-        assert_eq!(b.l1_gas.max_amount, 0);
-        // 2x would be 36.2 gfri: the ticket caps it at ~30 (1.66x).
-        assert_eq!(b.l2_gas.max_price_per_unit, 29_999_999_996);
-        assert!(fee_ceiling_fri(&b) <= policy.max_fee);
-        // Cheap gas: 2x.
-        let b = policy.bounds((0, 10_000_000_000, 0)).unwrap();
-        assert_eq!(b.l2_gas.max_price_per_unit, 20_000_000_000);
-        // Pricier gas: capped by the ticket, still above 1.1x.
-        let b = policy.bounds((0, 25_000_000_000, 0)).unwrap();
-        assert_eq!(b.l2_gas.max_price_per_unit, 30_000_000_000);
-        assert!(fee_ceiling_fri(&b) <= policy.max_fee);
-        // Too pricey for the ticket: refused before anything is sent.
-        assert!(policy.bounds((0, 28_000_000_000, 0)).is_err());
+        let b = policy.bounds((52_616_363_968_810, 18_090_898_182, 52_616)).unwrap();
+        assert_eq!(b, txpolicy::bounds(txpolicy::TxKind::Publish, (52_616_363_968_810, 18_090_898_182, 52_616)));
+    }
+
+    #[test]
+    fn the_publish_waits_for_its_block() {
+        let heads = std::cell::RefCell::new(vec![100u64, 104, 109, 110, 111]);
+        let mut slept = 0;
+        let mut events = vec![];
+        wait_for_head(
+            110,
+            || Ok(heads.borrow_mut().remove(0)),
+            |_| slept += 1,
+            Duration::ZERO,
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+        assert_eq!(slept, 3);
+        assert_eq!(events.len(), 1, "reported once");
+        assert!(matches!(events[0], PipelineEvent::Waiting { until_block: 110, blocks_left: 10 }));
+        // Already past: no wait, no event.
+        let mut events = vec![];
+        wait_for_head(110, || Ok(200), |_| panic!("no sleep"), Duration::ZERO, &mut |e| events.push(e)).unwrap();
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1154,6 +1162,8 @@ mod tests {
     type Log = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
 
     const BLOCK: u64 = 16_000_123;
+    /// `txpolicy::base_block(BLOCK)`.
+    const BASE: u64 = 16_000_096;
     const EPOCH_BLOCKS: u64 = 5_000;
     const QUOTA: u32 = 2;
 
@@ -1182,7 +1192,7 @@ mod tests {
             Ok(match method {
                 "starknet_blockNumber" => json!(BLOCK),
                 "starknet_getEvents" => {
-                    assert_eq!(params[0]["to_block"], json!({"block_number": BLOCK}), "events must stop at N");
+                    assert_eq!(params[0]["to_block"], json!({"block_number": BASE}), "events must stop at N");
                     let key = params[0]["keys"][0][0].as_str().unwrap().to_string();
                     if key == felt_hex(&snkeccak("UserRegistered")) {
                         as_events(&fake.members)
@@ -1270,8 +1280,8 @@ mod tests {
         let w = world("egress");
         let (sender, log) = fake_sender(&w.home, w.fake);
         let p = sender.prepare(&w.alice, "carol", "hi carol").unwrap();
-        assert_eq!(p.block, BLOCK);
-        assert_eq!(p.public.epoch, BLOCK / EPOCH_BLOCKS);
+        assert_eq!(p.block, BASE, "proved on the schedule's base block");
+        assert_eq!(p.public.epoch, BASE / EPOCH_BLOCKS);
         assert_eq!(p.public.quota, QUOTA);
         // The witness: alice's leaf 0, slot 0, ticket at index 1.
         assert_eq!(p.prove_calldata[11], Felt::ZERO, "slot");
