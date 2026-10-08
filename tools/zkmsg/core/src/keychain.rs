@@ -61,6 +61,18 @@ impl KeyStore for SecurityCli {
         use std::io::Write;
         check_token(service)?;
         check_token(account)?;
+        // With no default keychain (e.g. HOME pointed elsewhere), `add`
+        // raises a system dialog whose "Reset to defaults" button would wipe
+        // the real login keychain. Refuse instead.
+        let default = std::process::Command::new(SECURITY)
+            .arg("default-keychain")
+            .output()
+            .context("running /usr/bin/security")?;
+        ensure!(
+            default.status.success(),
+            "no default keychain for this user (is HOME set to another directory?): {}",
+            String::from_utf8_lossy(&default.stderr).trim()
+        );
         let mut child = std::process::Command::new(SECURITY)
             .arg("-i")
             .stdin(std::process::Stdio::piped())
