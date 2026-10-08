@@ -67,7 +67,7 @@ use crate::pipeline::PipelineEvent;
 use crate::registry::Registry;
 use crate::sequencer::{Gateway, GatewayError, ProofAttachment};
 use crate::state::{SendState, StepKind, V4Binding};
-use crate::tickets::{QuotaLog, TicketState, TicketTree, Wallet};
+use crate::tickets::{QuotaLog, TicketNotInTreeYet, TicketState, TicketTree, Wallet};
 use crate::txpolicy::{self, TIP};
 use crate::tree::fold_path;
 
@@ -414,6 +414,8 @@ pub fn run_prover(
 const PUBLISH_POLL: Duration = Duration::from_secs(5);
 /// How often the scheduled publish re-reads the head while it waits.
 const SCHEDULE_POLL: Duration = Duration::from_secs(6);
+/// Prepare retries (× SCHEDULE_POLL) for a ticket younger than the base.
+const TICKET_WAIT_TRIES: usize = 20;
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(1800);
 const TOO_RECENT_WAIT: Duration = Duration::from_secs(10);
 const PUBLISH_ATTEMPTS: usize = 12;
@@ -480,7 +482,18 @@ impl<'a> VirtualSender<'a> {
 
         // 1. Prepare, all at one block. Takes a quota slot and reserves a ticket.
         sink(PipelineEvent::StepStarted { index: 0, total, kind: StepKind::Prepare });
-        let p = self.prepare(keys, handle, text)?;
+        // A ticket bought moments ago enters the tree after the base block:
+        // wait for the base to catch up (≈1 min) rather than fail.
+        let mut tries = 0;
+        let p = loop {
+            match self.prepare(keys, handle, text) {
+                Err(e) if tries < TICKET_WAIT_TRIES && e.downcast_ref::<TicketNotInTreeYet>().is_some() => {
+                    tries += 1;
+                    std::thread::sleep(SCHEDULE_POLL);
+                }
+                other => break other?,
+            }
+        };
         let block = p.block;
         let mut state = SendState::new_virtual_plan(
             p.id.clone(),

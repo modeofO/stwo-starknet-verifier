@@ -183,6 +183,9 @@ impl Wallet {
             }
         }
         let c = self.counts();
+        if c.unspent > 0 {
+            return Err(TicketNotInTreeYet { unspent: c.unspent }.into());
+        }
         bail!(
             "no unspent ticket ({} reserved, {} pending, {} spent) — buy one with `zkmsg buy-tickets`",
             c.reserved,
@@ -218,6 +221,27 @@ impl Wallet {
         }
     }
 }
+
+/// Every unspent ticket was bought after the block the send proves on (the
+/// schedule's base trails the head by 10–41 blocks): a fresh purchase is
+/// usable a minute later. The sender waits on this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TicketNotInTreeYet {
+    pub unspent: usize,
+}
+
+impl std::fmt::Display for TicketNotInTreeYet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} unspent ticket(s), but none is in the ticket tree at the proof's base block yet \
+             (the base trails the head by 10–41 blocks) — try again in a minute",
+            self.unspent
+        )
+    }
+}
+
+impl std::error::Error for TicketNotInTreeYet {}
 
 /// The pool's ticket tree, rebuilt from its `TicketBought` events.
 pub struct TicketTree {
@@ -405,6 +429,18 @@ pub(crate) mod tests {
         assert_eq!(back.counts(), TicketCounts { unspent: 1, reserved: 0, spent: 1, pending: 1 });
         assert!(Wallet::load(&home, "0x1").is_err(), "another store's wallet is refused");
         fs::remove_dir_all(&home.dir).unwrap();
+    }
+
+    /// A ticket settled against the latest tree but younger than the
+    /// (older) tree a send proves on is "not yet", which the sender waits on.
+    #[test]
+    fn a_ticket_newer_than_the_base_tree_is_not_yet() {
+        let mut wallet = Wallet::default();
+        let leaves = wallet.mint(1).unwrap();
+        wallet.settle(&TicketTree::from_events(&[event(leaves[0], 0)]).unwrap()).unwrap();
+        let base_tree = TicketTree::from_events(&[]).unwrap();
+        let err = wallet.pick(&base_tree).unwrap_err();
+        assert_eq!(err.downcast_ref::<TicketNotInTreeYet>(), Some(&TicketNotInTreeYet { unspent: 1 }));
     }
 
     #[test]
