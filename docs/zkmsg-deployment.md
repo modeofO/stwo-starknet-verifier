@@ -478,8 +478,8 @@ older bounds; the v4 inbox no longer opens them):
   256 / 1024 / 4096 bytes (`u16 BE length ‖ plaintext ‖ zeros`), under
   HKDF labels `zkmsg-v4` / `zkmsg-v4 aead` / `zkmsg-v4 tag`, so content is
   1372, 2140 or 5212 bytes. The top bucket fits the event cap (171
-  ByteArray felts + 2 = 173 of 300). The DEPLOYED pool still accepts
-  1116..8192 bytes, i.e. bucket sizes are enforced by the clients only.
+  ByteArray felts + 2 = 173 of 300). The first pool accepted
+  1116..8192 bytes (clients-only enforcement); the padded pool below does not.
 - **Shared transaction policy** (`tools/zkmsg/core/src/txpolicy.rs`):
   price bound = ceil(1.5 × price) rounded up to 2 significant figures;
   tip 1e8 fri (96.7% of 1,277 Sepolia INVOKE v3 txs in blocks
