@@ -118,10 +118,6 @@ enum Command {
         /// Keep the account's entry in sncast's accounts file.
         #[arg(long)]
         keep_account_key: bool,
-        /// Read the account's balance first (asks the RPC about its address,
-        /// from this machine's connection).
-        #[arg(long)]
-        check_balance: bool,
         /// The handle (or, without one, the profile name), instead of typing
         /// it at the prompt.
         #[arg(long)]
@@ -144,7 +140,7 @@ fn main() -> Result<()> {
         ensure!(dir.join("config.json").exists(), "no profile '{name}' at {}", dir.display());
         return cmd_migrate_store(&Home::new(dir), account.as_deref());
     }
-    if let Command::DeleteProfile { name, archived, move_tickets_to, keep_account_key, check_balance, confirm } =
+    if let Command::DeleteProfile { name, archived, move_tickets_to, keep_account_key, confirm } =
         &cli.command
     {
         return cmd_delete_profile(
@@ -153,7 +149,6 @@ fn main() -> Result<()> {
             *archived,
             move_tickets_to.as_deref(),
             *keep_account_key,
-            *check_balance,
             confirm.as_deref(),
         );
     }
@@ -187,7 +182,6 @@ fn cmd_delete_profile(
     archived: bool,
     move_tickets_to: Option<&str>,
     keep_account_key: bool,
-    check_balance: bool,
     confirm: Option<&str>,
 ) -> Result<()> {
     use zkmsg_core::wipe;
@@ -199,15 +193,7 @@ fn cmd_delete_profile(
     if let Some(account) = &plan.account {
         let address = plan.account_address.as_deref().unwrap_or("address unknown");
         println!("  account   : {account} ({address})");
-        let balance = if !check_balance {
-            "not checked (--check-balance asks the RPC)".to_string()
-        } else {
-            match wipe::account_balance_fri(&plan) {
-                Ok(fri) => wipe::strk_label(fri),
-                Err(e) => format!("unknown ({e:#})"),
-            }
-        };
-        println!("  balance   : {balance} — NOT moved: a sweep would link the accounts on chain");
+        println!("  balance   : any STRK left is NOT moved (a sweep would link the accounts on chain); `zkmsg status` shows it");
         if plan.removes_account_key(&opts) {
             println!("  its private key is removed from sncast's accounts file: the balance is lost");
         } else if plan.account_address.is_none() {

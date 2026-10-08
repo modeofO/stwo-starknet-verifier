@@ -351,25 +351,6 @@ pub fn delete_profile(
     Ok((moved, wipe_profile(root, &plan.dir, opts)?))
 }
 
-/// The account's remaining STRK balance, in fri: shown before a delete,
-/// never moved. Network; best effort.
-pub fn account_balance_fri(plan: &DeletePlan) -> Result<u128> {
-    let address = plan.account_address.as_deref().context("the account's address is unknown")?;
-    let rpc = Home::new(plan.dir.clone())
-        .load_config()
-        .map(|c| c.rpc_url)
-        .ok()
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| crate::config::SEPOLIA_RPC_DEFAULT.into());
-    crate::setup::read_balance_fri(&crate::chain::Chain::new(&rpc, ""), address)
-}
-
-/// `12.3456 STRK` (truncated to 4 decimals).
-pub fn strk_label(fri: u128) -> String {
-    const ONE: u128 = 1_000_000_000_000_000_000;
-    format!("{}.{:04} STRK", fri / ONE, (fri % ONE) / (ONE / 10_000))
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct PanicReport {
     pub profiles: usize,
@@ -856,12 +837,6 @@ mod tests {
         let _ = fs::remove_dir_all(&fresh);
     }
 
-    #[test]
-    fn strk_labels() {
-        assert_eq!(strk_label(0), "0.0000 STRK");
-        assert_eq!(strk_label(3_000_000_000_000_000_000), "3.0000 STRK");
-        assert_eq!(strk_label(83_123_456_789_000_000_000), "83.1234 STRK");
-    }
 
     #[test]
     fn sncast_entry_removed_with_others_and_mode_kept() {

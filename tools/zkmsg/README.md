@@ -272,9 +272,8 @@ account's entry in sncast's accounts file (unless another profile uses it,
 or `--keep-account-key`), then the directory, then `current`. Before
 that, unspent tickets can move to another profile on the same pool
 (`--move-tickets-to`): a ticket is a bearer secret nothing on chain ties
-to an identity. The account's balance is read only on request
-(`--check-balance`, or "check" in the dialog: it asks the RPC about the
-address from your connection) and is **abandoned, never swept** — a transfer to another account would link the two on chain.
+to an identity. Any balance left on the account is **abandoned, never
+swept** — a transfer to another account would link the two on chain.
 Nothing happens on chain: the registration stays, and messages sent to
 the deleted handle become unreadable to everyone. You confirm by typing
 the handle. `core/src/wipe.rs`.

@@ -1,12 +1,11 @@
 //! The delete dialog: wipe a profile from this machine for good
 //! (`zkmsg_core::wipe`). Tickets can move to another profile first; the
-//! account's balance is shown and abandoned, never swept (a sweep is a
+//! account's balance is abandoned, never swept (a sweep is a
 //! public edge linking the two accounts). The user confirms by typing the
 //! handle. Owned by ZkmsgApp, like the archive dialog: it may delete the
 //! active profile and so outlive its session.
 
 use std::path::Path;
-use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui;
 
@@ -20,14 +19,6 @@ pub enum DeleteOutcome {
     Deleted { name: String, archived: bool, new_current: Option<Option<String>> },
 }
 
-enum Balance {
-    /// Not asked: reading it tells the RPC this machine knows the account.
-    NotChecked,
-    Loading(Receiver<Result<u128, String>>),
-    Known(u128),
-    Unknown(String),
-}
-
 enum DeleteAct {
     None,
     Delete,
@@ -36,7 +27,6 @@ enum DeleteAct {
 
 pub struct DeleteUi {
     plan: DeletePlan,
-    balance: Balance,
     /// Where the unspent tickets go; `None` abandons them.
     ticket_target: Option<String>,
     keep_account_key: bool,
@@ -57,33 +47,12 @@ impl DeleteUi {
             (plan.movable_tickets > 0).then(|| plan.ticket_targets.first().cloned()).flatten();
         Ok(Self {
             plan,
-            balance: Balance::NotChecked,
             ticket_target,
             keep_account_key: false,
             typed: String::new(),
             error: None,
             app_busy: false,
         })
-    }
-
-    fn check_balance(&mut self) {
-        let (tx, rx) = channel();
-        let plan = self.plan.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(wipe::account_balance_fri(&plan).map_err(|e| format!("{e:#}")));
-        });
-        self.balance = Balance::Loading(rx);
-    }
-
-    fn poll_balance(&mut self) {
-        if let Balance::Loading(rx) = &self.balance {
-            if let Ok(result) = rx.try_recv() {
-                self.balance = match result {
-                    Ok(fri) => Balance::Known(fri),
-                    Err(e) => Balance::Unknown(e),
-                };
-            }
-        }
     }
 
     fn delete(&mut self, root: &Path) -> DeleteOutcome {
@@ -104,12 +73,7 @@ impl DeleteUi {
     }
 
     pub fn update(&mut self, ctx: &egui::Context, root: &Path) -> DeleteOutcome {
-        self.poll_balance();
-        if matches!(self.balance, Balance::Loading(_)) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
-        }
         let mut act = DeleteAct::None;
-        let mut check = false;
         let plan = &self.plan;
         let opts = WipeOptions { delete_account_key: !self.keep_account_key };
         let title = if plan.archived { format!("Delete archived '{}'", plan.name) } else { format!("Delete '{}'", plan.name) };
@@ -170,24 +134,8 @@ impl DeleteUi {
                         "Account {account} ({})",
                         plan.account_address.as_deref().unwrap_or("address unknown")
                     ));
-                    let balance = match &self.balance {
-                        Balance::NotChecked => "not checked".to_string(),
-                        Balance::Loading(_) => "reading…".to_string(),
-                        Balance::Known(fri) => wipe::strk_label(*fri),
-                        Balance::Unknown(e) => format!("unknown ({e})"),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Balance: {balance}"));
-                        if matches!(self.balance, Balance::NotChecked | Balance::Unknown(_))
-                            && plan.account_address.is_some()
-                            && ui.small_button("check").clicked()
-                        {
-                            check = true;
-                        }
-                    });
-                    ui.small("Checking asks the RPC about this account's address, from this machine's connection.");
                     ui.label(
-                        "It is not moved anywhere: a transfer to another of your accounts would \
+                        "Any STRK left on it is not moved anywhere: a transfer to another of your accounts would \
                          link the two on chain. Deleting abandons it.",
                     );
                     if plan.account_address.is_none() {
@@ -235,9 +183,6 @@ impl DeleteUi {
                 });
             });
 
-        if check {
-            self.check_balance();
-        }
         match act {
             DeleteAct::None => DeleteOutcome::None,
             DeleteAct::Delete => self.delete(root),
