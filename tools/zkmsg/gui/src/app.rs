@@ -535,7 +535,7 @@ impl eframe::App for ZkmsgApp {
                 LockOutcome::None => self.lock = Some(lock),
                 LockOutcome::Panic => {
                     self.lock = Some(lock);
-                    self.panic = Some(PanicUi);
+                    self.panic = Some(PanicUi::new());
                 }
                 LockOutcome::Wiped(errors) => self.after_wipe(if errors.is_empty() {
                     format!("{} wrong PINs in a row: everything was wiped", zkmsg_core::applock::MAX_ATTEMPTS)
@@ -598,7 +598,7 @@ impl eframe::App for ZkmsgApp {
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.small_button("Panic wipe…").clicked() {
-                    self.panic = Some(PanicUi);
+                    self.panic = Some(PanicUi::new());
                 }
                 if ui.add_enabled(!app_busy, egui::Button::new("Lock").small()).clicked() {
                     lock_clicked = true;

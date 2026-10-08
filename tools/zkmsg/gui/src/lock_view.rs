@@ -171,12 +171,42 @@ pub enum PanicOutcome {
     Wiped(zkmsg_core::wipe::PanicReport),
 }
 
-/// One confirmation, then everything goes.
-pub struct PanicUi;
+/// The app PIN is the one confirmation (owner decision 2026-10-08); a wrong
+/// one counts as an attempt. Before any PIN exists, a plain button.
+pub struct PanicUi {
+    needs_pin: bool,
+    pin: String,
+    message: Option<String>,
+}
 
 impl PanicUi {
+    pub fn new() -> Self {
+        let needs_pin = !matches!(applock::state(), Ok(LockState::NotSet));
+        Self { needs_pin, pin: String::new(), message: None }
+    }
+
+    fn run(&mut self, root: &Path) -> PanicOutcome {
+        use zkmsg_core::wipe::{PanicAttempt, PanicReport, panic_wipe_with_pin};
+        let pin = std::mem::take(&mut self.pin);
+        match panic_wipe_with_pin(root, &pin) {
+            Ok(PanicAttempt::Wiped(r)) => PanicOutcome::Wiped(r),
+            Ok(PanicAttempt::Wrong { attempts_left, .. }) => {
+                self.message = Some(format!(
+                    "wrong PIN — nothing wiped; {attempts_left} attempt(s) left (the last one wipes anyway)"
+                ));
+                PanicOutcome::None
+            }
+            Ok(PanicAttempt::Wait { secs }) => {
+                self.message = Some(format!("too many wrong PINs — try again in {secs} s"));
+                PanicOutcome::None
+            }
+            Err(e) => PanicOutcome::Wiped(PanicReport { errors: vec![format!("{e:#}")], ..Default::default() }),
+        }
+    }
+
     pub fn update(&mut self, ctx: &egui::Context, root: &Path) -> PanicOutcome {
         let mut outcome = PanicOutcome::None;
+        let mut go = false;
         egui::Window::new("Panic wipe")
             .collapsible(false)
             .resizable(false)
@@ -184,26 +214,34 @@ impl PanicUi {
             .show(ctx, |ui| {
                 ui.label(
                     "Wipes EVERY identity on this computer now, for good: all profile keys, the \
-                     app PIN, the profiles' account keys and the whole profile folder. No \
-                     network needed. Balances and tickets are abandoned.",
+                     app PIN, the profiles' account keys and zkmsg's files. No network needed. \
+                     Balances and tickets are abandoned.",
                 );
+                if self.needs_pin {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.pin).password(true).hint_text("app PIN to confirm"),
+                    );
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        go = true;
+                    }
+                }
+                if let Some(m) = &self.message {
+                    ui.colored_label(egui::Color32::RED, m.as_str());
+                }
                 ui.horizontal(|ui| {
                     let wipe = egui::Button::new(egui::RichText::new("Wipe everything now").color(egui::Color32::WHITE))
                         .fill(egui::Color32::from_rgb(170, 30, 30));
-                    if ui.add(wipe).clicked() {
-                        outcome = match zkmsg_core::wipe::panic_wipe(root) {
-                            Ok(r) => PanicOutcome::Wiped(r),
-                            Err(e) => PanicOutcome::Wiped(zkmsg_core::wipe::PanicReport {
-                                errors: vec![format!("{e:#}")],
-                                ..Default::default()
-                            }),
-                        };
+                    if ui.add_enabled(!self.needs_pin || !self.pin.is_empty(), wipe).clicked() {
+                        go = true;
                     }
                     if ui.button("Cancel").clicked() {
                         outcome = PanicOutcome::Cancelled;
                     }
                 });
             });
+        if go {
+            outcome = self.run(root);
+        }
         outcome
     }
 }

@@ -101,12 +101,9 @@ enum Command {
     /// moved (a sweep would link the accounts) and is lost with the key.
     /// Wipe EVERY identity on this machine at once, offline: all profile
     /// keys and the app lock in the Keychain, the profiles' account keys in
-    /// sncast's accounts file, and the whole profile root. No PIN needed.
-    PanicWipe {
-        /// Skip the one confirmation.
-        #[arg(long)]
-        yes: bool,
-    },
+    /// sncast's accounts file, and zkmsg's files under the profile root.
+    /// The app PIN is the confirmation (a wrong one counts as an attempt).
+    PanicWipe,
     /// Change the app PIN (asks the current one first; that attempt counts).
     ChangePin,
     DeleteProfile {
@@ -135,8 +132,8 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = zkmsg_core::profiles::profile_root(&cli.home_dir());
-    if let Command::PanicWipe { yes } = &cli.command {
-        return cmd_panic_wipe(&root, *yes);
+    if let Command::PanicWipe = &cli.command {
+        return cmd_panic_wipe(&root);
     }
     gate(&root)?;
     if let Command::ChangePin = &cli.command {
@@ -178,7 +175,7 @@ fn main() -> Result<()> {
         Command::Inbox => cmd_inbox(&home),
         Command::Status => cmd_status(&home),
         Command::MigrateStore { account, .. } => cmd_migrate_store(&home, account.as_deref()),
-        Command::DeleteProfile { .. } | Command::PanicWipe { .. } | Command::ChangePin => {
+        Command::DeleteProfile { .. } | Command::PanicWipe | Command::ChangePin => {
             unreachable!("handled before the home resolves")
         }
     }
@@ -350,16 +347,29 @@ fn cmd_change_pin(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_panic_wipe(root: &std::path::Path, yes: bool) -> Result<()> {
-    if !yes {
+fn cmd_panic_wipe(root: &std::path::Path) -> Result<()> {
+    use zkmsg_core::applock::{self, LockState};
+    use zkmsg_core::wipe::{self, PanicAttempt};
+    let pin = if applock::state()? == LockState::NotSet {
+        // No PIN was ever set: nothing is behind one; a plain confirmation.
         print!("wipe EVERY identity on this machine ({}), for good? type 'wipe': ", root.display());
         use std::io::Write;
         std::io::stdout().flush()?;
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         ensure!(line.trim() == "wipe", "not confirmed — nothing was touched");
-    }
-    let r = zkmsg_core::wipe::panic_wipe(root)?;
+        String::new()
+    } else {
+        eprintln!("panic wipe: EVERY identity on this machine ({}), for good", root.display());
+        read_pin("app PIN to confirm: ")?
+    };
+    let r = match wipe::panic_wipe_with_pin(root, &pin)? {
+        PanicAttempt::Wiped(r) => r,
+        PanicAttempt::Wrong { attempts_left, .. } => anyhow::bail!(
+            "wrong PIN — nothing was wiped; {attempts_left} attempt(s) left (the last one wipes anyway)"
+        ),
+        PanicAttempt::Wait { secs } => anyhow::bail!("too many wrong PINs: try again in {}", wait_label(secs)),
+    };
     println!(
         "wiped: {} profile(s), {} profile key(s) shredded, the app lock, {} account key(s){}",
         r.profiles,

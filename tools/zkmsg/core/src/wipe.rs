@@ -468,6 +468,34 @@ fn owned_entries(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// What a PIN-checked panic wipe did.
+#[derive(Debug, Clone)]
+pub enum PanicAttempt {
+    Wiped(PanicReport),
+    /// Wrong PIN: counted like any unlock attempt; nothing wiped.
+    Wrong { attempts_left: u32, wait_secs: u64 },
+    /// Too soon after wrong PINs; nothing checked or counted.
+    Wait { secs: u64 },
+}
+
+/// The panic wipe behind the app PIN (owner decision 2026-10-08: a wipe
+/// needs the unlock PIN as a check). The PIN goes through the same attempt
+/// counter as unlocking, so a wipe prompt is no free guessing oracle; the
+/// 10th wrong PIN in a row wipes anyway. Before any PIN was ever set there
+/// is nothing to check, and `pin` is ignored.
+pub fn panic_wipe_with_pin(root: &Path, pin: &str) -> Result<PanicAttempt> {
+    use crate::applock::{self, LockState, Unlock};
+    if applock::state()? == LockState::NotSet {
+        return Ok(PanicAttempt::Wiped(panic_wipe(root)?));
+    }
+    Ok(match applock::unlock(pin, root)? {
+        Unlock::Unlocked => PanicAttempt::Wiped(panic_wipe(root)?),
+        Unlock::Wiped { errors } => PanicAttempt::Wiped(PanicReport { errors, ..Default::default() }),
+        Unlock::Wrong { attempts_left, wait_secs } => PanicAttempt::Wrong { attempts_left, wait_secs },
+        Unlock::Wait { secs } => PanicAttempt::Wait { secs },
+    })
+}
+
 pub fn sncast_accounts_path() -> Result<PathBuf> {
     // Tests must never rewrite the real accounts file.
     if cfg!(test) {
@@ -804,6 +832,28 @@ mod tests {
         for d in [root, empty, flat] {
             fs::remove_dir_all(d).unwrap();
         }
+    }
+
+    #[test]
+    fn the_panic_wipe_needs_the_pin() {
+        let root = tmp("panic-pin");
+        let carol = mk(&root, "carol", Some("carol"), "a1", STORE);
+        crate::applock::set_pin("123456", &root).unwrap();
+        crate::applock::lock();
+        assert!(matches!(
+            panic_wipe_with_pin(&root, "000000").unwrap(),
+            PanicAttempt::Wrong { attempts_left: 9, .. }
+        ));
+        assert!(carol.dir.exists(), "a wrong PIN wipes nothing");
+        assert!(matches!(panic_wipe_with_pin(&root, "123456").unwrap(), PanicAttempt::Wiped(r) if r.errors.is_empty()));
+        assert!(!carol.dir.exists());
+        // No PIN ever set: nothing to check.
+        let fresh = tmp("panic-nopin");
+        mk(&fresh, "x", None, "a9", STORE);
+        assert!(matches!(panic_wipe_with_pin(&fresh, "").unwrap(), PanicAttempt::Wiped(_)));
+        assert!(!fresh.join(".zkmsg-x").exists());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&fresh);
     }
 
     #[test]

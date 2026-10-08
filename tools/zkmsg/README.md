@@ -294,8 +294,10 @@ guess, so a 6-digit PIN falls in days to someone who has both; use a
 longer PIN or a passphrase on a laptop. (The phone binds its PIN to the
 Secure Enclave instead.)
 
-**Panic wipe**: `zkmsg panic-wipe` (one confirmation, no PIN, no
-network) or "Panic wipe…" on the GUI's lock screen and top bar. It
+**Panic wipe**: `zkmsg panic-wipe` or "Panic wipe…" on the GUI's lock
+screen and top bar; no network. The app PIN is its one confirmation, and
+a wrong one counts as an unlock attempt (no free guessing through the
+wipe prompt; the 10th wrong PIN wipes anyway). It
 deletes every profile key and the app lock from the Keychain first (all
 sealed files become unreadable at once), then the profiles' account keys
 from sncast's accounts file, then the whole profile root (`~/.zkmsg`).
