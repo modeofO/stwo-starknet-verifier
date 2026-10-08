@@ -52,6 +52,13 @@ pub fn signed_invoke(
 /// Signs `calls` from `account` with `kind`'s bounds at the latest prices,
 /// submits, and waits for a successful receipt. Returns the hash.
 pub fn send(chain: &Chain, account: &str, calls: &[Call], kind: TxKind) -> Result<String> {
+    let hex = submit(chain, account, calls, kind)?;
+    chain.wait_receipt(&hex, RECEIPT_TIMEOUT)?;
+    Ok(hex)
+}
+
+/// `send` without the receipt wait: the hash once the node took it.
+pub fn submit(chain: &Chain, account: &str, calls: &[Call], kind: TxKind) -> Result<String> {
     let signer = Signer::from_sncast_account(account)?;
     let chain_id = Felt::from_hex(chain.rpc("starknet_chainId", json!([]))?.as_str().context("chain id")?)?;
     let nonce = chain.rpc("starknet_getNonce", json!(["latest", felt_hex(&signer.address)]))?;
@@ -68,9 +75,7 @@ pub fn send(chain: &Chain, account: &str, calls: &[Call], kind: TxKind) -> Resul
         kind.name(),
         felt_hex(&hash)
     );
-    let hex = felt_hex(&hash);
-    chain.wait_receipt(&hex, RECEIPT_TIMEOUT)?;
-    Ok(hex)
+    Ok(felt_hex(&hash))
 }
 
 #[cfg(test)]

@@ -39,6 +39,9 @@ pub enum TxKind {
     /// at most `MAX_TICKETS_PER_PURCHASE` tickets (measured 2 tickets:
     /// approve 1.6M + buy 10.6–19.1M as separate transactions).
     BuyTickets,
+    /// The setup wizard's STRK transfer to a new account (an ERC20
+    /// `transfer`, ~1.6M L2 gas like `approve`).
+    Transfer,
 }
 
 /// Tickets per purchase the `BuyTickets` amount is sized for.
@@ -50,6 +53,7 @@ impl TxKind {
             Self::Publish => 100_000_000,
             Self::Register => 30_000_000,
             Self::BuyTickets => 80_000_000,
+            Self::Transfer => 10_000_000,
         }
     }
 
@@ -58,6 +62,7 @@ impl TxKind {
             Self::Publish => "publish",
             Self::Register => "register",
             Self::BuyTickets => "buy_tickets",
+            Self::Transfer => "transfer",
         }
     }
 }

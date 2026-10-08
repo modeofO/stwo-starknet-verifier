@@ -278,12 +278,17 @@ impl SetupRunner<'_> {
             }
         }
 
-        let tx = chain.invoke(
-            STRK_TOKEN,
+        // Signed natively under the shared transaction policy.
+        let transfer = crate::invoke_v3::Call::new(
+            starknet_types_core::felt::Felt::from_hex(STRK_TOKEN)?,
             "transfer",
-            &[address, strk_to_fri_hex(state.fund_strk), "0x0".into()],
-            &Default::default(),
-        )?;
+            vec![
+                starknet_types_core::felt::Felt::from_hex(&address)?,
+                starknet_types_core::felt::Felt::from_hex(&strk_to_fri_hex(state.fund_strk))?,
+                starknet_types_core::felt::Felt::ZERO,
+            ],
+        );
+        let tx = crate::account_tx::submit(&chain, &state.source_account, &[transfer], crate::txpolicy::TxKind::Transfer)?;
         sink(SetupEvent::TxSubmitted { kind: kind.clone(), tx_hash: tx.clone() });
         chain.wait_receipt(&tx, RECEIPT_TIMEOUT)?;
         Ok(StepOutcome::Done(Some(tx), Some(format!("funded {} STRK", state.fund_strk))))

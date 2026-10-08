@@ -93,6 +93,20 @@
           "max_amount": "0x1c9c380",
           "max_price_per_unit": "0x684ee1800"
         }
+      },
+      "transfer": {
+        "l1_data_gas": {
+          "max_amount": "0x1000",
+          "max_price_per_unit": "0x13498"
+        },
+        "l1_gas": {
+          "max_amount": "0x0",
+          "max_price_per_unit": "0x47d99eeff000"
+        },
+        "l2_gas": {
+          "max_amount": "0x989680",
+          "max_price_per_unit": "0x684ee1800"
+        }
       }
     },
     "da_modes": "L1",
@@ -100,7 +114,8 @@
     "l2_gas": {
       "buy_tickets": 80000000,
       "publish": 100000000,
-      "register": 30000000
+      "register": 30000000,
+      "transfer": 10000000
     },
     "max_tickets_per_purchase": 8,
     "member_signature": "[r, s]",

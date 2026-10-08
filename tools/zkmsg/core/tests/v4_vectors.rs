@@ -185,7 +185,7 @@ fn build() -> Value {
         })
         .collect();
 
-    let policy_bounds: Value = [TxKind::Publish, TxKind::Register, TxKind::BuyTickets]
+    let policy_bounds: Value = [TxKind::Publish, TxKind::Register, TxKind::BuyTickets, TxKind::Transfer]
         .iter()
         .map(|k| (k.name().to_string(), txpolicy::bounds(*k, prices).rpc_json()))
         .collect::<serde_json::Map<_, _>>()
@@ -265,7 +265,7 @@ fn build() -> Value {
             "price_rule": "ceil(price * 3 / 2), rounded UP to 2 significant figures",
             "publish_cap_rule": "if the L2 bound exceeds (max_fee - l1_data_amount*l1_data_bound)/l2_amount - tip, use that, rounded DOWN to 2 s.f.; refuse if below ceil(1.1 * l2 price)",
             "l1_data_gas": txpolicy::L1_DATA_GAS,
-            "l2_gas": {"publish": TxKind::Publish.l2_gas(), "register": TxKind::Register.l2_gas(), "buy_tickets": TxKind::BuyTickets.l2_gas()},
+            "l2_gas": {"publish": TxKind::Publish.l2_gas(), "register": TxKind::Register.l2_gas(), "buy_tickets": TxKind::BuyTickets.l2_gas(), "transfer": TxKind::Transfer.l2_gas()},
             "max_tickets_per_purchase": txpolicy::MAX_TICKETS_PER_PURCHASE,
             "da_modes": "L1",
             "paymaster_data": [],
