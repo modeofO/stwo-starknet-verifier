@@ -129,12 +129,36 @@ send_message     = (commitment, E, merkle_root, nullifier, ticket_root,
 Cairo short strings: `'zkmsg-nullifier-v4'`, `'zkmsg-ticket-v4'`,
 `'zkmsg-ticket-null-v4'`.
 
+## Client-side additions (same day, both clients)
+
+- **Padding**: inside the AEAD, `padded = u16be(len) ‖ plaintext ‖ 0…`,
+  `|padded| ∈ {256, 1024, 4096}` (smallest that fits; > 4094 refused);
+  open requires `len ≤ |padded| − 2` and an all-zero tail. HKDF labels
+  "zkmsg-v4" / "zkmsg-v4 aead" / "zkmsg-v4 tag" (v2's construction
+  otherwise). Content ∈ {1372, 2140, 5212} bytes. On-chain enforcement of
+  bucket sizes needs a pool redeploy (pending decision); the deployed pool
+  accepts 1116..8192.
+- **Inbox**: a tag match that fails to open or unpad is dropped silently.
+- **Transaction policy** (`txpolicy.rs`): per kind fixed amounts (publish
+  L2 100M, register 30M, `[approve, buy_tickets]` 80M; L1 data 4,096; L1
+  0), price bound `round_up_2sf(ceil(1.5 × price))`, publish L2 bound
+  capped at `round_down_2sf((max_fee − l1_data_cost)/l2 − tip)` and
+  refused under `ceil(1.1 × price)`, tip 1e8, L1 DA, empty paymaster and
+  deployment data, member signature `[r, s]`.
+- **Schedule**: base `= ⌊(head − 10)/32⌋·32`; publish when head
+  `≥ base + 90 + j`, `j ∈ [0, 20]` uniform. Epoch (5,000 blocks, lag 1),
+  the 64-root member history and the never-evicted ticket roots all
+  tolerate base + 110.
+
+All of it is pinned in `v4_vectors.json` (`sealing_v4`, `policy`,
+`schedule`).
+
 ## What v4 does not fix
 
 - Registration is still from the member's own account, so the member set is
   public and each handle is tied to an account.
 - Ticket purchases are from an account too: with few buyers, "bought a
   ticket shortly before a send" narrows the sender down.
-- Timing, ciphertext length and the base block (client fingerprints, red
-  team 01 F9) are unchanged; content padding is out of scope.
+- Ciphertext length is bucketed and timing is scheduled (above), but
+  only by convention until the pool enforces bucket sizes.
 - The phone still sends on v3, which the desktop no longer reads.

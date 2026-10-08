@@ -466,3 +466,36 @@ Golden vectors for the iOS port: `tools/zkmsg/core/testdata/v4_vectors.json`
 values asserted against the contracts in
 `contracts/zkmsg_pool_v4/tests/test_vectors_v4.cairo`, which also replays
 the vectors' `prove_send` calldata through the prover).
+
+### Padding, shared transaction policy, fixed publish timing (client-side, 2026-10-07)
+
+Added after the first four sends (they used v2 sealing, tip 0 and the
+older bounds; the v4 inbox no longer opens them):
+
+- **Padding + v4 sealing**: the plaintext is padded inside the AEAD to
+  256 / 1024 / 4096 bytes (`u16 BE length ‖ plaintext ‖ zeros`), under
+  HKDF labels `zkmsg-v4` / `zkmsg-v4 aead` / `zkmsg-v4 tag`, so content is
+  1372, 2140 or 5212 bytes. The top bucket fits the event cap (171
+  ByteArray felts + 2 = 173 of 300). The DEPLOYED pool still accepts
+  1116..8192 bytes, i.e. bucket sizes are enforced by the clients only.
+- **Shared transaction policy** (`tools/zkmsg/core/src/txpolicy.rs`):
+  price bound = ceil(1.5 × price) rounded up to 2 significant figures;
+  tip 1e8 fri (96.7% of 1,277 Sepolia INVOKE v3 txs in blocks
+  16257334–16257733); L1 data 4,096; L2 publish 100M / register 30M /
+  `[approve, buy_tickets]` 80M (≤ 8 tickets); L1 DA; empty paymaster and
+  deployment data. Register and ticket purchases are now signed natively
+  (`account_tx.rs`), not via sncast.
+- **Schedule**: base = floor((head − 10)/32) × 32; publish once the head
+  reaches base + 90 + j, j uniform in 0..=20.
+- **Front-run copies**: a tag match that fails to open is dropped silently.
+
+| tx | hash | block | fee |
+|---|---|---|---|
+| carol `[approve, buy_tickets]` × 1 (native, policy bounds) | `0x062d12e709580a2333deea39c1652225311a767d056bdfd008cb9c8ed14eb2e1` | 16257927 | 0.1354 STRK + 3 STRK |
+| carol → mode (padded 1372 B, scheduled) | `0x06434b6b01fbeb82ad44b72fd66c1b2d4f610aba4c720028bcca847bec195510` | 16258049 | 1.4355 STRK (ticket), 79,523,568 L2 gas |
+
+The scheduled send: base 16257952 (≡ 0 mod 32), target 16258043, landed
+16258049 (97 blocks after base), tip 0x5f5e100, L2 bound 27 gfri; mode's
+inbox decrypts it; neither member account appears in it. Pool after:
+5 tickets bought, 5 burnt, 5 messages, nonce 5, balance 7.8303 STRK.
+Running total on v4: 36.44 STRK.

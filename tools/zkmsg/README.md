@@ -37,11 +37,11 @@ alias zkmsg=$PWD/target/release/zkmsg
 
 zkmsg init --account <your-sncast-account>   # scan key + ML-KEM seed + member secret + config
 zkmsg register <your-handle>                 # one cheap tx (~0.2 STRK)
-zkmsg buy-tickets 2                          # 2 x 3 STRK, secrets saved to tickets.json first
+zkmsg buy-tickets 2                          # 2 x 3 STRK in one tx, secrets saved to tickets.json first
 zkmsg tickets                                # unspent / reserved / pending / spent
 zkmsg status                                 # balance, tickets, addresses, count
 
-zkmsg send <their-handle> "hello"            # ~35 s: prepare, prove, publish — spends one ticket
+zkmsg send <their-handle> "hello"            # ~2.5 min: prepare, prove, scheduled publish — one ticket
 zkmsg inbox                                  # detect and decrypt what's addressed to you
 ```
 
@@ -88,6 +88,20 @@ every member's account out of the send:
   rebuilt locally from all events; the send path's RPC requests are the
   same for every sender (`virtual_send::tests::
   prepare_reads_name_no_handle_leaf_ticket_or_account`).
+
+- **Padded, versioned sealing.** Plaintext is padded inside the AEAD to
+  256 / 1024 / 4096 bytes (u16 length prefix, zero fill; over 4094 bytes
+  is refused), sealed under "zkmsg-v4" HKDF labels: on chain a message is
+  1372, 2140 or 5212 bytes. A tag match that does not open (someone
+  front-running a commitment over other content) is dropped silently.
+- **One transaction shape for every client** (`core/src/txpolicy.rs`):
+  fixed gas amounts per kind, price bounds ceil(1.5×) rounded up to 2
+  significant figures, tip 1e8 fri; register and ticket purchases are
+  signed natively (`core/src/account_tx.rs`), not through sncast.
+- **Fixed timing.** A send proves on block floor((head − 10)/32)×32 and
+  publishes once the head is 90 + (0..=20 random) blocks past it, so the
+  base block reveals neither when Send was pressed nor how fast the device
+  proved: a send takes ~2.5–3 min ("publishing in ~2 min").
 
 `zkmsg migrate-store [<profile>] [--account <name>]` moves a profile to
 the pool with a FRESH scan key, ML-KEM seed and member secret (the old
