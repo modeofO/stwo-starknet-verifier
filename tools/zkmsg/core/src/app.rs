@@ -64,8 +64,8 @@ pub fn status(home: &Home) -> Result<StatusReport> {
     })
 }
 
-/// Generates the scan keypair, writes `keys.json` (mode 0600, refuses to
-/// overwrite) and a default Sepolia `config.json`. Returns the scan
+/// Generates the scan keypair, the ML-KEM seed and the membership secret,
+/// writes `keys.json` (mode 0600, refuses to overwrite) and a default Sepolia `config.json`. Returns the scan
 /// pubkey.
 pub fn init_identity(
     home: &Home,
@@ -263,7 +263,7 @@ pub fn migrate_store(home: &Home) -> Result<StoreMigration> {
     Ok(migration)
 }
 
-/// Whether `config` points at the store this client reads and writes (v2).
+/// Whether `config` points at the store this client reads and writes (v3).
 /// Anything else needs `migrate_store` first.
 pub fn on_current_store(config: &Config) -> bool {
     is_current_store(&config.store)

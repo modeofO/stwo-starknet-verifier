@@ -2,13 +2,14 @@
 //!
 //! Since Starknet 0.14.2 the sequencer verifies S-two proofs natively, but
 //! only proofs of the *virtual* Starknet OS running one invoke on top of a
-//! past block. So the zkmsg statement lives in a contract (`ZkmsgSendProver`)
-//! that only ever runs inside that virtual OS, here: its calldata is the
-//! witness (scan private key, ephemeral private key, Merkle paths) and the
-//! chain never sees it. What leaves is the proof and its facts, whose one
-//! L2→L1 message hash binds (store, commitment, ephemeral pubkey, root,
-//! content hash). `MessageStoreSnip36.send_message` recomputes that hash from
-//! public data in the same transaction that publishes the ciphertext.
+//! past block. So the zkmsg statement lives in a contract
+//! (`ZkmsgSendProverV3`) that only ever runs inside that virtual OS, here: its
+//! calldata is the witness (the sender's scan pubkey R, kem_digest,
+//! membership secret m, leaf index and Merkle path) and the chain never sees
+//! it. What leaves is the proof and its facts, whose one L2→L1 message hash
+//! binds (store, commitment, ephemeral pubkey, root, content hash).
+//! `MessageStoreV3.send_message` recomputes that hash from public data in the
+//! same transaction that publishes the ciphertext.
 //!
 //! A port of zkmsg-ios `VirtualSendExecutor`; its rules, exactly:
 //!
@@ -154,7 +155,7 @@ const FACT_MESSAGE_HASH: usize = 8;
 
 /// Poseidon over the Cairo serialization of the ciphertext `ByteArray` —
 /// what the proof carries in the ciphertext's place
-/// (`MessageStoreSnip36::content_hash`).
+/// (`messagezk_store_v3::store::content_hash`).
 pub fn content_hash(ciphertext: &[u8]) -> Felt {
     let felts: Vec<Felt> = bytearray_calldata(ciphertext)
         .iter()
@@ -742,7 +743,7 @@ impl<'a> VirtualSender<'a> {
 }
 
 /// Masks long hex runs in a prover log line: if the prover ever echoed its
-/// request, the witness (scan private key) must not reach the UI.
+/// request, the witness (membership secret) must not reach the UI.
 fn redact_felts(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
@@ -1025,8 +1026,8 @@ mod tests {
 
     #[test]
     fn only_the_current_store_routes() {
-        let v2 = VirtualRoute::for_store(crate::config::SEPOLIA_STORE_V3).unwrap();
-        assert_eq!(v2.prover, Felt::from_hex(crate::config::SEPOLIA_V3_SEND_PROVER).unwrap());
+        let v3 = VirtualRoute::for_store(crate::config::SEPOLIA_STORE_V3).unwrap();
+        assert_eq!(v3.prover, Felt::from_hex(crate::config::SEPOLIA_V3_SEND_PROVER).unwrap());
         assert!(VirtualRoute::for_store("0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f").is_none());
         assert!(VirtualRoute::for_store("0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8").is_none());
     }
