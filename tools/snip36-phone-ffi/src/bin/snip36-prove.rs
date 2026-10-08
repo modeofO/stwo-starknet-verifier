@@ -3,8 +3,8 @@
 //! timings) to `<out.json>`. The same code path the phone runs.
 //!
 //! The request travels on stdin because the virtual transaction's calldata is
-//! the send's witness (scan private key, ephemeral private key): it must never
-//! be written to disk. The result is public and goes to a file. Logs go to
+//! the send's witness (membership secret, leaf, Merkle path): it must never
+//! be written to disk, and the prover never sends it to the RPC (`prover_config`). The result is public and goes to a file. Logs go to
 //! stderr unless the request names a `log_path`. Exit status is non-zero, and
 //! stderr carries the reason, when proving fails.
 

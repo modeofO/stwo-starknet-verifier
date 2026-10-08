@@ -10,6 +10,18 @@ Request: `{"rpc_url", "chain_id", "block_id": {"block_number": N}, "transaction"
 Response: the `starknet_proveTransaction` result (`proof`, `proof_facts`,
 `l2_to_l1_messages`) plus timings, or `{"error": "..."}`.
 
+**The witness never goes to the RPC.** The virtual transaction's calldata is the
+send's witness (membership secret, leaf, Merkle path). `starknet_transaction_prover`
+prefetches state by default: before executing, it sends the whole transaction to
+the RPC as `starknet_simulateTransactions`. `prover_config` turns that off
+(through the runner config's serde form; the field is crate-private), so the
+executor reads state key by key instead. A send's prover reads are then the
+block header, the account's nonce, class and one storage slot, the prover
+contract's class hash, the two classes, and one `getStorageProof` for those two
+contracts: nothing that depends on the witness, and no slower (measured
+2026-10-07 through a recording proxy: 10 requests, ~11 s of a 21 s prove, either
+way). A unit test pins the flag.
+
 Large allocations spill to `$ZKMSG_SPILL_DIR` (see `src/spill_alloc.rs`). The
 threshold must equal `tools/privacy-prove-cairo-bridge`'s: both libraries are
 built by the same nightly, so the app links one copy of the allocator for both.
