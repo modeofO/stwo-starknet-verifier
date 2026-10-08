@@ -278,9 +278,14 @@ pub fn migrate_store(home: &Home, account: Option<&str>) -> Result<StoreMigratio
         config.rpc_url = crate::config::SEPOLIA_RPC_DEFAULT.into();
     }
     home.save_config(&config)?;
-    // The cached inbox and the quota log belong to the old store.
+    // The cached inbox and the quota log belong to the old store; its
+    // ticket wallet is set aside (kept: ticket secrets are bearer value).
     let _ = std::fs::remove_file(home.inbox_cache_path());
     let _ = std::fs::remove_file(home.quota_path());
+    if home.tickets_path().exists() {
+        let old = home.dir.join(format!("tickets-{}.json", migration.previous_store.trim_start_matches("0x")));
+        std::fs::rename(home.tickets_path(), &old).with_context(|| format!("setting aside {}", old.display()))?;
+    }
     Ok(migration)
 }
 
@@ -463,6 +468,7 @@ mod tests {
         .unwrap();
 
         std::fs::write(home.quota_path(), "{}").unwrap();
+        std::fs::write(home.tickets_path(), "{}").unwrap();
         let m = migrate_store(&home, None).unwrap();
         assert_eq!(m.previous_handle.as_deref(), Some("carol"));
         assert_eq!(m.previous_store, OLD_STORE);
@@ -474,6 +480,8 @@ mod tests {
         assert!(keys.member_secret_felt().is_ok(), "a fresh membership secret for the new store");
         assert!(is_current_store(&home.load_config().unwrap().store));
         assert!(!home.quota_path().exists(), "the old store's quota log is dropped");
+        assert!(!home.tickets_path().exists());
+        assert!(dir.join(format!("tickets-{}.json", OLD_STORE.trim_start_matches("0x"))).exists(), "old tickets kept aside");
         // Twice is refused.
         assert!(migrate_store(&home, None).is_err());
         std::fs::remove_dir_all(&dir).unwrap();

@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use starknet_crypto::poseidon_hash_many;
 use starknet_types_core::felt::Felt;
 use zkmsg_core::chain::{bytearray_decode, felt_hex};
-use zkmsg_core::config::{SEPOLIA_POOL_V4, SEPOLIA_V4_SEND_PROVER, SEPOLIA_V4_VIRTUAL_SENDER};
+use zkmsg_core::config::{SEPOLIA_POOL_V4_UNPADDED, SEPOLIA_V4_SEND_PROVER, SEPOLIA_V4_VIRTUAL_SENDER};
 use zkmsg_core::crypto::{
     Sealing, assemble_v2, ec_mul_gen_x, encap_deterministic, envelope_key, kem_keygen_from_seed,
     leaf_v3, member_commit, nullifier_v4, nullifier_v4_domain, pad_v4, receive_v4,
@@ -44,7 +44,8 @@ fn fixture_ticket_secret(i: u64) -> Felt {
     Felt::from(0x7111c3700000u64 + i)
 }
 
-/// The Cairo fixtures' pool fixture store address stands in for "some store".
+/// "Some store" for the vectors: the first (unpadded, retired) pool's
+/// address. Any felt works; it is kept so the Cairo-side literals stay.
 const STORE: &str = "0x50f98ee98a0c1a583529c115f394ad79d18686ff66dc1ee25ba0f7bc53669b9";
 const MEMBER_SECRET: &str = "0x4d3b2a1f00112233445566778899aabbccddeeff00112233445566778899aab";
 
@@ -152,8 +153,14 @@ fn build() -> Value {
             let sealed = assemble_v2(&encap, &blob);
             let opened = receive_v4(&recipient_priv, &dk, &sealed.commitment, &sealed.ephemeral_pub, &sealed.content);
             assert_eq!(opened.unwrap().unwrap(), plaintext);
+            use sha3::Digest;
             json!({
                 "plaintext_len": n,
+                "kem_ct_sha3_256": hex::encode(sha3::Sha3_256::digest(&encap.kem_ct)),
+                "ss_kem": hex::encode(encap.ss_kem),
+                "ss_ec": felt_hex(&encap.ss_ec),
+                "k": hex::encode(encap.keys.k),
+                "tag": felt_hex(&encap.keys.tag),
                 "padded_len": padded.len(),
                 "padded_hex": hex::encode(&padded),
                 "content_len": sealed.content.len(),
@@ -164,6 +171,7 @@ fn build() -> Value {
             })
         })
         .collect();
+    let ek_digest = { use sha3::Digest; hex::encode(sha3::Sha3_256::digest(&ek)) };
     // Padded plaintexts a receiver must refuse.
     let mut nonzero_tail = pad_v4(b"hello").unwrap();
     nonzero_tail[100] = 1;
@@ -189,6 +197,19 @@ fn build() -> Value {
 
     json!({
         "generator": "zkmsg-core tests/v4_vectors.rs (ZKMSG_WRITE_VECTORS=1 cargo test -p zkmsg-core --test v4_vectors)",
+        "deployment": {
+            "pool": zkmsg_core::config::SEPOLIA_POOL_V4,
+            "pool_deploy_block": zkmsg_core::config::SEPOLIA_POOL_V4_DEPLOY_BLOCK,
+            "prover": SEPOLIA_V4_SEND_PROVER,
+            "virtual_sender": SEPOLIA_V4_VIRTUAL_SENDER,
+            "ticket_price": "3000000000000000000",
+            "epoch_blocks": 5000,
+            "max_epoch_lag": 1,
+            "quota": 10,
+            "fee_policy": {"max_fee": "3000000000000000000", "max_tip": "1000000000", "min_l2_gas": 100_000_000},
+            "content_lens": zkmsg_core::crypto::content_lens_v4(),
+            "retired_unpadded_pool": SEPOLIA_POOL_V4_UNPADDED,
+        },
         "domains": {
             "NULLIFIER_V4": felt_hex(&nullifier_v4_domain()),
             "TICKET_V4": felt_hex(&ticket_v4_domain()),
@@ -227,10 +248,13 @@ fn build() -> Value {
             "content_lens": zkmsg_core::crypto::content_lens_v4(),
             "max_plaintext": zkmsg_core::crypto::MAX_PLAINTEXT_V4,
             "recipient_scan_priv": felt_hex(&recipient_priv),
-            "recipient_kem_seed_byte": 7,
+            "recipient_scan_pub": felt_hex(&recipient_pub),
+            "recipient_kem_seed_hex": hex::encode([7u8; 64]),
+            "recipient_ek_sha3_256": ek_digest,
+            "aad": "tag (32 B BE) ‖ E (32 B BE), as v2",
             "ephemeral_priv": felt_hex(&Felt::from(271828u64)),
-            "kem_m_byte": 0x42,
-            "aead_nonce_byte": 9,
+            "kem_m_hex": hex::encode([0x42u8; 32]),
+            "aead_nonce_hex": hex::encode([9u8; 12]),
             "plaintext": "bytes b'a' + (i % 26)",
             "cases": sealing,
             "bad_padding": bad_padding,
@@ -317,7 +341,8 @@ fn live_pool_publish_reproduces() {
     let tx: Value = serde_json::from_str(&std::fs::read_to_string(testdata("v4_pool_publish_tx.json")).unwrap()).unwrap();
     let felts = |k: &str| -> Vec<Felt> { tx[k].as_array().unwrap().iter().map(|x| f(x.as_str().unwrap())).collect() };
     let (calldata, facts) = (felts("calldata"), felts("proof_facts"));
-    let pool = f(SEPOLIA_POOL_V4);
+    // Sent on the first (unpadded, since retired) pool; same encodings.
+    let pool = f(SEPOLIA_POOL_V4_UNPADDED);
     assert_eq!(f(tx["sender_address"].as_str().unwrap()), pool, "the pool publishes");
     assert_eq!(tx["signature"], json!([]), "and signs nothing");
 

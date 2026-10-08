@@ -18,15 +18,22 @@ use starknet_types_core::felt::Felt;
 pub const SEPOLIA_STORE_V3: &str =
     "0x0103de677e966a8a72669551093f0f5342621e635531fec146c4b04c5f5d3d9d";
 
+/// The first ZkmsgPoolV4 (2026-10-07, block 16,257,012) — RETIRED the same
+/// day for the padded pool below: it accepted any content of 1116..8192
+/// bytes. Its 6.27 STRK surplus stays locked (no owner).
+pub const SEPOLIA_POOL_V4_UNPADDED: &str =
+    "0x050f98ee98a0c1a583529c115f394ad79d18686ff66dc1ee25ba0f7bc53669b9";
+
 /// ZkmsgPoolV4 (contracts/zkmsg_pool_v4), deployed 2026-10-07
 /// (docs/zkmsg-deployment.md): the message store AND the account that
 /// publishes every send. A send carries no signature and names no member's
 /// account: the SNIP-36 proof (v3 membership + a per-epoch quota nullifier +
 /// a spent single-send ticket) authorizes it, and the ticket, bought earlier
-/// at `ticket_price`, pays for it. Registration (leaf, events, ABI) is v3's.
+/// at `ticket_price`, pays for it. Content must be one of the padded sizes
+/// 1372 / 2140 / 5212 bytes. Registration (leaf, events, ABI) is v3's.
 pub const SEPOLIA_POOL_V4: &str =
-    "0x050f98ee98a0c1a583529c115f394ad79d18686ff66dc1ee25ba0f7bc53669b9";
-pub const SEPOLIA_POOL_V4_DEPLOY_BLOCK: u64 = 16_257_012;
+    "0x07ba165780beacf1e4dd8fae2cbeb3873afdd0e3b806fb60fb1563fc2860e9eb";
+pub const SEPOLIA_POOL_V4_DEPLOY_BLOCK: u64 = 16_258_239;
 /// The pool's `ticket_price()`: 3 STRK per single-send ticket. Its fee
 /// policy caps a publish's worst case at the same 3 STRK (~2x a send's
 /// measured cost); what a send does not use stays in the pool.
@@ -449,6 +456,7 @@ mod tests {
         // The retired stores are just unknown addresses now.
         for retired in [
             SEPOLIA_STORE_V3,
+            SEPOLIA_POOL_V4_UNPADDED,
             "0x04dc92ef9a90d336a79188c5408cdf9ce480f3ecd5b1ce55ef2ca207f2c3afe8", // v2 PQ
             "0x002b9c6f617b3197dfed76401c32aa3b4b597ebdd01a7eba4b5657236bc8084f", // SNIP-36 v1
         ] {
