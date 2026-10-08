@@ -4,5 +4,6 @@ mod test_facts;
 mod test_policy;
 mod test_pool;
 mod test_prover;
+mod test_vectors_v4;
 mod test_virtual_sender;
 mod vector;

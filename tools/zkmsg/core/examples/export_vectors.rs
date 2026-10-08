@@ -8,6 +8,11 @@
 //!     cargo run -p zkmsg-core --example export_vectors > vectors.json
 //!
 //! Every input is fixed, so a rerun reproduces the output byte for byte.
+//!
+//! The v4 pool's encodings (quota nullifier, tickets, envelope key, the
+//! 10-felt payload, prove_send / send_message calldata, the unsigned pool
+//! publish) are a separate, committed file: `core/testdata/v4_vectors.json`,
+//! built and checked by `core/tests/v4_vectors.rs`.
 
 use serde_json::json;
 use starknet_types_core::felt::Felt;
