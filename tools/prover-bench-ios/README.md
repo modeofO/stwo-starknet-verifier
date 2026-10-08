@@ -4,7 +4,8 @@ Runs the real Stwo `prove` + `wrap` pipeline on an iPhone and reports peak
 `phys_footprint` — the memory ledger iOS jetsam actually enforces. The app
 links `privacy_prove_cairo_bridge` as a staticlib through the `zkmsg_prove` /
 `zkmsg_wrap` C entry points in `tools/privacy-prove-cairo-bridge/src/lib.rs`,
-so it exercises the same soundness-critical code the desktop CLI runs.
+so it exercises the lane-1 bridge's soundness-critical prove/wrap code (the
+zkmsg desktop CLI ran it until 2026-10-01, when sends moved to SNIP-36).
 
 Workload is the public `poseidon_chain(100)` fixture. No key material is
 bundled.

@@ -1,7 +1,9 @@
 # zkmsg desktop: SNIP-36 send + v2 (post-quantum) store (2026-10-01)
 
-**Blocked on** phase 2 of `2026-10-01-zkmsg-pq-hybrid-kem-design.md`: the v2
-prover and store must be deployed on Sepolia alpha, with addresses recorded in
+Status: **shipped 2026-10-01** (merged `09834e0`); membership superseded by v3
+(`2026-10-01-zkmsg-v3-pq-membership-design.md`). Originally *blocked on* phase 2
+of `2026-10-01-zkmsg-pq-hybrid-kem-design.md`: the v2 prover and store must be
+deployed on Sepolia alpha, with addresses recorded in
 `docs/zkmsg-deployment.md`. Work that doesn't need those addresses can start
 earlier; it's marked **(unblocked)**.
 

@@ -279,6 +279,9 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   time the same day: still rejected.
 - **zkmsg SHIPPED (2026-07-05): the first natively-proven private message
   on Starknet** — [`docs/zkmsg-deployment.md`](./docs/zkmsg-deployment.md).
+  *(Historical: this lane-1 send route — and the burner sweep and `from:`
+  line below — was retired from the client 2026-10-01; see the SNIP-36
+  bullet that follows for the current route.)*
   The FULL messagezk circuit (2×depth-20 Merkle membership + ephemeral
   ECDH + Poseidon commitment, `ec_op` — provable on lane 1's recursion
   route, never on lane 2's contract config) ported to a bootloader
@@ -308,12 +311,31 @@ Results so far: [`docs/spike1-results.md`](./docs/spike1-results.md).
   `0x4535d688…c46a`, whole loop deposit→send→sweep. Suites: store
   12/12, zkmsg-core 47/47 + gui 9/9 + cli 1/1, blake 5/5,
   poseidon 30/30.
-- **Next:** the qm31 gate-probe re-test on Starknet version bumps (the
-  only blocker for the public network), the messagezk-circuit sizing
-  pass (re-run `prove-blake` + the devnet drive on the real circuit;
-  drop to 6-query groups if the margin thins), Sepolia campaign under
-  the registry's governed route list once the gate opens; confirm the
-  Controller envelope with a live Sepolia session transaction.
+- **zkmsg on SNIP-36, v3 (2026-10-01; current)** —
+  [`docs/zkmsg-deployment.md`](./docs/zkmsg-deployment.md), "zkmsg v3".
+  A send is ONE transaction: the sender's device proves `prove_send`
+  (contract `ZkmsgSendProverV3`) in StarkWare's virtual Starknet OS, the
+  proof rides in the invoke, the sequencer verifies it, and the store
+  checks the transaction's `proof_facts` — no wrap, no staging, no
+  `StwoFactRegistry`. Store `MessageStoreV3` `0x0103de67…3d9d`, prover
+  `0x03d4da71…4f30` (Sepolia alpha). v2 made content and recipient
+  detection hybrid ML-KEM-768 + ECDH; v3 makes membership hash-based
+  (member secret `m`, leaf `poseidon([LEAF_V3, R, kem_digest, m_commit])`,
+  no EC step). Measured: desktop ~32–35 s wall, iPhone 14 Pro ~73–76 s
+  prove-to-publish, proving on the phone itself, ~1.54–1.57 STRK per send (vs ~47–50 STRK
+  on lane 1). Trust shift: under SNIP-36 the proof is checked by the
+  sequencer/validators, not re-checked by L1 settlement — lane 1 had
+  settlement coverage. Retired 2026-10-01: the lane-1 send route, the
+  lane-1 store (`0x02d66a02…91b7`), the SNIP-36 v1 and v2 stores, the
+  burner sweep, the `from:` line, the Phase B companion daemon and the
+  ffi crate.
+- **Next:** the sovereign lane stays the end state — the qm31 gate-probe
+  re-test on Starknet version bumps, the messagezk-circuit sizing pass,
+  and a Sepolia campaign under the registry's governed route list once
+  the gate opens, so zkmsg can again carry settlement-checked
+  verification. On zkmsg itself: per-member rate-limit nullifiers (which
+  v3's member secret enables; v3 spec), and metadata work (timing,
+  anonymity set, RPC exposure).
 
 ## Layout
 
@@ -334,12 +356,20 @@ scarb build
 
 ## Honest framing
 
-- The incumbent is SNIP-36: one tx, ~cents, seconds — but it requires a local
-  native proving service and only proves virtual-SNOS executions. This
-  project's win condition is UX + generality (browser proofs of arbitrary
-  Cairo executables), accepting higher on-chain cost.
-- Stwo proofs are not formally ZK; this route posts the full proof into
-  public calldata permanently. Do not put long-lived secrets in witnesses.
+- SNIP-36 is what zkmsg ships on today (since 2026-10-01): one tx, ~1.5
+  STRK, tens of seconds, proven on the user's own desktop or phone — but it
+  only proves virtual-OS executions of Starknet contracts, and the proof is
+  checked by the sequencer/validators rather than re-checked at L1
+  settlement. The registry lanes here remain the route for arbitrary Cairo
+  executables and for settlement-checked verification, accepting higher
+  on-chain cost.
+- The registry lanes' proofs have no ZK blinding (Stwo itself has no
+  masking or salted commitments), and these routes post the full proof into
+  public calldata permanently. Do not put long-lived secrets in their
+  witnesses. The SNIP-36 route differs: StarkWare's privacy prover wraps the
+  inner proof in a recursive proof with ZK blinding (`add_zk_blinding`, 35
+  random rows per component) and only that proof leaves the device. The
+  blinding is heuristic, not proven ZK.
 - Any `set_verifier`-style integration in consumer contracts must be
   owner-gated and eventually immutable — a swappable verifier is a rug vector.
 

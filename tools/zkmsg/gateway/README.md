@@ -1,5 +1,15 @@
 # zkmsg-gateway — the client that needs no RPC provider
 
+> **Status (2026-10-07): spike crate, not in the send/read path.** Neither
+> the desktop client nor the phone uses it: the phone reads through
+> JSON-RPC and publishes through the sequencer gateway, and so does the
+> desktop. It decodes `UserRegistered` as v1/lane-1 events
+> (`[handle, scan_pubkey, leaf_index]`) and inserts the raw scan key as the
+> leaf, so its `registry` root is **wrong for v3 stores** (leaf =
+> `poseidon([LEAF_V3, R, kem_digest, m_commit])`, `m_commit` and the
+> ML-KEM key in the event data). Kept as the record of the feeder-only
+> approach.
+
 Answers zkmsg's chain queries by syncing raw blocks from a **feeder gateway**
 and replaying contract logic locally, instead of calling a JSON-RPC provider.
 
@@ -10,7 +20,7 @@ Two reasons it exists:
    without this the phone can never reach the network its future depends on.
 2. **On any network it removes a trusted third party.** An RPC provider sees
    your IP alongside the exact events you ask for — the deanonymisation vector
-   `docs/THREAT_MODEL.md` calls out. A client that syncs whole blocks reveals
+   zkmsg-ios's `docs/THREAT_MODEL.md` calls out. A client that syncs whole blocks reveals
    nothing about which of them it cares about.
 
 ## The idea
@@ -53,8 +63,9 @@ rate-limits per IP**. Measured against integration:
 | 2 | **12 blocks/s** | sustained |
 | 4+ | — | HTTP 429 within a few hundred blocks |
 
-At 12 blocks/s and ~30 s block times, that is roughly **4 minutes per day of
-chain history**, or two hours per month. Practical consequences:
+At 12 blocks/s and integration's ~1.7 s block time (measured from feeder
+timestamps, 2026-07-29 and 2026-10-07), that is roughly **70 minutes per day
+of chain history**, or about 36 hours per month. Practical consequences:
 
 - Sync from the store's **deployment height**, never genesis.
 - Persist the cursor and the derived tree; only the delta matters after the
@@ -72,13 +83,16 @@ that is a much larger build and is not attempted here.
 
 ## Live on sepolia-integration (deployed 2026-07-29)
 
+The store deployed here is the **lane-1** `MessageStoreV3` class (fact-registry
+consumer), not the SNIP-36 v3 store on Sepolia alpha.
+
 The store now exists next to the qm31 verifier, so the full phone-first
 architecture has a home on the network where single-transaction verification
 is possible:
 
 | Thing | Address |
 |---|---|
-| `MessageStoreV3` class | `0x4dc67c0ad76d9674a80d6dcb717cec7334014f2d5df986c440ed1aa62765745` |
+| lane-1 `MessageStoreV3` class | `0x4dc67c0ad76d9674a80d6dcb717cec7334014f2d5df986c440ed1aa62765745` |
 | store instance (salt `qm31`) | `0x6f3db45f5a5bbef78dd7f8c93b76894c453fce935423fc40bb68475df64a30b` |
 | pinned fact registry (qm31) | `0xae46627b660dfc659e00e21e5c03660f1c891e8230cd5900ddc564fe36cf22` |
 
@@ -110,6 +124,6 @@ cargo test -p zkmsg-gateway -- --ignored   # live tests against integration
 
 `registry` is the payoff: it rebuilds the membership tree from events and
 prints the root, members and paths — the view calls, served locally.
-(It needs a store deployed on the target network; on integration the campaign
-deployed only the verifier and registry, so point it at alpha-sepolia's store
-or deploy one there first.)
+(It needs a store deployed on the target network: on integration, the lane-1
+store above. Pointed at the alpha-sepolia v3 store it prints a wrong root; see
+the status note.)

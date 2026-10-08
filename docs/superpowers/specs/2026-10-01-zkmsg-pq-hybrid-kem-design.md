@@ -1,5 +1,10 @@
 # zkmsg v2: hybrid post-quantum key exchange (ML-KEM-768 + ECDH) (2026-10-01)
 
+Status: **shipped 2026-10-01** on Sepolia alpha, phone and desktop (merged
+`09834e0`; deployment and runs in `docs/zkmsg-deployment.md`). The hybrid
+content key and recipient tag carry forward unchanged; membership is superseded
+by v3 (`2026-10-01-zkmsg-v3-pq-membership-design.md`).
+
 Owner decision: **option B**. The content key and the recipient tag come from a
 hybrid of ML-KEM-768 and the existing Stark-curve ECDH. The recipient check
 leaves the zk statement, which keeps only sender membership. New prover
@@ -131,7 +136,8 @@ Cost per event: one Stark-curve multiplication plus one ML-KEM decapsulation
 - **Recipient:** the tag needs both shared secrets. ML-KEM ciphertexts are
   believed not to reveal the public key they were made for (ANO-CCA;
   Grubbs–Maram–Paterson 2022), so `kem_ct` doesn't identify the recipient.
-- **Sender:** unchanged. The S-two proof is zero-knowledge and hash-based.
+- **Sender:** unchanged. The S-two proof is hash-based and zero-knowledge by
+  design (heuristic blinding; corrected 2026-10-07, see `tools/zkmsg/README.md`).
   - A quantum adversary can forge *membership*: compute a member's `r` and
     prove as them. That is spam or impersonation of "a member sent this". It
     breaks neither confidentiality nor recipient privacy.
