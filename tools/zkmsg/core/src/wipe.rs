@@ -426,6 +426,12 @@ fn owned_entries(root: &Path) -> Vec<PathBuf> {
     if root.join("current").is_file() {
         out.push(root.join("current"));
     }
+    // Tor's guards and directory cache say this machine used Tor for zkmsg.
+    for name in [crate::net::TOR_DIR, crate::net::SETTINGS_FILE] {
+        if root.join(name).symlink_metadata().is_ok() {
+            out.push(root.join(name));
+        }
+    }
     if root.join("config.json").is_file() {
         const LEGACY: [&str; 13] = [
             "config.json", "keys.json", "sends", "inbox.json", "proofs", "vault.json", "tickets.json",
@@ -481,6 +487,15 @@ pub fn sncast_accounts_path() -> Result<PathBuf> {
     // Tests must never rewrite the real accounts file.
     if cfg!(test) {
         return Ok(std::env::temp_dir().join("zkmsg-test-no-such-sncast-accounts.json"));
+    }
+    // A namespaced run (ZKMSG_KEYCHAIN_NAMESPACE, used for live tests) must
+    // not either: its profiles may name real accounts (2026-10-11 a test
+    // profile naming "zkmsg-carol" removed the real entry; restored from a
+    // duplicate). Delete and panic wipe then edit a throwaway file instead.
+    if let Ok(ns) = std::env::var("ZKMSG_KEYCHAIN_NAMESPACE") {
+        if !ns.is_empty() {
+            return Ok(std::env::temp_dir().join(format!("{ns}.sncast-accounts.json")));
+        }
     }
     Ok(PathBuf::from(std::env::var("HOME")?)
         .join(".starknet_accounts/starknet_open_zeppelin_accounts.json"))
