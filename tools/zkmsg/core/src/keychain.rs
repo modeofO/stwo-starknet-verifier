@@ -9,7 +9,8 @@
 //! Tests (and `ZKMSG_KEYSTORE=memory`) use an in-process store instead.
 //! `ZKMSG_KEYCHAIN_NAMESPACE=<word>` prefixes every service name, so a
 //! live end-to-end run can use the real Keychain without touching the
-//! user's own items.
+//! user's own items; it also points delete and panic wipe at a throwaway
+//! sncast accounts file (`wipe::sncast_accounts_path`).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -9,6 +9,7 @@ pub mod crypto;
 pub mod inbox;
 pub mod invoke_v3;
 pub mod keychain;
+pub mod net;
 pub mod pipeline;
 pub mod profiles;
 pub mod registry;

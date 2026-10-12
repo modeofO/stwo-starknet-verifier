@@ -1,0 +1,15 @@
+[package]
+license = "Apache-2.0"
+name = "zkmsg-tor"
+version = "0.1.0"
+edition = "2021"
+description = "Embedded Tor (Arti) behind a local, password-protected HTTP CONNECT proxy with one circuit family per role."
+
+[dependencies]
+anyhow.workspace = true
+arti-client = { version = "0.47", features = ["tokio", "native-tls"] }
+tor-rtcompat = { version = "0.47", features = ["tokio", "native-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+base64 = "0.22"
+rand.workspace = true
+hex.workspace = true

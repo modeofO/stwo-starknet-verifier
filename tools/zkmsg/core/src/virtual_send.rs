@@ -369,7 +369,11 @@ pub fn run_prover(
          \"virtual_prover_bin\" in config.json",
         prover_bin.display()
     );
-    let mut child = Command::new(prover_bin)
+    let mut command = Command::new(prover_bin);
+    // The prover's state reads (reqwest) follow HTTPS_PROXY: with Tor on,
+    // they go out on the Prove circuits.
+    crate::net::proxy_command(&mut command, crate::net::Role::Prove);
+    let mut child = command
         .arg(out_path)
         .env("ZKMSG_SPILL_DIR", spill)
         .stdin(Stdio::piped())
@@ -460,8 +464,11 @@ impl<'a> VirtualSender<'a> {
         Ok(Self {
             home,
             route,
-            chain: Chain::new(config.prover_rpc_url(), &config.account),
-            gateway: Gateway::sepolia(),
+            chain: Chain::new(config.prover_rpc_url(), &config.account).with_role(crate::net::Role::Prove),
+            gateway: match config.publish_rpc() {
+                Some(url) => Gateway::sepolia_via_rpc(url),
+                None => Gateway::sepolia(),
+            },
             prover_bin: config.virtual_prover_bin(),
         })
     }

@@ -23,14 +23,40 @@ fn main() -> eframe::Result<()> {
         None => (default_home(), true),
     };
     let profile_override = parse_profile_arg();
+    let tor = start_tor(&launch_path);
     let native = eframe::NativeOptions::default();
     eframe::run_native(
         "zkmsg",
         native,
         Box::new(move |_cc| {
-            Ok(Box::new(app::ZkmsgApp::new(launch_path, profile_override, is_default_home)))
+            Ok(Box::new(app::ZkmsgApp::new(launch_path, profile_override, is_default_home, tor)))
         }),
     )
+}
+
+/// With Tor on (`network.json` under the profile root), starts it before
+/// anything else and routes every request through it. Tor bootstraps in the
+/// background while the lock screen is up; a request made before it is ready
+/// waits for it. If Tor cannot start, the app still opens, and the error is
+/// shown, but nothing goes out directly: routing is fixed to the proxy.
+fn start_tor(launch_path: &std::path::Path) -> app::TorState {
+    use zkmsg_core::net::{self, NetSettings};
+    let root = zkmsg_core::profiles::profile_root(launch_path);
+    if !NetSettings::load(&root).tor {
+        return app::TorState::Off;
+    }
+    match zkmsg_tor::Tor::start(&root.join(net::TOR_DIR)) {
+        Ok(tor) => match net::use_tor(|role| tor.proxy_url(role.name())) {
+            Ok(()) => app::TorState::On(tor),
+            Err(e) => app::TorState::Failed(format!("{e:#}")),
+        },
+        Err(e) => {
+            // Fail closed: route to a proxy that does not exist rather than
+            // fall back to direct connections.
+            let _ = net::use_tor(|_| "http://unavailable:x@127.0.0.1:9".to_string());
+            app::TorState::Failed(format!("{e:#}"))
+        }
+    }
 }
 
 fn default_home() -> PathBuf {

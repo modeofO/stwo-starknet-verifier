@@ -40,6 +40,14 @@ struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
+    /// Route this run through Tor, whatever `zkmsg tor` says.
+    #[arg(long, global = true, conflicts_with = "no_tor")]
+    tor: bool,
+
+    /// Connect directly for this run, whatever `zkmsg tor` says.
+    #[arg(long, global = true)]
+    no_tor: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -106,6 +114,12 @@ enum Command {
     PanicWipe,
     /// Change the app PIN (asks the current one first; that attempt counts).
     ChangePin,
+    /// Route all traffic through Tor (embedded), or not: `on`, `off`, or
+    /// `status`. Applies to every profile on this machine.
+    Tor {
+        #[arg(value_parser = ["on", "off", "status"])]
+        action: String,
+    },
     DeleteProfile {
         /// Profile name under the profile root.
         name: String,
@@ -131,7 +145,12 @@ fn main() -> Result<()> {
     if let Command::PanicWipe = &cli.command {
         return cmd_panic_wipe(&root);
     }
+    if let Command::Tor { action } = &cli.command {
+        return cmd_tor(&root, action);
+    }
     gate(&root)?;
+    // Kept alive for the whole run: it carries every request.
+    let _tor = start_network(&root, &cli)?;
     if let Command::ChangePin = &cli.command {
         return cmd_change_pin(&root);
     }
@@ -170,7 +189,7 @@ fn main() -> Result<()> {
         Command::Inbox => cmd_inbox(&home),
         Command::Status => cmd_status(&home),
         Command::MigrateStore { account, .. } => cmd_migrate_store(&home, account.as_deref()),
-        Command::DeleteProfile { .. } | Command::PanicWipe | Command::ChangePin => {
+        Command::DeleteProfile { .. } | Command::PanicWipe | Command::ChangePin | Command::Tor { .. } => {
             unreachable!("handled before the home resolves")
         }
     }
@@ -318,6 +337,48 @@ fn gate(root: &std::path::Path) -> Result<()> {
 
 fn wait_label(secs: u64) -> String {
     if secs >= 60 { format!("{} min", secs.div_ceil(60)) } else { format!("{secs} s") }
+}
+
+/// Starts Tor and routes every request through it, if this run uses Tor
+/// (`--tor` / `--no-tor`, else `zkmsg tor`'s setting).
+fn start_network(root: &std::path::Path, cli: &Cli) -> Result<Option<zkmsg_tor::Tor>> {
+    use zkmsg_core::net::{self, NetSettings};
+    let on = if cli.tor {
+        true
+    } else if cli.no_tor {
+        false
+    } else {
+        NetSettings::load(root).tor
+    };
+    if !on {
+        return Ok(None);
+    }
+    eprintln!("connecting to Tor…");
+    let tor = zkmsg_tor::Tor::start(&root.join(net::TOR_DIR))?;
+    tor.wait_ready(std::time::Duration::from_secs(120))?;
+    net::use_tor(|role| tor.proxy_url(role.name()))?;
+    eprintln!("Tor ready");
+    Ok(Some(tor))
+}
+
+fn cmd_tor(root: &std::path::Path, action: &str) -> Result<()> {
+    use zkmsg_core::net::NetSettings;
+    let mut settings = NetSettings::load(root);
+    match action {
+        "on" | "off" => {
+            settings.tor = action == "on";
+            settings.save(root)?;
+            println!("Tor {action} for every profile under {}", root.display());
+        }
+        _ => println!("Tor is {}", if settings.tor { "on" } else { "off" }),
+    }
+    if settings.tor {
+        println!(
+            "with Tor on, sends publish through JSON-RPC (StarkWare's gateway refuses Tor exits); \
+             set \"publish_via_rpc\": false in a profile's config.json to override"
+        );
+    }
+    Ok(())
 }
 
 fn cmd_change_pin(root: &std::path::Path) -> Result<()> {

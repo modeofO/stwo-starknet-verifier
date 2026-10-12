@@ -90,7 +90,18 @@ pub struct ZkmsgApp {
     panic: Option<PanicUi>,
     /// The session to reopen on unlock after a lock.
     reopen: Option<(String, PathBuf)>,
+    tor: TorState,
+    /// The Tor setting as saved now; differs from `tor` until a restart.
+    tor_wanted: bool,
     last_input: std::time::Instant,
+}
+
+/// Whether this run goes through Tor (`network.json`), fixed at launch.
+pub enum TorState {
+    Off,
+    On(zkmsg_tor::Tor),
+    /// Tor was wanted but did not start; requests fail rather than go direct.
+    Failed(String),
 }
 
 /// Unlocked and untouched this long (and nothing running): lock.
@@ -101,6 +112,7 @@ impl ZkmsgApp {
         launch_path: PathBuf,
         profile_override: Option<String>,
         is_default_home: bool,
+        tor: TorState,
     ) -> Self {
         let mut root = None;
         let mut classified_root = None;
@@ -175,6 +187,8 @@ impl ZkmsgApp {
             panic: None,
             reopen: None,
             last_input: std::time::Instant::now(),
+            tor_wanted: zkmsg_core::net::NetSettings::load(&zkmsg_core::profiles::profile_root(&launch_path)).tor,
+            tor,
         }
     }
 
@@ -405,6 +419,37 @@ impl ZkmsgApp {
         }
     }
 
+    /// The Tor indicator and switch. The switch saves the setting; it takes
+    /// effect at the next launch (routing is fixed for a run).
+    fn tor_control(&mut self, ui: &mut egui::Ui) {
+        let (text, color) = match &self.tor {
+            TorState::Off => ("direct".to_string(), ui.visuals().weak_text_color()),
+            TorState::On(t) => match t.status() {
+                zkmsg_tor::Status::Ready => ("Tor".to_string(), egui::Color32::from_rgb(60, 160, 90)),
+                zkmsg_tor::Status::Bootstrapping => ("Tor connecting…".to_string(), egui::Color32::from_rgb(200, 150, 40)),
+                zkmsg_tor::Status::Failed(e) => (format!("Tor failed: {e}"), egui::Color32::RED),
+            },
+            TorState::Failed(e) => (format!("Tor failed: {e}"), egui::Color32::RED),
+        };
+        let mut wanted = self.tor_wanted;
+        ui.menu_button(egui::RichText::new(text).color(color).small(), |ui| {
+            if ui.checkbox(&mut wanted, "Route everything through Tor").changed() {
+                let settings = zkmsg_core::net::NetSettings { tor: wanted };
+                if settings.save(&self.lock_root).is_ok() {
+                    self.tor_wanted = wanted;
+                }
+            }
+            let running = !matches!(self.tor, TorState::Off);
+            if self.tor_wanted != running {
+                ui.label("Restart zkmsg to apply.");
+            }
+            ui.small("Sends publish through JSON-RPC while Tor is on (StarkWare's gateway refuses Tor).");
+        });
+        if matches!(&self.tor, TorState::On(t) if t.status() == zkmsg_tor::Status::Bootstrapping) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
+    }
+
     /// Drives the New-profile wizard for one frame. Extracts the funding
     /// source (the active session's account + rpc) so the wizard can borrow
     /// them without a `self` borrow conflict, then acts on its outcome: on
@@ -600,6 +645,7 @@ impl eframe::App for ZkmsgApp {
                 if ui.small_button("Panic wipe…").clicked() {
                     self.panic = Some(PanicUi::new());
                 }
+                self.tor_control(ui);
                 if ui.add_enabled(!app_busy, egui::Button::new("Lock").small()).clicked() {
                     lock_clicked = true;
                 }

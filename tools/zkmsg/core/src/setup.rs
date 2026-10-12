@@ -219,7 +219,7 @@ impl SetupRunner<'_> {
     }
 
     fn step_create(&self, state: &mut SetupState) -> Result<(Option<String>, Option<String>)> {
-        let chain = Chain::new(self.rpc_url, &state.source_account);
+        let chain = Chain::new(self.rpc_url, &state.source_account).with_role(crate::net::Role::Account);
         let (address, note) = match chain.account_create(&state.account_name) {
             Ok(addr) => (addr.clone(), addr),
             // A previous run may have created the account before dying; if
@@ -241,7 +241,7 @@ impl SetupRunner<'_> {
     ) -> Result<StepOutcome> {
         ensure!(state.fund_strk > 0, "fund amount must be > 0 STRK");
         let address = state.address.clone().context("fund step before address is known")?;
-        let chain = Chain::new(self.rpc_url, &state.source_account);
+        let chain = Chain::new(self.rpc_url, &state.source_account).with_role(crate::net::Role::Account);
 
         if state.fund_mode == FundMode::External {
             // Never transfers. Covered -> done; not covered -> park. A
@@ -300,7 +300,7 @@ impl SetupRunner<'_> {
         kind: &SetupStepKind,
         sink: &mut dyn FnMut(SetupEvent),
     ) -> Result<(Option<String>, Option<String>)> {
-        let chain = Chain::new(self.rpc_url, &state.source_account);
+        let chain = Chain::new(self.rpc_url, &state.source_account).with_role(crate::net::Role::Account);
         match chain.account_deploy(&state.account_name) {
             Ok(tx) => {
                 sink(SetupEvent::TxSubmitted { kind: kind.clone(), tx_hash: tx.clone() });

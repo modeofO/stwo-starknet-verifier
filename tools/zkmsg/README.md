@@ -318,6 +318,27 @@ unlinkable loop 2026-07-10 — external deposit, send to alice (fact
 `0x4535d688…c46a`), sweep + archive: see
 `docs/zkmsg-deployment.md`.
 
+## Tor (2026-10-11, opt-in)
+
+`zkmsg tor on` (or the Tor switch in the GUI's top bar, applied at the next
+launch; `--tor` / `--no-tor` for one CLI run) routes every request through
+Tor, embedded with Arti (`tor/`, crate `zkmsg-tor`). Arti runs in the
+process behind a local HTTP CONNECT proxy on 127.0.0.1 that answers only
+this process (a random secret) and only port 443, by host name, so no DNS
+query leaves the machine. Each kind of traffic gets its own Tor circuits:
+reads (inbox, status, logs), account transactions (register, buy tickets,
+deploy), proving (preparation and the prover's state reads; the prover and
+sncast subprocesses get the proxy through `HTTPS_PROXY`), and publishing.
+Arti's state lives in `~/.zkmsg/tor/`; the panic wipe removes it.
+
+StarkWare's gateway and feeder refuse most Tor exits (2026-10-11: 7 of 8
+exits got 403), so with Tor on a send is published through JSON-RPC
+instead: RPC 0.10.3 takes `proof` and `proof_facts` on
+`starknet_addInvokeTransaction`, and zan accepts them. A profile can force
+either route with `"publish_via_rpc": true|false` and pick the endpoint with
+`"publish_rpc_url"` in its config.json. Measured over Tor: about 1.3–3 s
+per RPC call. Not yet proven with a real send through the RPC route.
+
 ## What's public, what's private (v4, honest)
 
 - **Private, cryptographically**: message content (AES-256-GCM under a

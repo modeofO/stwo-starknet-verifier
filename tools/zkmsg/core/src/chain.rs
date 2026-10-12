@@ -54,11 +54,20 @@ pub struct Chain {
     pub account: String,
     /// `None`: JSON-RPC over HTTP to `rpc_url`.
     transport: Option<Transport>,
+    /// Which traffic this is (`net`): with Tor on, each role has its own
+    /// circuits. Reads unless said otherwise.
+    role: crate::net::Role,
 }
 
 impl Chain {
     pub fn new(rpc_url: &str, account: &str) -> Self {
-        Self { rpc_url: rpc_url.into(), account: account.into(), transport: None }
+        Self { rpc_url: rpc_url.into(), account: account.into(), transport: None, role: crate::net::Role::Read }
+    }
+
+    /// The same chain, its traffic counted as `role` (`net`).
+    pub fn with_role(mut self, role: crate::net::Role) -> Self {
+        self.role = role;
+        self
     }
 
     /// A chain whose raw RPC goes to `transport` instead of the network.
@@ -73,6 +82,7 @@ impl Chain {
         cmd.arg("--json").arg("--account").arg(&self.account);
         cmd.args(args);
         cmd.arg("--url").arg(&self.rpc_url);
+        crate::net::proxy_command(&mut cmd, self.role);
         let out = cmd.output().context("running sncast")?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
@@ -109,6 +119,8 @@ impl Chain {
     fn sncast_account(args: &[&str], url: &str) -> Result<Value> {
         let mut cmd = Command::new("sncast");
         cmd.arg("--json").arg("account").args(args).arg("--url").arg(url);
+        // Account create and deploy: the new account's own traffic.
+        crate::net::proxy_command(&mut cmd, crate::net::Role::Account);
         let out = cmd.output().context("running sncast account")?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
@@ -177,7 +189,8 @@ impl Chain {
             return transport(method, &params);
         }
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let reply: Value = ureq::post(&self.rpc_url)
+        let reply: Value = crate::net::agent(self.role)
+            .post(&self.rpc_url)
             .set("Content-Type", "application/json")
             .send_json(body)
             .with_context(|| format!("rpc {method}"))?

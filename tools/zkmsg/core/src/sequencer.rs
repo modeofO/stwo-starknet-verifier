@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use starknet_types_core::felt::Felt;
 
 use crate::chain::felt_hex;
+use crate::net::{self, Role};
 use crate::invoke_v3::{Bounds, Call, InvokeV3, Signer, execute_calldata};
 
 pub const SEPOLIA_GATEWAY: &str = "https://alpha-sepolia.starknet.io/gateway";
@@ -125,12 +126,20 @@ pub struct ProofAttachment<'a> {
 pub struct SignedInvoke {
     pub hash: Felt,
     body: Value,
+    /// The same transaction in JSON-RPC spelling (`starknet_addInvokeTransaction`).
+    rpc_body: Value,
 }
 
 pub struct Gateway {
     pub gateway_url: String,
     pub feeder_url: String,
     pub chain_id: Felt,
+    /// `Some`: publish and poll through this JSON-RPC endpoint instead of the
+    /// gateway and feeder. RPC 0.10.3 takes `proof` and `proof_facts` on
+    /// `starknet_addInvokeTransaction` (zan does); StarkWare's gateway and
+    /// feeder refuse most Tor exits (measured 2026-10-11: 7 of 8 got 403), so
+    /// with Tor on this is the only route that works.
+    pub rpc_url: Option<String>,
 }
 
 impl Gateway {
@@ -139,7 +148,13 @@ impl Gateway {
             gateway_url: SEPOLIA_GATEWAY.into(),
             feeder_url: SEPOLIA_FEEDER.into(),
             chain_id: crate::invoke_v3::short_string("SN_SEPOLIA"),
+            rpc_url: None,
         }
+    }
+
+    /// Sepolia, publishing through `rpc_url` instead of the gateway.
+    pub fn sepolia_via_rpc(rpc_url: &str) -> Self {
+        Self { rpc_url: Some(rpc_url.to_string()), ..Self::sepolia() }
     }
 
     /// Signs one INVOKE v3 with `attachment`'s facts in the hash. Nothing is
@@ -155,6 +170,7 @@ impl Gateway {
         let mut invoke = self.invoke(signer.address, calls, nonce, bounds, 0, attachment);
         let [r, s] = signer.sign(&invoke.hash)?;
         invoke.body["signature"] = json!([felt_hex(&r), felt_hex(&s)]);
+        invoke.rpc_body["signature"] = json!([felt_hex(&r), felt_hex(&s)]);
         Ok(invoke)
     }
 
@@ -208,18 +224,38 @@ impl Gateway {
             "nonce_data_availability_mode": 0,
             "fee_data_availability_mode": 0,
         });
+        let mut rpc_body = json!({
+            "type": "INVOKE",
+            "version": "0x3",
+            "sender_address": felt_hex(&sender),
+            "calldata": calldata.iter().map(felt_hex).collect::<Vec<_>>(),
+            "signature": [],
+            "nonce": felt_hex(&nonce),
+            "resource_bounds": bounds.rpc_json(),
+            "tip": format!("{tip:#x}"),
+            "paymaster_data": [],
+            "account_deployment_data": [],
+            "nonce_data_availability_mode": "L1",
+            "fee_data_availability_mode": "L1",
+        });
         if let Some(a) = attachment {
+            let facts = json!(a.proof_facts.iter().map(felt_hex).collect::<Vec<_>>());
             body["proof"] = json!(a.proof);
-            body["proof_facts"] = json!(a.proof_facts.iter().map(felt_hex).collect::<Vec<_>>());
+            body["proof_facts"] = facts.clone();
+            rpc_body["proof"] = json!(a.proof);
+            rpc_body["proof_facts"] = facts;
         }
-        SignedInvoke { hash, body }
+        SignedInvoke { hash, body, rpc_body }
     }
 
     /// Submits a signed invoke, checking the gateway echoes the hash we
     /// signed. An `Err` that is not a `GatewayError::Rejected` says nothing
     /// about whether the gateway kept the transaction: poll the hash.
     pub fn submit(&self, signed: &SignedInvoke) -> Result<()> {
-        let reply = self.post("add_transaction", &signed.body)?;
+        let reply = match &self.rpc_url {
+            Some(url) => rpc_call(url, "starknet_addInvokeTransaction", json!({"invoke_transaction": signed.rpc_body}))?,
+            None => self.post("add_transaction", &signed.body)?,
+        };
         let echoed = reply["transaction_hash"]
             .as_str()
             .with_context(|| format!("no transaction_hash in gateway reply: {reply}"))?;
@@ -234,9 +270,13 @@ impl Gateway {
     }
 
     pub fn status(&self, hash: &Felt) -> Result<TxStatus> {
+        if let Some(url) = &self.rpc_url {
+            return rpc_status(url, hash);
+        }
         let url = format!("{}/get_transaction_status", self.feeder_url);
         let reply: Value = with_retries(|| {
-            ureq::get(&url)
+            net::agent(Role::Publish)
+                .get(&url)
                 .query("transactionHash", &felt_hex(hash))
                 .timeout(Duration::from_secs(60))
                 .call()
@@ -285,7 +325,7 @@ impl Gateway {
     fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let url = format!("{}/{path}", self.gateway_url);
         // A proof-carrying submission is verified before the gateway answers.
-        match ureq::post(&url).timeout(Duration::from_secs(180)).send_json(body.clone()) {
+        match net::agent(Role::Publish).post(&url).timeout(Duration::from_secs(180)).send_json(body.clone()) {
             Ok(resp) => Ok(resp.into_json()?),
             Err(ureq::Error::Status(status, resp)) => {
                 let text = resp.into_string().unwrap_or_default();
@@ -300,6 +340,56 @@ impl Gateway {
             }
             Err(e) => Err(e).with_context(|| format!("gateway {path}")),
         }
+    }
+}
+
+/// One JSON-RPC call on the Publish role. A JSON-RPC error is a
+/// `GatewayError::Rejected`, its code spelled like the gateway's where the
+/// caller acts on it (52 = INVALID_TRANSACTION_NONCE).
+fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value> {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    let reply: Value = match net::agent(Role::Publish)
+        .post(url)
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(180))
+        .send_json(body)
+    {
+        Ok(resp) => resp.into_json()?,
+        Err(ureq::Error::Status(status, resp)) => {
+            bail!("rpc {method}: HTTP {status}: {}", resp.into_string().unwrap_or_default())
+        }
+        Err(e) => return Err(e).with_context(|| format!("rpc {method}")),
+    };
+    if let Some(err) = reply.get("error") {
+        let code = err["code"].as_i64().unwrap_or_default();
+        let data = match &err["data"] {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        let message = format!("{} {data}", err["message"].as_str().unwrap_or_default()).trim().to_string();
+        let code = match code {
+            52 => "RPC.INVALID_TRANSACTION_NONCE".to_string(),
+            c => format!("RPC.{c}"),
+        };
+        return Err(GatewayError::Rejected { code, message }.into());
+    }
+    Ok(reply["result"].clone())
+}
+
+/// `starknet_getTransactionStatus`, as a `TxStatus`. An unknown hash
+/// (error 29) reads as NOT_RECEIVED, like the feeder's answer.
+fn rpc_status(url: &str, hash: &Felt) -> Result<TxStatus> {
+    match rpc_call(url, "starknet_getTransactionStatus", json!([felt_hex(hash)])) {
+        Ok(r) => Ok(TxStatus {
+            finality: r["finality_status"].as_str().unwrap_or("UNKNOWN").to_string(),
+            execution: r["execution_status"].as_str().unwrap_or("").to_string(),
+            revert_reason: r["failure_reason"].as_str().map(String::from),
+        }),
+        Err(e) if matches!(e.downcast_ref::<GatewayError>(), Some(GatewayError::Rejected { code, .. }) if code == "RPC.29") => {
+            Ok(TxStatus { finality: "NOT_RECEIVED".into(), execution: String::new(), revert_reason: None })
+        }
+        Err(e) => Err(e),
     }
 }
 

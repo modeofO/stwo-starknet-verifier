@@ -105,6 +105,17 @@ pub struct Config {
     /// doesn't). Absent: `SEPOLIA_PROVER_RPC`.
     #[serde(default)]
     pub prover_rpc_url: Option<String>,
+    /// Where a send is published: `Some(true)` through JSON-RPC
+    /// (`publish_rpc_url`), `Some(false)` through StarkWare's gateway.
+    /// Absent: JSON-RPC when Tor is on (the gateway refuses Tor exits),
+    /// the gateway otherwise.
+    #[serde(default)]
+    pub publish_via_rpc: Option<bool>,
+    /// The JSON-RPC endpoint a send is published through. It must accept
+    /// `proof` and `proof_facts` on `starknet_addInvokeTransaction` (RPC
+    /// 0.10.3). Absent: the prover RPC.
+    #[serde(default)]
+    pub publish_rpc_url: Option<String>,
 }
 
 impl Config {
@@ -116,6 +127,8 @@ impl Config {
             burner: false,
             virtual_prover_bin: Some(default_virtual_prover_bin(repo_root)),
             prover_rpc_url: None,
+            publish_via_rpc: None,
+            publish_rpc_url: None,
         }
     }
 
@@ -132,6 +145,13 @@ impl Config {
 
     pub fn prover_rpc_url(&self) -> &str {
         self.prover_rpc_url.as_deref().unwrap_or(SEPOLIA_PROVER_RPC)
+    }
+
+    /// The publish route: the RPC URL to publish through, or `None` for the
+    /// gateway.
+    pub fn publish_rpc(&self) -> Option<&str> {
+        let via_rpc = self.publish_via_rpc.unwrap_or_else(crate::net::tor);
+        via_rpc.then(|| self.publish_rpc_url.as_deref().unwrap_or_else(|| self.prover_rpc_url()))
     }
 }
 

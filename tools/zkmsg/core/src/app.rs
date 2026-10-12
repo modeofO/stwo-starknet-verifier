@@ -138,7 +138,7 @@ pub fn register(home: &Home, handle: &str) -> Result<RegisterOutcome> {
     let digest = kem_digest(&ek);
     let m_commit = member_commit(&keys.member_secret_felt()?);
 
-    let chain = Chain::new(&config.rpc_url, &config.account);
+    let chain = Chain::new(&config.rpc_url, &config.account).with_role(crate::net::Role::Account);
     let handle_felt = short_string_felt(handle)?;
     let ours = |user: &Member| {
         Some(user.scan_pub) == keys.scan_pub_felt().ok()
@@ -340,7 +340,7 @@ pub fn buy_tickets(home: &Home, n: usize) -> Result<TicketPurchase> {
     ensure!(is_current_store(&config.store), "{} is not the v4 pool — `zkmsg migrate-store` first", config.store);
     let max = crate::txpolicy::MAX_TICKETS_PER_PURCHASE;
     ensure!((1..=max).contains(&n), "buy 1..={max} tickets at a time");
-    let chain = Chain::new(&config.rpc_url, &config.account);
+    let chain = Chain::new(&config.rpc_url, &config.account).with_role(crate::net::Role::Account);
     let price_fri = {
         let out = chain.call(&config.store, "ticket_price", &[])?;
         u128::from_str_radix(out.first().context("ticket_price shape")?.trim_start_matches("0x"), 16)?
